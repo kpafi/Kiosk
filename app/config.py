@@ -1,0 +1,106 @@
+from __future__ import annotations
+
+import os
+import secrets
+from dataclasses import dataclass
+from pathlib import Path
+
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+)
+
+# Passwort aus .env.example: darf nie produktiv laufen.
+EXAMPLE_PASSWORD = "bitte-aendern"
+MIN_PASSWORD_LEN = 12
+
+
+@dataclass(frozen=True)
+class Settings:
+    data_dir: Path
+    db_path: Path
+    sources_file: Path
+    static_dir: Path
+    password: str
+    secret: str
+    fetch_interval: int
+    retention_days: int
+    extract_concurrency: int
+    user_agent: str
+    session_max_age: int
+    cookie_secure: bool
+    disable_fetcher: bool
+
+
+def _int(name: str, default: int, lo: int | None = None, hi: int | None = None) -> int:
+    """Ganzzahl aus der Umgebung, optional mit Grenzen (einschließlich); sonst RuntimeError."""
+    raw = os.environ.get(name, "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        raise RuntimeError(f"{name} muss eine ganze Zahl sein, ist {raw!r}") from None
+    if (lo is not None and value < lo) or (hi is not None and value > hi):
+        bounds = f"mindestens {lo}" if hi is None else f"zwischen {lo} und {hi}"
+        raise RuntimeError(f"{name} muss {bounds} sein, ist {value}")
+    return value
+
+
+def _bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+def docs_enabled() -> bool:
+    """API-Doku (/docs, /openapi.json) nur mit KIOSK_DOCS=1; in Produktion standardmäßig aus."""
+    return _bool("KIOSK_DOCS", False)
+
+
+def load_settings() -> Settings:
+    root = Path(__file__).resolve().parent.parent
+    data_dir = Path(os.environ.get("KIOSK_DATA_DIR", root / "data")).resolve()
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    secret = os.environ.get("KIOSK_SECRET", "").strip()
+    if not secret:
+        secret_file = data_dir / "secret.key"
+        if secret_file.exists():
+            secret = secret_file.read_text().strip()
+        else:
+            secret = secrets.token_urlsafe(48)
+            # O_EXCL + Modus beim Anlegen: Die Datei ist nie, auch nicht kurz, für andere lesbar
+            # (die umask kann Rechte nur wegnehmen), und eine vorhandene Datei wird nie überschrieben.
+            try:
+                fd = os.open(secret_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:  # gleichzeitig von einem anderen Prozess angelegt
+                secret = secret_file.read_text().strip()
+            else:
+                with os.fdopen(fd, "w") as f:
+                    f.write(secret)
+
+    password = os.environ.get("KIOSK_PASSWORD", "").strip()
+    if not password:
+        raise RuntimeError("KIOSK_PASSWORD ist nicht gesetzt")
+    if password == EXAMPLE_PASSWORD:
+        raise RuntimeError("KIOSK_PASSWORD ist noch das Beispiel aus .env.example, bitte ändern")
+    if len(password) < MIN_PASSWORD_LEN:
+        raise RuntimeError(f"KIOSK_PASSWORD muss mindestens {MIN_PASSWORD_LEN} Zeichen lang sein")
+
+    return Settings(
+        data_dir=data_dir,
+        db_path=data_dir / "kiosk.db",
+        sources_file=Path(os.environ.get("KIOSK_SOURCES", root / "sources.yaml")),
+        static_dir=root / "static",
+        password=password,
+        secret=secret,
+        fetch_interval=_int("KIOSK_FETCH_INTERVAL", 900, lo=60),
+        retention_days=_int("KIOSK_RETENTION_DAYS", 90, lo=1, hi=3650),
+        extract_concurrency=_int("KIOSK_EXTRACT_CONCURRENCY", 6, lo=1, hi=32),
+        user_agent=os.environ.get("KIOSK_USER_AGENT", DEFAULT_UA),
+        session_max_age=_int("KIOSK_SESSION_DAYS", 30, lo=1, hi=365) * 86400,
+        # Nur für lokale Entwicklung über http auf false setzen.
+        cookie_secure=_bool("KIOSK_COOKIE_SECURE", True),
+        # Für Tests: kein Sammler, keine Netzwerkzugriffe.
+        disable_fetcher=_bool("KIOSK_DISABLE_FETCHER", False),
+    )

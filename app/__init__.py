@@ -1,0 +1,1 @@
+"""Kiosk: privater Nachrichten-Aggregator."""

@@ -1,0 +1,41 @@
+services:
+  kiosk:
+    build: .
+    # deploy.sh baut und startet mit KIOSK_IMAGE=kiosk:candidate und setzt kiosk:latest erst nach
+    # dem Login-Test; ohne Variable (Neustart von Hand, Zurückrollen) gilt kiosk:latest.
+    image: ${KIOSK_IMAGE:-kiosk:latest}
+    container_name: kiosk
+    restart: unless-stopped
+    # Kleiner init-Prozess als PID 1: sammelt verwaiste Prozesse ein (z. B. vom Pool getötete
+    # Extraktions-Worker) und leitet Signale an uvicorn weiter.
+    init: true
+    env_file: .env
+    ports:
+      - "127.0.0.1:8100:8100"     # nur Loopback, Caddy macht HTTPS
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 768m
+    pids_limit: 256
+    cpus: "1.5"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Subnetz fest vorgeben: Der Container vertraut Proxy-Headern nur von 127.0.0.1 und 172.19.0.1
+# (Dockerfile, --forwarded-allow-ips); Caddy kommt über docker-proxy vom Gateway 172.19.0.1.
+# Entspricht dem bestehenden Netz kiosk_default auf der Box.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.19.0.0/16
+          gateway: 172.19.0.1

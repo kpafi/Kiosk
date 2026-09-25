@@ -1,0 +1,19 @@
+# >>> kiosk (managed by deploy.sh)
+# Dieser Block wird von deploy/deploy.sh zwischen den Markern ersetzt; nicht von Hand ändern.
+kiosk.example.org {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8100
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+	}
+	# /docs (Swagger UI) lädt Skripte von einem CDN und nutzt Inline-Skripte, deshalb ohne CSP.
+	@app not path /docs /docs/*
+	header @app Content-Security-Policy "default-src 'self'; img-src * data:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'"
+	log {
+		output discard
+	}
+}
+# <<< kiosk

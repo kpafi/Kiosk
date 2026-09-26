@@ -39,3 +39,4 @@ def test_index_html_references_exist():
     assert len(refs) >= 5
     missing = [r for r in refs if r.startswith("/") and not _file(r).is_file()]
     assert not missing, missing
+

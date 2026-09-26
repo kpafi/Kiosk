@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import mimetypes
 import os
 import re
 import sqlite3
@@ -605,4 +606,8 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 async def favicon():
     return FileResponse(STATIC_DIR / "icons" / "favicon.ico", media_type="image/x-icon")
 
+# Das schlanke Docker-Image hat keine /etc/mime.types; Schriften und Manifest sonst als text/plain.
+for _ext, _type in ((".woff2", "font/woff2"), (".woff", "font/woff"), (".webmanifest", "application/manifest+json"),
+                    (".ico", "image/x-icon"), (".svg", "image/svg+xml"), (".mjs", "text/javascript")):
+    mimetypes.add_type(_type, _ext)
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")

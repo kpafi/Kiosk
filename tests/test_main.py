@@ -607,3 +607,11 @@ def test_proxy_headers_ignored_from_untrusted_peer(app_env, peer):
     with TestClient(_behind_proxy(peer), base_url="http://testserver") as c:
         r = login(c, **{"X-Forwarded-Proto": "https", "Origin": "https://testserver", "X-Forwarded-For": "203.0.113.7"})
         assert r.status_code == 403  # Schema bleibt http, Origin passt nicht
+
+
+def test_font_and_manifest_content_types(client):
+    """Schriften und Manifest muessen den richtigen MIME-Typ tragen (schlankes Image ohne mime.types)."""
+    r = client.get("/fonts/doto-700-latin.woff2")
+    assert r.status_code == 200 and r.headers["content-type"].startswith("font/woff2")
+    r = client.get("/manifest.webmanifest")
+    assert r.status_code == 200 and r.headers["content-type"].startswith("application/manifest+json")

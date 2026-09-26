@@ -136,3 +136,52 @@ def test_extract_from_bytes_with_legacy_encoding():
     assert result.body_len == len(result.body_text)
     assert "<p>" in (result.body_html or "")
     assert result.image_url is None  # javascript:-Bild aus den Metadaten verworfen
+
+
+# ---- Beifang aus der Extraktion ---------------------------------------------------
+
+def test_published_on_and_newsfeed_paragraphs_are_dropped():
+    html, text = sanitize(
+        '<p>Published On 12 Sep 2026</p><p><a href="/news/">NewsFeed</a></p>'
+        '<p>Der eigentliche Text.</p><p>Published in 2020, the report said.</p>', BASE)
+    assert "Published On" not in html and "NewsFeed" not in html and "NewsFeed" not in text
+    assert "Der eigentliche Text." in html and "Published in 2020" in html
+    assert text == "Der eigentliche Text. Published in 2020, the report said."
+
+
+@pytest.mark.parametrize("para", [
+    "Published On the same day, a second report followed.",
+    "Published On 12 Sep 2026, the report found that most households saved less than before.",
+])
+def test_published_on_rule_keeps_real_sentences(para):
+    html, _ = sanitize(f"<p>Published On 3 March 2026</p><p>{para}</p>", BASE)
+    assert "3 March 2026" not in html and para in html
+
+
+def test_newsfeed_inside_text_is_kept():
+    html, _ = sanitize('<p>Mehr im <a href="/n">NewsFeed</a> von heute.</p>', BASE)
+    assert "NewsFeed" in html
+
+
+def _extraction(body: str):
+    from app.extract import Extraction
+    text = html_to_text(body)
+    return Extraction("full", body, text, len(text), False, None, None)
+
+
+@pytest.mark.parametrize("tag", ["figcaption", "h2", "p"])
+def test_leading_title_echo_is_dropped(tag):
+    from app.extract import drop_title_echo
+    res = drop_title_echo(_extraction(f"<{tag}>  Große  Nachricht </{tag}><p>Text folgt.</p>"), "große nachricht")
+    assert res.body_html == "<p>Text folgt.</p>" and res.body_text == "Text folgt." and res.body_len == 11
+
+
+def test_title_echo_only_at_start_and_only_exact():
+    from app.extract import drop_title_echo
+    later = _extraction("<p>Einleitung.</p><h2>Große Nachricht</h2>")
+    assert drop_title_echo(later, "Große Nachricht") is later
+    longer = _extraction("<p>Große Nachricht mit mehr Wörtern</p><p>x</p>")
+    assert drop_title_echo(longer, "Große Nachricht") is longer
+    only = _extraction("<p>Große Nachricht</p>")
+    assert drop_title_echo(only, "Große Nachricht") is only   # sonst bliebe kein Text
+    assert drop_title_echo(later, None) is later

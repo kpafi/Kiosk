@@ -23,7 +23,7 @@ import httpx
 
 from .config import Settings
 from .db import Database, utcnow
-from .extract import extract, safe_http_url, strip_html
+from .extract import drop_title_echo, extract, is_placeholder, safe_http_url, strip_html
 from .netguard import BlockedURL, ResolveError, check_url, server_addr_blocked
 from .sources import Catalog, Source
 
@@ -199,10 +199,19 @@ def _entry_image(entry: Any) -> str | None:
     return None
 
 
-def _entry_summary(entry: Any) -> str:
+def _entry_summary(entry: Any, title: str = "") -> str:
+    """Teaser aus dem Feed; Platzhalter ("None", "null" ...) und reine Titel-Wiederholung gelten als leer."""
     content = entry.get("content") or []
-    raw = entry.get("summary") or (content[0].get("value") if content else "") or ""
-    return strip_html(raw)
+    for raw in (entry.get("summary"), content[0].get("value") if content else None):
+        text = strip_html(raw or "")
+        if not is_placeholder(text, title):
+            return text
+    return ""
+
+
+def _entry_author(entry: Any) -> str | None:
+    author = strip_html(entry.get("author") or "", limit=200)
+    return None if is_placeholder(author) else author
 
 
 def parse_feed(source: Source, raw: bytes) -> list[dict[str, Any]]:
@@ -222,8 +231,8 @@ def parse_feed(source: Source, raw: bytes) -> list[dict[str, Any]]:
             "guid": (e.get("id") or link).strip()[:500],
             "url": link[:1000],
             "title": title,
-            "summary": _entry_summary(e),
-            "author": strip_html(e.get("author") or "", limit=200) or None,
+            "summary": _entry_summary(e, title),
+            "author": _entry_author(e),
             "image_url": safe_http_url(_entry_image(e)),
             "published_at": min(_entry_datetime(e), now),
             "fetched_at": now,
@@ -575,6 +584,16 @@ class Fetcher:
             task = self._spawn(article_id, self._extract(article_id, url))
             await asyncio.shield(task)
 
+    def is_extracting(self, article_id: int) -> bool:
+        """True, solange für diese ID eine Extraktion läuft."""
+        return article_id in self._inflight
+
+    def start_extraction(self, article_id: int, url: str) -> None:
+        """Startet eine Extraktion auf Anforderung im Hintergrund, ohne auf sie zu warten
+        (Leseansicht fragt per Polling nach). Läuft schon eine, passiert nichts."""
+        if article_id not in self._inflight:
+            self._spawn(article_id, self._extract_priority(article_id, url))
+
     async def _extract_priority(self, article_id: int, url: str) -> None:
         async with self._priority_sem:
             await self._extract(article_id, url)
@@ -640,6 +659,8 @@ class Fetcher:
             log.warning("Extraktion %s (%s): %s", article_id, url, e)
             self._fail(article_id, f"{type(e).__name__}: {e}")
             return
+        row = self.db.get_article(article_id)
+        result = drop_title_echo(result, row["title"] if row else None)
         self.db.store_extraction(
             article_id, status=result.status, body_html=result.body_html, body_text=result.body_text,
             body_len=result.body_len, paywalled=result.paywalled, image_url=result.image_url,

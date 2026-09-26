@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import html
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
 
@@ -144,7 +144,53 @@ def sanitize(fragment: str, base_url: str) -> tuple[str, str]:
     body = "".join(s.out)
     body = re.sub(r"^\s*<h1>.*?</h1>\s*", "", body, count=1, flags=re.S)  # Titel steht separat
     body = re.sub(r"(<p>\s*</p>\s*)+", "", body)
-    return body.strip(), _normalize_ws("".join(s.text))
+    text = _normalize_ws("".join(s.text))
+    cleaned = _drop_junk_paragraphs(body)
+    if cleaned != body:
+        body, text = cleaned, html_to_text(cleaned)
+    return body.strip(), text
+
+
+# Absätze ohne Artikelinhalt, die trafilatura bei manchen Verlagen mitnimmt (z. B. Al Jazeera):
+# kurze Datumszeile „Published On 12 Sep 2026“ und ein Absatz, der nur aus dem Link „NewsFeed“ besteht.
+_PARA_RE = re.compile(r"<p>(.*?)</p>\s*", re.S)
+_PUBLISHED_RE = re.compile(r"^\s*Published On\s+\d{1,2}\s+\w+\s+\d{4}")
+_PUBLISHED_MAX_LEN = 60     # längere Absätze mit „Published On …“ sind Artikeltext
+_NEWSFEED_RE = re.compile(r"^\s*<a\b[^>]*>\s*NewsFeed\s*</a>\s*$")
+
+
+def _drop_junk_paragraphs(body: str) -> str:
+    def repl(m: re.Match) -> str:
+        inner = m.group(1)
+        if _NEWSFEED_RE.match(inner):
+            return ""
+        text = html_to_text(inner)
+        if len(text) < _PUBLISHED_MAX_LEN and _PUBLISHED_RE.match(text):
+            return ""
+        return m.group(0)
+    return _PARA_RE.sub(repl, body)
+
+
+_LEAD_RE = re.compile(r"^\s*<(figcaption|h2|p)>(.*?)</\1>\s*", re.S)
+
+
+def _norm_title(text: str) -> str:
+    return _normalize_ws(text).casefold()
+
+
+def drop_title_echo(result: Extraction, title: str | None) -> Extraction:
+    """Entfernt ein führendes <figcaption>, <h2> oder <p>, das nur den Titel wiederholt
+    (Groß-/Kleinschreibung und Leerraum egal). Der Titel steht in der Leseansicht separat."""
+    if not result.body_html or not title or not title.strip():
+        return result
+    m = _LEAD_RE.match(result.body_html)
+    if not m or _norm_title(html_to_text(m.group(2))) != _norm_title(title):
+        return result
+    body = result.body_html[m.end():].strip()
+    text = html_to_text(body)
+    if not text:
+        return result  # nur der Titel da: lieber so lassen als leeren Text speichern
+    return replace(result, body_html=body, body_text=text, body_len=len(text))
 
 
 def html_to_text(fragment: str | None) -> str:
@@ -177,7 +223,7 @@ def extract(page: bytes, url: str) -> Extraction:
         meta = trafilatura.extract_metadata(page, default_url=url)
         if meta:
             image_url = safe_http_url(meta.image)
-            author = (meta.author or None) and meta.author[:200]
+            author = None if is_placeholder(meta.author) else meta.author[:200]
     except Exception:
         pass
 
@@ -192,6 +238,18 @@ def extract(page: bytes, url: str) -> Extraction:
 
 
 _TAG_RE = re.compile(r"<[^>]+>")
+
+
+PLACEHOLDERS = {"none", "null", "undefined"}
+
+
+def is_placeholder(text: str | None, title: str | None = None) -> bool:
+    """True für leere Werte und Platzhalter wie "None"/"null"/"undefined" (manche Feeds liefern
+    die als Text) sowie für einen Wert, der nur den Titel wiederholt."""
+    t = (text or "").strip().lower()
+    if not t or t in PLACEHOLDERS:
+        return True
+    return title is not None and t == title.strip().lower()
 
 
 def strip_html(raw: str | None, limit: int = 700) -> str:

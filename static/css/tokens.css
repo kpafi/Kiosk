@@ -1,0 +1,183 @@
+/* Kiosk Design-Tokens, abgeleitet aus design/tokens.json (Version 3).
+   :root = Dunkel (Standard), [data-theme="light"] = Hell. */
+
+/* ---- Schriften (selbst gehostet, OFL, siehe fonts/OFL-*.txt) ---- */
+@font-face {
+  font-family: "Doto";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("../fonts/doto-700-latin.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Space Grotesk";
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url("../fonts/space-grotesk-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: "Space Grotesk";
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url("../fonts/space-grotesk-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Space Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("../fonts/space-mono-400-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: "Space Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("../fonts/space-mono-400-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+/* ---- Farben: Dunkel ---- */
+:root {
+  --bg: #000000;
+  --raised: #121212;
+  --raised-2: #1c1c1c;
+  --hairline: #2a2a2a;
+  --rule: #6b6b6b;
+  --ink: #ffffff;
+  --on-ink: #000000;
+  --muted: #9c9c9c;
+  --signal: #3d8bfd;
+  --signal-text: #7db4ff;
+  --on-signal: #000000;
+  --star: #ffd60a;
+  --overlay: rgba(0, 0, 0, 0.6);
+  color-scheme: dark;
+
+  /* Familien */
+  --font-dot: "Doto", "Courier New", monospace;
+  --font-sans: "Space Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "Space Mono", "Courier New", monospace;
+
+  /* Abstände */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+
+  /* Radien */
+  --radius-sm: 6px;
+  --radius-md: 14px;
+  --radius-pill: 999px;
+
+  /* Maße */
+  --measure: 680px;
+  --thumb: 80px;
+  --tap: 44px;
+  --bar: 64px;
+  --dot: 8px;
+
+  /* Textgröße (Einstellung): skaliert Titel, Teaser, Artikeltext */
+  --scale: 1;
+}
+
+/* ---- Farben: Hell ---- */
+:root[data-theme="light"] {
+  --bg: #f2f2f2;
+  --raised: #ffffff;
+  --raised-2: #e6e6e6;
+  --hairline: #d6d6d6;
+  --rule: #8a8a8a;
+  --ink: #000000;
+  --on-ink: #ffffff;
+  --muted: #5a5a5a;
+  --signal: #1d5fd0;
+  --signal-text: #174fb0;
+  --on-signal: #ffffff;
+  --star: #6f5800;
+  --overlay: rgba(0, 0, 0, 0.6);
+  color-scheme: light;
+}
+
+html[data-text="s"] { --scale: 0.92; }
+html[data-text="m"] { --scale: 1; }
+html[data-text="l"] { --scale: 1.1; }
+
+/* ---- Typografie ---- */
+.t-wordmark {
+  font-family: var(--font-dot);
+  font-size: 32px;
+  line-height: 36px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.t-section {
+  font-family: var(--font-dot);
+  font-size: 20px;
+  line-height: 24px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.t-counter {
+  font-family: var(--font-dot);
+  font-size: 14px;
+  line-height: 18px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+.t-headline {
+  font-family: var(--font-sans);
+  font-size: calc(21px * var(--scale));
+  line-height: calc(27px * var(--scale));
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+.t-article {
+  font-family: var(--font-sans);
+  font-size: calc(17px * var(--scale));
+  line-height: calc(27px * var(--scale));
+  font-weight: 400;
+}
+.t-article-h {
+  font-family: var(--font-sans);
+  font-size: calc(19px * var(--scale));
+  line-height: calc(25px * var(--scale));
+  font-weight: 600;
+}
+.t-teaser {
+  font-family: var(--font-sans);
+  font-size: calc(15px * var(--scale));
+  line-height: calc(22px * var(--scale));
+  font-weight: 400;
+}
+.t-ui {
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 22px;
+  font-weight: 500;
+}
+.t-meta {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+.t-caption {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 400;
+  text-transform: uppercase;
+}

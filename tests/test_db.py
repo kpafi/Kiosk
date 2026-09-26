@@ -136,6 +136,17 @@ def test_purge_keeps_starred_and_fts_consistent(db):
     assert {r["id"] for r in list_all(db, query="suchen")} == {ids["alpha-2"], ids["alpha-3"]}
 
 
+
+def test_purge_keeps_read_later(db):
+    db.upsert_articles([
+        make_row("alpha", 1, ago(days=200), title="Uralt"),
+        make_row("alpha", 2, ago(days=200), title="Uralt Später"),
+    ])
+    ids = {r["guid"]: r["id"] for r in db.q("SELECT id, guid FROM articles")}
+    db.set_flag(ids["alpha-2"], "later", True)
+    assert db.purge(90) == 1
+    assert {r["guid"] for r in db.q("SELECT guid FROM articles")} == {"alpha-2"}
+
 # ---- Wiederholungen --------------------------------------------------------
 
 def test_retry_backoff_and_final_failure(db):
@@ -352,7 +363,7 @@ def test_migration_v2_to_v3_fills_seen_guids(tmp_path):
 
     db = Database(path)
     try:
-        assert db.get_meta("schema_version") == "3" == str(SCHEMA_VERSION)
+        assert db.get_meta("schema_version") == str(SCHEMA_VERSION)
         assert db.one("SELECT COUNT(*) AS n FROM seen_guids")["n"] == 3
         assert db.upsert_articles([make_row("alpha", 0, ago(hours=0))]) == 0
         fts_integrity(db)
@@ -368,3 +379,99 @@ def test_pending_articles_keyset(db):
     rest = db.pending_articles(3, before=(first[-1]["published_at"], first[-1]["id"]))
     ids = [r["id"] for r in first + rest]
     assert len(ids) == 5 and len(set(ids)) == 5
+
+
+# ---- v4: Profile, Lieblingszeitungen, Einstellungen, "Später lesen" ------------
+
+V4_TABLES = {"profiles", "favorite_sources", "settings"}
+
+
+def _tables(db) -> set[str]:
+    return {r["name"] for r in db.q("SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def test_migration_v3_to_v4(tmp_path):
+    path = tmp_path / "v3.db"
+    db = Database(path)
+    db.upsert_articles([make_row("alpha", i, ago(hours=i), title=f"Inflation {i}") for i in range(3)])
+    db.set_flag(db.q("SELECT id FROM articles")[0]["id"], "starred", True)
+    # Zurück auf den Stand v3: ohne Spalte later und ohne die neuen Tabellen
+    db.q("ALTER TABLE articles DROP COLUMN later")
+    for table in V4_TABLES:
+        db.q(f"DROP TABLE {table}")
+    db.set_meta("schema_version", "3")
+    db.close()
+
+    db = Database(path)
+    try:
+        assert db.get_meta("schema_version") == "5" == str(SCHEMA_VERSION)
+        assert "later" in {r["name"] for r in db.q("PRAGMA table_info(articles)")}
+        assert V4_TABLES <= _tables(db)
+        assert db.one("SELECT COUNT(*) AS n FROM articles WHERE later=0 AND starred=1")["n"] == 1
+        aid = db.q("SELECT id FROM articles")[1]["id"]
+        assert db.set_flag(aid, "later", True)
+        assert [r["id"] for r in list_all(db, later=True)] == [aid]
+        assert db.seed_profiles(["alpha"], None) is True
+        fts_integrity(db)
+    finally:
+        db.close()
+    db = Database(path)  # erneutes Öffnen: nichts mehr zu tun, Daten bleiben
+    try:
+        assert len(db.list_profiles()) == 4 and db.one("SELECT later FROM articles WHERE id=?", (aid,))["later"] == 1
+    finally:
+        db.close()
+
+
+def test_migration_v1_to_v4_has_new_tables(tmp_path):
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(OLD_SCHEMA)
+    conn.execute("INSERT INTO articles (source_id, guid, url, title, published_at, fetched_at) "
+                 "VALUES ('alpha', 'g', 'https://a.example/', 'Alt', ?, ?)", (ago(hours=1), ago(hours=1)))
+    conn.commit()
+    conn.close()
+    db = Database(path)
+    try:
+        assert db.get_meta("schema_version") == str(SCHEMA_VERSION)
+        assert V4_TABLES <= _tables(db)
+        assert db.one("SELECT later FROM articles")["later"] == 0
+        assert list_all(db)[0]["later"] == 0
+    finally:
+        db.close()
+
+
+def test_seed_profiles(db):
+    assert db.seed_profiles(["alpha"], ["beta"]) is True
+    assert db.seed_profiles(["x"], None) is False  # nur wenn leer
+    profiles = db.list_profiles()
+    assert [(p["name"], p["builtin"], p["sources"], p["in_bar"], p["position"]) for p in profiles] == [
+        ("Deutschland", "de", ["alpha"], True, 0), ("Weltweit", "world", None, False, 1),
+        ("Wirtschaft", "business", ["beta"], True, 2), ("Militär", "military", None, False, 3)]
+    assert profiles[2]["terms"][:2] == ["Wirtschaft", "Konjunktur"] and "Börse" in profiles[2]["terms"]
+    assert "Bundeswehr" in profiles[3]["terms"] and profiles[0]["terms"] == []
+
+
+def test_terms_filter_is_prefix_or_and_keeps_chronology(db):
+    db.upsert_articles([
+        make_row("alpha", 1, ago(hours=1), title="Die Börsen schwanken"),
+        make_row("alpha", 2, ago(hours=2), title="Interest rates rise"),
+        make_row("alpha", 3, ago(hours=3), title="Wetter"),
+        make_row("alpha", 4, ago(hours=4), title="Neue Zinsentscheidung"),
+    ])
+    rows = list_all(db, terms=["Börse", "interest rates", "Zinsen"])
+    # Präfix ("Zinsen" trifft "Zinsentscheidung", "Börse" trifft "Börsen"), ODER, neueste zuerst
+    assert [r["url"][-1] for r in rows] == ["1", "2", "4"]
+    assert list_all(db, terms=["interest rise"]) == []  # Begriff mit Leerzeichen ist eine Phrase
+    rows = list_all(db, terms=["Zins", "Wett"])
+    assert [r["url"][-1] for r in rows] == ["3", "4"]
+    assert db.count_articles(cap=10, terms=["Zins", "Wett"]) == 2
+    assert db.count_articles(cap=1, terms=["Zins", "Wett"]) == 1
+    assert list_all(db, sources=[]) == []  # leere Quellenliste: nichts
+    assert db.mark_all_read(["alpha"], ["Wett"]) == 1
+    assert db.one("SELECT read FROM articles WHERE guid='alpha-3'")["read"] == 1
+
+
+def test_settings_roundtrip(db):
+    assert db.get_settings() == {}
+    db.set_settings({"theme": "dark", "bar_order": ["source:alpha"]})
+    assert db.get_settings() == {"theme": "dark", "bar_order": ["source:alpha"]}

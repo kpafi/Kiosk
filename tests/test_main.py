@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -41,9 +43,31 @@ def test_401_without_cookie(client):
 
 
 def test_static_page_has_no_inline_script(client):
+    import re
     html = client.get("/").text
-    assert '<script src="/app.js"></script>' in html
-    assert "<script>" not in html and "<style" not in html
+    scripts = re.findall(r"<script\b[^>]*>", html)
+    assert scripts and all(" src=" in tag for tag in scripts)  # nur externe Skripte (CSP script-src 'self')
+    assert "<style" not in html
+
+
+def test_static_files_are_revalidated(client):
+    for path in ("/", "/js/app.js", "/css/app.css", "/sw.js", "/manifest.webmanifest", "/js/theme-boot.js"):
+        r = client.get(path)
+        assert r.status_code == 200, path
+        assert r.headers["cache-control"] == "no-cache", path
+    assert client.get("/api/session").headers["cache-control"] == "no-store"
+    assert client.get("/api/build").headers["cache-control"] == "no-store"
+
+
+def test_favicon(client):
+    r = client.get("/favicon.ico")
+    assert r.status_code == 200 and r.content[:4] == b"\x00\x00\x01\x00"
+    assert r.headers["cache-control"] == "no-cache"
+
+
+def test_build_is_open(client, monkeypatch):
+    monkeypatch.setenv("KIOSK_BUILD", "20260926-1200")
+    assert client.get("/api/build").json() == {"build": "20260926-1200"}
 
 
 def test_login_sets_host_prefixed_secure_cookie(client):
@@ -451,11 +475,43 @@ def test_huge_ids_are_client_errors(authed):
 def extract_calls(monkeypatch):
     calls = []
 
-    async def fake(article_id, url, *, priority=False):
-        calls.append((article_id, priority))
+    def fake(article_id, url):
+        calls.append((article_id, True))
 
-    monkeypatch.setattr(state.fetcher, "extract_article", fake)
+    monkeypatch.setattr(state.fetcher, "start_extraction", fake)
     return calls
+
+
+def test_article_detail_does_not_block_on_extraction(authed, monkeypatch):
+    """Ein fälliger pending-Artikel startet die Extraktion im Hintergrund; die Antwort kommt sofort."""
+    _seed(1)
+    aid = state.db.one("SELECT id FROM articles")["id"]
+
+    release = []
+
+    async def hang(article_id, url):  # hängt, bis der Test ihn freigibt
+        while not release:
+            await asyncio.sleep(0.01)
+        state.db.store_extraction(article_id, status="full", body_html="<p>x</p>", body_text="x",
+                                  body_len=1, paywalled=False)
+
+    monkeypatch.setattr(state.fetcher, "_extract_priority", hang)
+    t0 = time.monotonic()
+    r = authed.get(f"/api/articles/{aid}")
+    assert time.monotonic() - t0 < 5
+    body = r.json()
+    assert r.status_code == 200 and body["text_status"] == "pending" and body["extracting"] is True
+    assert body["title"] == "Wahl 0"
+    assert state.fetcher.is_extracting(aid)
+    # Zweiter Abruf während der laufenden Extraktion: kein zweiter Start, weiterhin pending.
+    assert authed.get(f"/api/articles/{aid}").json()["extracting"] is True
+    # Fertig extrahiert: extracting=false und der echte Status.
+    release.append(True)
+    deadline = time.monotonic() + 5
+    while state.fetcher.is_extracting(aid) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    body = authed.get(f"/api/articles/{aid}").json()
+    assert body["extracting"] is False and body["text_status"] == "full"
 
 
 def test_on_demand_extraction_respects_schedule(authed, extract_calls):

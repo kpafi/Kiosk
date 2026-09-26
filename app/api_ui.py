@@ -1,0 +1,365 @@
+"""API für die Oberfläche: Profile, Lieblingszeitungen, Leiste, Einstellungen, Zähler.
+
+Dazu Hilfsfunktionen, die auch die Artikel-Routen in main.py nutzen (Filterkontext aus
+Quelle/Land/Profil, Einstellungen, Zwischenspeicher der Profil-Zähler).
+"""
+from __future__ import annotations
+
+import time
+from typing import Annotated, Any, Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import Path as PathParam
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints
+
+from .state import state
+
+MAX_ID = 2**63 - 1
+MAX_SOURCE_IDS = 200
+UNREAD_CAP = 5000          # Profil-Zähler werden hier gedeckelt
+UNREAD_TTL = 60.0          # Sekunden, so lange gilt ein berechneter Profil-Zähler
+
+SETTINGS_DEFAULTS: dict[str, Any] = {
+    "theme": "dark", "text_size": "m", "mark_read_on_open": True,
+    "show_images": True, "free_only": True, "bar_order": [],
+}
+
+
+def _authed(request: Request) -> None:
+    # Die Middleware in main.py prüft bereits; hier nur als zweite Sicherung wie bei den anderen Routen.
+    if state.auth.token_from_cookies(request.cookies) is None:
+        raise HTTPException(401, "Nicht angemeldet")
+
+
+router = APIRouter(prefix="/api", dependencies=[Depends(_authed)])
+
+
+# ---- Hilfsfunktionen (auch für main.py) ------------------------------------
+
+def ui_settings() -> dict[str, Any]:
+    """Einstellungen mit Standardwerten; unbekannte oder ungültige gespeicherte Werte zählen nicht."""
+    stored = state.db.get_settings()
+    out = dict(SETTINGS_DEFAULTS)
+    for key, default in SETTINGS_DEFAULTS.items():
+        if key in stored and type(stored[key]) is type(default):
+            out[key] = stored[key]
+    return out
+
+
+def enabled_sources() -> list[str]:
+    """Aktivierte Quellen in Katalog-Reihenfolge."""
+    enabled = set(state.db.enabled_source_ids())
+    return [s.id for s in state.catalog.all() if s.id in enabled]
+
+
+def effective_sources(profile: dict[str, Any]) -> list[str]:
+    """Wirksame Quellen eines Profils: seine Liste (oder alle) geschnitten mit den aktivierten."""
+    active = enabled_sources()
+    if profile["sources"] is None:
+        return active
+    wanted = set(profile["sources"])
+    return [s for s in active if s in wanted]
+
+
+def _intersect(scope: list[str] | None, other: list[str]) -> list[str]:
+    if scope is None:
+        return list(other)
+    keep = set(other)
+    return [s for s in scope if s in keep]
+
+
+def article_scope(sources: list[str], countries: set[str], profile_id: int | None,
+                  *, only_enabled: bool = True) -> tuple[list[str] | None, list[str]]:
+    """Filterkontext: (Quellen oder None = alle, Profil-Begriffe). Leere Liste = nichts passt.
+
+    Ohne ausdrückliche Quelle und ohne Profil gelten nur die aktivierten Quellen (ALLE);
+    only_enabled=False (Gemerkt) lässt dann alle Quellen zu."""
+    scope: list[str] | None = list(sources) if sources else None
+    if scope is None and profile_id is None and only_enabled:
+        scope = enabled_sources()
+    if countries:
+        scope = _intersect(scope, [s.id for s in state.catalog.all() if s.country in countries])
+    terms: list[str] = []
+    if profile_id is not None:
+        profile = state.db.get_profile(profile_id)
+        if profile is None:
+            raise HTTPException(404, "Profil nicht gefunden")
+        scope = _intersect(scope, effective_sources(profile))
+        terms = profile["terms"]
+    return scope, terms
+
+
+# Profil-ID -> (Zeitpunkt, Ende des letzten Sammellaufs, Zahl)
+_unread_cache: dict[int, tuple[float, Any, int]] = {}
+
+
+def invalidate_unread() -> None:
+    _unread_cache.clear()
+
+
+def profile_unread(profile: dict[str, Any], sources: list[str]) -> int:
+    """Ungelesene, Paywall-freie Artikel im Profil (höchstens UNREAD_CAP), höchstens alle 60 s neu
+    berechnet; ein beendeter Sammellauf macht den Wert sofort ungültig."""
+    run = state.fetcher.state.get("last_finished")
+    hit = _unread_cache.get(profile["id"])
+    now = time.monotonic()
+    if hit and now - hit[0] < UNREAD_TTL and hit[1] == run:
+        return hit[2]
+    n = state.db.count_articles(cap=UNREAD_CAP, sources=sources, terms=profile["terms"] or None,
+                                unread=True, free_only=True)
+    _unread_cache[profile["id"]] = (now, run, n)
+    return n
+
+
+def _profile_view(profile: dict[str, Any]) -> dict[str, Any]:
+    sources = effective_sources(profile)
+    return {**profile, "source_count": len(sources), "unread": profile_unread(profile, sources)}
+
+
+def _check_reorder(ids: list, known: set) -> None:
+    if len(set(ids)) != len(ids):
+        raise HTTPException(400, "Doppelte IDs")
+    unknown = [i for i in ids if i not in known]
+    if unknown:
+        raise HTTPException(400, f"Unbekannte IDs: {', '.join(map(str, unknown[:5]))}")
+
+
+# ---- Profile ----------------------------------------------------------------
+
+Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=40)]
+Term = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=40, pattern=r'^[^"]*$')]
+
+
+class ProfileIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: Name
+    sources: list[str] | None = Field(None, max_length=MAX_SOURCE_IDS)
+    terms: list[Term] = Field(default_factory=list, max_length=20)
+    in_bar: StrictBool = False
+
+
+class ProfilePatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: Name | None = None
+    sources: list[str] | None = Field(None, max_length=MAX_SOURCE_IDS)
+    terms: list[Term] | None = Field(None, max_length=20)
+    in_bar: StrictBool | None = None
+
+
+def _clean_fields(body: BaseModel) -> dict[str, Any]:
+    """Nur gesetzte Felder; Quellen müssen bekannt sein, Dubletten fallen weg."""
+    fields = {k: getattr(body, k) for k in body.model_fields_set}
+    for key in ("name", "terms", "in_bar"):
+        if key in fields and fields[key] is None:
+            raise HTTPException(422, f"{key} darf nicht null sein")
+    if fields.get("sources") == []:
+        raise HTTPException(422, "sources darf nicht leer sein (null heißt alle aktiven Zeitungen)")
+    if fields.get("sources") is not None:
+        unknown = [s for s in fields["sources"] if s not in state.catalog]
+        if unknown:
+            raise HTTPException(422, f"Unbekannte Quellen: {', '.join(unknown[:5])}")
+        fields["sources"] = list(dict.fromkeys(fields["sources"]))
+    if "terms" in fields:
+        fields["terms"] = list(dict.fromkeys(fields["terms"]))
+    return fields
+
+
+@router.get("/profiles")
+async def list_profiles():
+    return [_profile_view(p) for p in state.db.list_profiles()]
+
+
+@router.post("/profiles", status_code=201)
+async def create_profile(body: ProfileIn):
+    fields = _clean_fields(body)
+    pid = state.db.create_profile(name=body.name, sources=fields.get("sources", body.sources),
+                                  terms=fields.get("terms", []), in_bar=body.in_bar)
+    invalidate_unread()
+    return _profile_view(state.db.get_profile(pid))
+
+
+class IdOrder(BaseModel):
+    ids: list[int] = Field(max_length=1000)
+
+
+@router.post("/profiles/reorder")
+async def reorder_profiles(body: IdOrder):
+    _check_reorder(body.ids, {p["id"] for p in state.db.list_profiles()})
+    state.db.reorder("profiles", "id", body.ids)
+    return await list_profiles()
+
+
+def _profile_or_404(profile_id: int) -> dict[str, Any]:
+    profile = state.db.get_profile(profile_id)
+    if profile is None:
+        raise HTTPException(404, "Profil nicht gefunden")
+    return profile
+
+
+@router.patch("/profiles/{profile_id}")
+async def patch_profile(body: ProfilePatch, profile_id: int = PathParam(ge=1, le=MAX_ID)):
+    _profile_or_404(profile_id)
+    state.db.update_profile(profile_id, _clean_fields(body))
+    invalidate_unread()
+    return _profile_view(state.db.get_profile(profile_id))
+
+
+@router.delete("/profiles/{profile_id}", status_code=204)
+async def delete_profile(profile_id: int = PathParam(ge=1, le=MAX_ID)):
+    if _profile_or_404(profile_id)["builtin"]:
+        raise HTTPException(409, "Vorgegebene Profile lassen sich nicht löschen")
+    state.db.delete_profile(profile_id)
+    invalidate_unread()
+    return Response(status_code=204)
+
+
+# ---- Lieblingszeitungen -----------------------------------------------------
+
+def _favorites_view() -> list[dict[str, Any]]:
+    unread = state.db.unread_free_by_source()
+    enabled = set(state.db.enabled_source_ids())
+    out = []
+    for f in state.db.list_favorites():
+        src = state.catalog.get(f["source_id"])
+        if src is None:  # aus dem Katalog entfernt
+            continue
+        out.append({
+            "source_id": src.id, "name": src.name, "short": src.short, "country": src.country,
+            "enabled": src.id in enabled, "in_bar": bool(f["in_bar"]), "position": f["position"],
+            "unread": unread.get(src.id, 0),
+        })
+    return out
+
+
+@router.get("/favorites/sources")
+async def list_favorites():
+    return _favorites_view()
+
+
+class FavoriteBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    in_bar: StrictBool | None = None
+
+
+class SourceOrder(BaseModel):
+    ids: list[str] = Field(max_length=MAX_SOURCE_IDS)
+
+
+@router.post("/favorites/sources/reorder")
+async def reorder_favorites(body: SourceOrder):
+    _check_reorder(body.ids, {f["source_id"] for f in state.db.list_favorites()})
+    state.db.reorder("favorite_sources", "source_id", body.ids)
+    return _favorites_view()
+
+
+@router.put("/favorites/sources/{source_id}")
+async def put_favorite(source_id: str, body: FavoriteBody = FavoriteBody()):
+    if source_id not in state.catalog:
+        raise HTTPException(404, "Unbekannte Quelle")
+    state.db.put_favorite(source_id, body.in_bar)
+    return next(f for f in _favorites_view() if f["source_id"] == source_id)
+
+
+@router.delete("/favorites/sources/{source_id}", status_code=204)
+async def delete_favorite(source_id: str):
+    state.db.delete_favorite(source_id)
+    return Response(status_code=204)
+
+
+# ---- Leiste -----------------------------------------------------------------
+
+BarKey = Annotated[str, StringConstraints(pattern=r"^(source:[A-Za-z0-9_-]{1,64}|profile:[0-9]{1,18})$")]
+
+
+def _bar() -> dict[str, Any]:
+    unread = state.db.unread_free_by_source()
+    entries: dict[str, dict[str, Any]] = {}
+    for f in state.db.list_favorites():
+        src = state.catalog.get(f["source_id"])
+        if f["in_bar"] and src is not None:
+            entries[f"source:{src.id}"] = {"type": "source", "id": src.id, "key": f"source:{src.id}",
+                                           "label": src.short, "unread": unread.get(src.id, 0)}
+    for p in state.db.list_profiles():
+        if p["in_bar"]:
+            entries[f"profile:{p['id']}"] = {"type": "profile", "id": p["id"], "key": f"profile:{p['id']}",
+                                             "label": p["name"].upper(),
+                                             "unread": profile_unread(p, effective_sources(p))}
+    ordered = [entries.pop(k) for k in ui_settings()["bar_order"] if k in entries]
+    total = state.db.article_counts(enabled_sources())["unread"]
+    return {"items": [{"type": "all", "key": "all", "label": "ALLE", "unread": total},
+                      *ordered, *entries.values()]}
+
+
+@router.get("/bar")
+async def get_bar():
+    return _bar()
+
+
+class BarBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    order: list[BarKey] = Field(max_length=400)
+
+
+def _check_bar_keys(keys: list[str]) -> None:
+    """Nur Schlüssel bekannter Zeitungen und vorhandener Profile (sonst 400)."""
+    profile_ids = {str(p["id"]) for p in state.db.list_profiles()}
+    unknown = [k for k in keys
+               if not ((k.startswith("source:") and k[7:] in state.catalog)
+                       or (k.startswith("profile:") and k[8:] in profile_ids))]
+    if unknown:
+        raise HTTPException(400, f"Unbekannte Einträge: {', '.join(unknown[:5])}")
+
+
+@router.patch("/bar")
+async def patch_bar(body: BarBody):
+    _check_bar_keys(body.order)
+    state.db.set_settings({"bar_order": list(dict.fromkeys(body.order))})
+    return _bar()
+
+
+# ---- Einstellungen ----------------------------------------------------------
+
+class SettingsPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    theme: Literal["system", "dark", "light"] | None = None
+    text_size: Literal["s", "m", "l"] | None = None
+    mark_read_on_open: StrictBool | None = None
+    show_images: StrictBool | None = None
+    free_only: StrictBool | None = None
+    bar_order: list[BarKey] | None = Field(None, max_length=400)
+
+
+@router.get("/settings")
+async def get_settings():
+    return ui_settings()
+
+
+@router.patch("/settings")
+async def patch_settings(body: SettingsPatch):
+    values = body.model_dump(exclude_unset=True)
+    nulls = [k for k, v in values.items() if v is None]
+    if nulls:
+        raise HTTPException(422, f"{', '.join(nulls)} darf nicht null sein")
+    if "bar_order" in values:
+        _check_bar_keys(values["bar_order"])
+        values["bar_order"] = list(dict.fromkeys(values["bar_order"]))
+    state.db.set_settings(values)
+    return ui_settings()
+
+
+# ---- Zähler -----------------------------------------------------------------
+
+@router.get("/counts")
+async def counts():
+    states = state.db.source_states()
+    catalog_ids = [s.id for s in state.catalog.all()]
+    enabled = [sid for sid in catalog_ids if sid in states and states[sid]["enabled"]]
+    return {
+        # unread: aktivierte Quellen ohne Paywall; later/starred: alle gemerkten (wie Gemerkt)
+        **state.db.article_counts(enabled),
+        "profiles": len(state.db.list_profiles()),
+        "favorites": sum(1 for f in state.db.list_favorites() if f["source_id"] in state.catalog),
+        "sources_enabled": len(enabled),
+        "sources_total": len(catalog_ids),
+        "sources_failing": sum(1 for sid in enabled if states[sid]["last_error"]),
+    }

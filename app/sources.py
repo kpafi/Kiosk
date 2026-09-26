@@ -18,6 +18,19 @@ class Source:
     default_enabled: bool = True
     note: str = ""
     tags: tuple[str, ...] = field(default_factory=tuple)
+    short: str = ""     # Kurzname für die Leiste, Versalien, höchstens SHORT_MAX Zeichen
+
+
+SHORT_MAX = 12
+
+
+def _short(sid: str, name: str, raw) -> str:
+    """Kurzname aus sources.yaml prüfen; ohne Angabe der Name in Versalien, gekürzt."""
+    if raw is None:
+        return name.upper()[:SHORT_MAX].rstrip()
+    if not isinstance(raw, str) or not raw.strip() or len(raw.strip()) > SHORT_MAX:
+        raise ValueError(f"Quelle {sid}: short muss ein Text mit 1 bis {SHORT_MAX} Zeichen sein, ist {raw!r}")
+    return raw.strip().upper()
 
 
 class Catalog:
@@ -54,6 +67,7 @@ class Catalog:
                     default_enabled=bool(item.get("default_enabled", True)),
                     note=item.get("note", ""),
                     tags=tuple(item.get("tags", [])),
+                    short=_short(sid, item["name"], item.get("short")),
                 )
             )
         return cls(sources)

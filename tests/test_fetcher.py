@@ -68,6 +68,39 @@ def test_parse_feed_dates_and_links():
         assert before <= datetime.fromisoformat(by_guid[g]["published_at"]) <= after
 
 
+def test_parse_feed_drops_placeholder_summary_and_author():
+    def entry(n, extra):
+        return (f"<item><title>Artikel {n}</title><guid>g{n}</guid>"
+                f"<link>https://alpha.example/a/{n}</link>{extra}</item>")
+    rows = parse_feed(SRC, rss(
+        entry(1, "<description>None</description><author>None</author>"),
+        entry(2, "<description> null </description><author>undefined</author>"),
+        entry(3, "<description>Artikel 3</description>"),              # nur der Titel
+        entry(4, "<description>Echter Teaser</description><author>Anna</author>"),
+    ))
+    by_guid = {r["guid"]: r for r in rows}
+    assert [by_guid[f"g{i}"]["summary"] for i in (1, 2, 3)] == ["", "", ""]
+    assert by_guid["g1"]["author"] is None and by_guid["g2"]["author"] is None
+    assert by_guid["g4"]["summary"] == "Echter Teaser" and by_guid["g4"]["author"] == "Anna"
+
+
+def test_migration_v5_clears_placeholders(tmp_path):
+    from app.db import Database
+    d = Database(tmp_path / "k.db")
+    d.upsert_articles([make_row("alpha", 1, ago(hours=1), summary="None", author="null"),
+                       make_row("alpha", 2, ago(hours=1), summary="Undefined "),
+                       make_row("alpha", 3, ago(hours=1), summary="Nonetheless", author="Anna")])
+    d.set_meta("schema_version", "4")
+    d.close()
+    for _ in range(2):  # mehrfach ausführbar
+        d = Database(tmp_path / "k.db")
+        rows = {r["guid"]: (r["summary"], r["author"]) for r in d.q("SELECT guid, summary, author FROM articles")}
+        assert rows == {"alpha-1": ("", None), "alpha-2": ("", None), "alpha-3": ("Nonetheless", "Anna")}
+        idx = {r["name"] for r in d.q("PRAGMA index_list(articles)")}
+        assert "idx_articles_read_paywalled_source" in idx
+        d.close()
+
+
 # ---- _fetch_feed ------------------------------------------------------------
 
 async def test_fetch_feed_conditional_and_retention(db, settings):

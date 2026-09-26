@@ -1,21 +1,31 @@
 <!doctype html>
-<html lang="de">
+<html lang="de" data-theme="dark" data-text="m">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src * data:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; object-src 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#000000">
+<meta name="color-scheme" content="dark light">
 <title>Kiosk</title>
-<link rel="stylesheet" href="/app.css">
+<script src="/js/theme-boot.js"></script>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icons/icon-192.png">
+<link rel="preload" href="/fonts/doto-700-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/fonts/space-grotesk-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/css/tokens.css">
+<link rel="stylesheet" href="/css/app.css">
+<script type="module" src="/js/app.js"></script>
 </head>
 <body>
-<h1>Kiosk</h1>
-<p>Backend-Platzhalter. Die richtige Oberfläche folgt.</p>
-<form id="login">
-  <input id="pw" type="password" placeholder="Passwort" autocomplete="current-password" required>
-  <button>Anmelden</button>
-  <span id="msg"></span>
-</form>
-<p id="links" hidden><a href="/docs">API-Dokumentation</a> · <a href="#" id="logout">Abmelden</a></p>
-<pre id="status" hidden></pre>
-<script src="/app.js"></script>
+<div id="shell" data-layout="list">
+  <main id="view" tabindex="-1"></main>
+  <section id="reader" aria-label="Artikel" tabindex="-1"></section>
+  <nav id="bar" aria-label="Schnellzugriff" hidden></nav>
+</div>
+<div id="sheet" hidden></div>
+<div id="toast" role="status" aria-live="polite"></div>
+<noscript><p class="noscript">Kiosk braucht JavaScript.</p></noscript>
 </body>
 </html>

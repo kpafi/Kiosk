@@ -18,14 +18,15 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .auth import COOKIE_NAMES, Auth
+from .auth import COOKIE_NAMES, LOGIN_ERROR, Auth, burn_time, normalize_username, verify_password
 from .config import docs_enabled, load_settings
 from .db import Database, _iso, utcnow
 from .fetcher import Fetcher
 from .sources import Catalog
 from .state import State, state  # noqa: F401  (State für Importe von außen)
 from . import api_ui
-from .api_ui import article_scope, invalidate_unread, ui_settings
+from .api_ui import admin_user, article_scope, current_user, invalidate_unread, public_user
+from .users import seed_builtin_profiles
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("kiosk")
@@ -37,6 +38,7 @@ STALL_GRACE = timedelta(minutes=10)
 RUN_MAX = timedelta(hours=3)            # so lange darf ein einzelner Sammellauf höchstens dauern
 WATCHDOG_INTERVAL = 60                  # Sekunden zwischen zwei Prüfungen des Wachhunds
 WATCHDOG_EXIT_CODE = 3
+VERIFY_SLOTS = 2                        # gleichzeitige scrypt-Prüfungen beim Login (je ca. 16 MiB)
 MAX_ID = 2**63 - 1                      # größter SQLite-INTEGER; größere Werte ergäben einen 500er
 
 
@@ -44,10 +46,30 @@ MAX_ID = 2**63 - 1                      # größter SQLite-INTEGER; größere We
 async def lifespan(app: FastAPI):
     state.settings = load_settings()
     state.catalog = Catalog.load(state.settings.sources_file)
-    state.db = Database(state.settings.db_path)
-    state.db.ensure_sources([(s.id, s.default_enabled) for s in state.catalog.all()])
+    s = state.settings
+    # KIOSK_PASSWORD legt den Admin an, solange es keine Benutzer gibt (frische Datenbank oder
+    # Umbau auf Schema 6); danach hat es keine Wirkung mehr.
+    state.db = Database(s.db_path, admin=(s.admin_user, s.password) if s.password else None)
+    state.db.retention_days = s.retention_days
+    if state.db.user_count() == 0:
+        state.db.close()
+        raise RuntimeError(
+            "Keine Benutzer in der Datenbank. Entweder KIOSK_PASSWORD setzen (Passwort des Admins "
+            "KIOSK_ADMIN_USER, Standard admin) oder den ersten Admin von Hand anlegen: "
+            "python -m app.users add <name> --admin, im Container "
+            "docker compose run --rm kiosk python -m app.users add <name> --admin")
+    if state.db.admin_created:
+        log.info("Admin %r aus KIOSK_ADMIN_USER/KIOSK_PASSWORD angelegt", s.admin_user)
+    elif s.password:
+        log.info("KIOSK_PASSWORD ist gesetzt, wird aber ignoriert: Es gibt schon Benutzer. "
+                 "Passwörter ändern mit python -m app.users passwd <name>")
+    if state.db.active_admin_count() == 0:
+        log.warning("Kein aktiver Admin: Zeitungen und Server lassen sich nicht verwalten. Abhilfe: "
+                    "python -m app.users admin <name> --on (oder enable <name>)")
+    state.db.ensure_sources([(src.id, src.default_enabled) for src in state.catalog.all()])
     _seed_profiles()
-    state.auth = Auth(state.settings, epoch=state.db.session_epoch())
+    state.auth = Auth(state.settings)
+    state.verify_slots = asyncio.Semaphore(VERIFY_SLOTS)
     state.fetcher = Fetcher(state.db, state.catalog, state.settings)
     state.started_at = datetime.now(timezone.utc)
     await state.fetcher.start()
@@ -76,13 +98,11 @@ async def lifespan(app: FastAPI):
 
 
 def _seed_profiles() -> None:
-    """Vorgegebene Profile anlegen, falls noch keine existieren (nach Migration auf v4 oder neu)."""
-    enabled = set(state.db.enabled_source_ids())
-    de = [s.id for s in state.catalog.all() if s.country == "DE"]
-    business = [s.id for s in state.catalog.all() if s.category == "business"]
-    # Keine Wirtschaftsquelle aktiv: alle Quellen, die Begriffe filtern.
-    if state.db.seed_profiles(de, business if enabled & set(business) else None):
-        log.info("Vorgegebene Profile angelegt")
+    """Vorgegebene Profile für jeden Benutzer ohne Profile anlegen (neuer Admin; Konten aus der
+    Kommandozeile bekommen sie schon dort)."""
+    for user_id in state.db.users_without_profiles():
+        if seed_builtin_profiles(state.db, state.catalog, user_id):
+            log.info("Vorgegebene Profile für Benutzer %d angelegt", user_id)
     invalidate_unread()
 
 
@@ -100,8 +120,11 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "?"
 
 
-def _is_authenticated(request: Request) -> bool:
-    return state.auth.token_from_cookies(request.cookies) is not None
+def _load_user(request: Request) -> dict[str, Any] | None:
+    """Angemeldeter Benutzer aus dem Cookie, einmal pro Request (request.state.user)."""
+    if not hasattr(request.state, "user"):
+        request.state.user = state.auth.user_from_cookies(request.cookies, state.db.get_user)
+    return request.state.user
 
 
 def _origin_tuple(raw: str) -> tuple[str, str, int | None] | None:
@@ -137,7 +160,7 @@ async def require_login(request: Request, call_next):
     if path.startswith("/api/") and request.method not in SAFE_METHODS and not _same_origin(request):
         return JSONResponse({"detail": "Fremde Herkunft abgelehnt"}, status_code=403)
     if path.startswith("/api/") or path in ("/docs", "/openapi.json"):
-        if path not in OPEN_PATHS and not _is_authenticated(request):
+        if _load_user(request) is None and path not in OPEN_PATHS:
             return JSONResponse({"detail": "Nicht angemeldet"}, status_code=401)
     response = await call_next(request)
     # Statische Dateien (index, JS, CSS, sw.js, Schriften, Icons) haben keine versionierten URLs:
@@ -175,37 +198,47 @@ class HeadAsGet:
 app.add_middleware(HeadAsGet)
 
 
-def authed(request: Request) -> None:
-    if not _is_authenticated(request):
-        raise HTTPException(401, "Nicht angemeldet")
-
-
 class LoginBody(BaseModel):
+    username: str = Field(min_length=1, max_length=100)
     password: str = Field(min_length=1, max_length=500)
 
 
 @app.post("/api/login", status_code=204)
 async def login(body: LoginBody, request: Request):
     ip = _client_ip(request)
-    if state.auth.rate_limited(ip):
+    username = normalize_username(body.username)
+    limit_key = username or body.username.strip().lower()[:64]
+    # Der Versuch zählt schon vor der Passwortprüfung (atomar mit der Prüfung der Grenzen);
+    # ein erfolgreicher Login gibt nur diese Reservierung zurück (die Zähler des Namens verfallen).
+    if not state.auth.reserve(ip, limit_key):
         raise HTTPException(429, "Zu viele Versuche, bitte später erneut")
-    if not state.auth.check_password(body.password):
-        state.auth.note_failure(ip)
-        raise HTTPException(401, "Falsches Passwort")
-    state.auth.clear(ip)
+    user = state.db.get_user_by_name(username) if username else None
+    # scrypt im Thread (blockiert sonst die Event-Loop), höchstens zwei gleichzeitig; unbekannte
+    # Namen kosten genauso lange, gesperrte Konten bekommen dieselbe Meldung wie ein falsches Passwort.
+    async with state.verify_slots:
+        if user is None:
+            await asyncio.to_thread(burn_time, body.password)
+            ok = False
+        else:
+            ok = await asyncio.to_thread(verify_password, body.password, user["password_hash"])
+    if not ok or user["disabled"]:
+        raise HTTPException(401, LOGIN_ERROR)
+    state.auth.clear(ip, limit_key)
+    state.db.update_user(user["id"], last_login_at=utcnow())
     response = Response(status_code=204)
     # Ohne Domain-Attribut; mit Secure gilt das __Host-Präfix.
     response.set_cookie(
-        state.auth.cookie_name, state.auth.issue_token(), max_age=state.auth.max_age,
+        state.auth.cookie_name, state.auth.issue_token(user), max_age=state.auth.max_age,
         httponly=True, samesite="lax", secure=state.auth.cookie_secure, path="/",
     )
     return response
 
 
 @app.post("/api/logout", status_code=204)
-async def logout(request: Request):
-    # Neue Session-Epoche: alle bisher ausgegebenen Cookies (auch kopierte) werden ungültig.
-    state.auth.epoch = state.db.bump_session_epoch()
+async def logout(request: Request, user: dict = Depends(current_user)):
+    # Neue Session-Epoche des Benutzers: alle seine bisher ausgegebenen Cookies (auch kopierte)
+    # werden ungültig, andere Benutzer bleiben angemeldet.
+    state.db.end_sessions(user["id"])
     response = Response(status_code=204)
     for name in COOKIE_NAMES:
         if name in request.cookies:
@@ -216,7 +249,13 @@ async def logout(request: Request):
 
 @app.get("/api/session")
 async def session(request: Request):
-    return {"authenticated": _is_authenticated(request)}
+    user = _load_user(request)
+    return {"authenticated": user is not None, "user": public_user(user) if user else None}
+
+
+@app.get("/api/me")
+async def me(user: dict = Depends(current_user)):
+    return public_user(user)
 
 
 def _build() -> str:
@@ -312,31 +351,31 @@ def _source_view(s, st, counts, favorites: set[str]) -> dict[str, Any]:
     }
 
 
-@app.get("/api/sources", dependencies=[Depends(authed)])
-async def list_sources():
+@app.get("/api/sources")
+async def list_sources(user: dict = Depends(current_user)):
     states = state.db.source_states()
-    counts = state.db.source_counts()
-    favorites = _favorite_ids()
+    counts = state.db.source_counts(user["id"])
+    favorites = _favorite_ids(user["id"])
     return [_source_view(s, states.get(s.id), counts, favorites) for s in state.catalog.all()]
 
 
-def _favorite_ids() -> set[str]:
-    return {f["source_id"] for f in state.db.list_favorites()}
+def _favorite_ids(user_id: int) -> set[str]:
+    return {f["source_id"] for f in state.db.list_favorites(user_id)}
 
 
 class SourcePatch(BaseModel):
     enabled: bool
 
 
-@app.patch("/api/sources/{source_id}", dependencies=[Depends(authed)])
-async def patch_source(source_id: str, body: SourcePatch):
+@app.patch("/api/sources/{source_id}")
+async def patch_source(source_id: str, body: SourcePatch, user: dict = Depends(admin_user)):
     if source_id not in state.catalog:
         raise HTTPException(404, "Unbekannte Quelle")
     state.db.set_source_enabled(source_id, body.enabled)
     invalidate_unread()
     states = state.db.source_states()
-    return _source_view(state.catalog.get(source_id), states.get(source_id), state.db.source_counts(),
-                        _favorite_ids())
+    return _source_view(state.catalog.get(source_id), states.get(source_id),
+                        state.db.source_counts(user["id"]), _favorite_ids(user["id"]))
 
 
 class BulkSources(BaseModel):
@@ -349,8 +388,8 @@ def _check_source_count(ids: list[str]) -> None:
         raise HTTPException(400, f"Höchstens {MAX_SOURCE_IDS} Quellen-IDs pro Anfrage")
 
 
-@app.post("/api/sources/bulk", dependencies=[Depends(authed)])
-async def bulk_sources(body: BulkSources):
+@app.post("/api/sources/bulk")
+async def bulk_sources(body: BulkSources, user: dict = Depends(admin_user)):
     _check_source_count(body.enabled)
     _check_source_count(body.disabled)
     for sid in body.enabled:
@@ -360,7 +399,7 @@ async def bulk_sources(body: BulkSources):
         if sid in state.catalog:
             state.db.set_source_enabled(sid, False)
     invalidate_unread()
-    return await list_sources()
+    return await list_sources(user)
 
 
 # ---- articles ------------------------------------------------------------
@@ -384,14 +423,14 @@ def _decorate(item: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-def _filters(source: str | None, country: str | None, profile: int | None, *, unread: bool,
+def _filters(user_id: int, source: str | None, country: str | None, profile: int | None, *, unread: bool,
              starred: bool, later: bool, free: bool | None, days: int | None) -> dict[str, Any]:
     """Gemeinsamer Filterkontext für Liste und "nächster Artikel" (Argumente für db.list_articles)."""
     sources = _csv(source)
     _check_source_count(sources)
     saved = starred or later
     # Ohne Quelle/Profil nur aktivierte Quellen; Gemerktes bleibt auch aus ausgeschalteten sichtbar.
-    scope, terms = article_scope(sources, {c.upper() for c in _csv(country)}, profile,
+    scope, terms = article_scope(user_id, sources, {c.upper() for c in _csv(country)}, profile,
                                  only_enabled=not saved)
     since = _iso(datetime.now(timezone.utc) - timedelta(days=days)) if days else None
     # Paywall-Artikel sind ausgeblendet, außer in Gemerkt (die Leseansicht zeigt dort den
@@ -401,7 +440,7 @@ def _filters(source: str | None, country: str | None, profile: int | None, *, un
             "later": later, "free_only": free_only, "since": since}
 
 
-@app.get("/api/articles", dependencies=[Depends(authed)])
+@app.get("/api/articles")
 async def list_articles(
     source: str | None = Query(None, description="Quellen-IDs, kommagetrennt"),
     country: str | None = Query(None, description="Ländercodes, kommagetrennt"),
@@ -416,18 +455,19 @@ async def list_articles(
                                description="Cursor aus `next_before` (\"<published_at>|<id>\"); ohne Suche"),
     offset: int = Query(0, ge=0, le=10_000, description="Versatz für Suchergebnisse (mit `q`)"),
     limit: int = Query(50, ge=1, le=200),
+    user: dict = Depends(current_user),
 ):
-    filters = _filters(source, country, profile, unread=unread, starred=starred, later=later,
+    filters = _filters(user["id"], source, country, profile, unread=unread, starred=starred, later=later,
                        free=free, days=days)
     cursor = None if q else _parse_cursor(before)
     # Wasserstand vor der Abfrage lesen: Die Oberfläche schickt ihn an read-all, damit später
     # geholte Artikel nicht ungesehen als gelesen gelten.
     max_id = state.db.max_article_id()
     try:
-        rows = state.db.list_articles(query=q, before=cursor, limit=limit, offset=offset if q else 0,
+        rows = state.db.list_articles(user["id"], query=q, before=cursor, limit=limit, offset=offset if q else 0,
                                       **filters)
         # Trefferzahl nur bei Suchen, gedeckelt
-        total = state.db.count_articles(cap=1000, query=q, **filters) if q else None
+        total = state.db.count_articles(user["id"], cap=1000, query=q, **filters) if q else None
     except sqlite3.OperationalError as e:
         if q:
             raise HTTPException(400, "Ungültige Suchanfrage") from e
@@ -443,21 +483,22 @@ async def list_articles(
             "max_id": max_id}
 
 
-@app.get("/api/articles/{article_id}/next", dependencies=[Depends(authed)])
+@app.get("/api/articles/{article_id}/next")
 async def next_article(
     article_id: int = PathParam(ge=1, le=MAX_ID),
     source: str | None = Query(None), country: str | None = Query(None),
     profile: int | None = Query(None, ge=1, le=MAX_ID),
     unread: bool = True, starred: bool = False, later: bool = False,
     free: bool | None = None, days: int | None = Query(None, ge=1, le=3650),
+    user: dict = Depends(current_user),
 ):
     """Nächster älterer Artikel im selben Filterkontext wie die Liste (Keyset ab dem aktuellen)."""
     published = state.db.published_at_of(article_id)
     if published is None:
         raise HTTPException(404, "Artikel nicht gefunden")
-    filters = _filters(source, country, profile, unread=unread, starred=starred, later=later,
+    filters = _filters(user["id"], source, country, profile, unread=unread, starred=starred, later=later,
                        free=free, days=days)
-    rows = state.db.list_articles(query=None, before=(published, article_id), limit=1, **filters)
+    rows = state.db.list_articles(user["id"], query=None, before=(published, article_id), limit=1, **filters)
     return {"item": _decorate(dict(rows[0])) if rows else None}
 
 
@@ -495,9 +536,10 @@ def _parse_cursor(raw: str | None) -> tuple[str, int] | None:
     return published, int(id_part)
 
 
-@app.get("/api/articles/{article_id}", dependencies=[Depends(authed)])
-async def get_article(article_id: int = PathParam(ge=1, le=MAX_ID), retry: bool = False):
-    row = state.db.get_article(article_id)
+@app.get("/api/articles/{article_id}")
+async def get_article(article_id: int = PathParam(ge=1, le=MAX_ID), retry: bool = False,
+                      user: dict = Depends(current_user)):
+    row = state.db.get_article(article_id, user["id"])
     if not row:
         raise HTTPException(404, "Artikel nicht gefunden")
     # Auf Anforderung nur extrahieren, wenn fällig; ?retry=true darf den Zeitplan nur für
@@ -524,24 +566,27 @@ class FlagBody(BaseModel):
     value: bool = True
 
 
-@app.post("/api/articles/{article_id}/read", dependencies=[Depends(authed)])
-async def set_read(article_id: int = PathParam(ge=1, le=MAX_ID), body: FlagBody = FlagBody()):
-    if not state.db.set_flag(article_id, "read", body.value):
+@app.post("/api/articles/{article_id}/read")
+async def set_read(article_id: int = PathParam(ge=1, le=MAX_ID), body: FlagBody = FlagBody(),
+                   user: dict = Depends(current_user)):
+    if not state.db.set_flag(user["id"], article_id, "read", body.value):
         raise HTTPException(404, "Artikel nicht gefunden")
-    invalidate_unread()
+    invalidate_unread(user["id"])
     return {"id": article_id, "read": body.value}
 
 
-@app.post("/api/articles/{article_id}/star", dependencies=[Depends(authed)])
-async def set_star(article_id: int = PathParam(ge=1, le=MAX_ID), body: FlagBody = FlagBody()):
-    if not state.db.set_flag(article_id, "starred", body.value):
+@app.post("/api/articles/{article_id}/star")
+async def set_star(article_id: int = PathParam(ge=1, le=MAX_ID), body: FlagBody = FlagBody(),
+                   user: dict = Depends(current_user)):
+    if not state.db.set_flag(user["id"], article_id, "starred", body.value):
         raise HTTPException(404, "Artikel nicht gefunden")
     return {"id": article_id, "starred": body.value}
 
 
-@app.post("/api/articles/{article_id}/later", dependencies=[Depends(authed)])
-async def set_later(article_id: int = PathParam(ge=1, le=MAX_ID), body: FlagBody = FlagBody()):
-    if not state.db.set_flag(article_id, "later", body.value):
+@app.post("/api/articles/{article_id}/later")
+async def set_later(article_id: int = PathParam(ge=1, le=MAX_ID), body: FlagBody = FlagBody(),
+                    user: dict = Depends(current_user)):
+    if not state.db.set_flag(user["id"], article_id, "later", body.value):
         raise HTTPException(404, "Artikel nicht gefunden")
     return {"id": article_id, "later": body.value}
 
@@ -553,8 +598,8 @@ class ReadAllBody(BaseModel):
     max_id: int | None = Field(None, ge=1, le=MAX_ID, description="Nur Artikel mit ID <= max_id")
 
 
-@app.post("/api/articles/read-all", dependencies=[Depends(authed)])
-async def read_all(body: ReadAllBody = ReadAllBody()):
+@app.post("/api/articles/read-all")
+async def read_all(body: ReadAllBody = ReadAllBody(), user: dict = Depends(current_user)):
     """Alles als gelesen markieren; `sources`, `source` und `profile` schränken die Menge ein
     (mehrere Angaben: Schnittmenge), `max_id` begrenzt auf die bereits angezeigten Artikel.
     `marked` zählt nur Artikel ohne Paywall (wie die Zähler der Oberfläche)."""
@@ -564,27 +609,30 @@ async def read_all(body: ReadAllBody = ReadAllBody()):
         sources = [s for s in sources if s == body.source] if sources else [body.source]
         if not sources:  # Widerspruch zwischen sources und source: nichts markieren
             return {"marked": 0}
-    scope, terms = article_scope(sources, set(), body.profile)
-    marked = state.db.mark_all_read(scope, terms or None, body.max_id)
-    invalidate_unread()
+    scope, terms = article_scope(user["id"], sources, set(), body.profile)
+    marked = state.db.mark_all_read(user["id"], scope, terms or None, body.max_id)
+    invalidate_unread(user["id"])
     return {"marked": marked}
 
 
 # ---- status --------------------------------------------------------------
 
-@app.post("/api/refresh", dependencies=[Depends(authed)])
+@app.post("/api/refresh", dependencies=[Depends(admin_user)])
 async def refresh():
     if not state.fetcher.trigger():
         raise HTTPException(409, "Ein Sammellauf läuft bereits")
     return {"started": True}
 
 
-@app.get("/api/status", dependencies=[Depends(authed)])
-async def status():
+@app.get("/api/status")
+async def status(user: dict = Depends(current_user)):
+    # Nicht-Admins sehen nur Build und Sammler-Zustand, keine Server-Werte.
+    if not user["is_admin"]:
+        return {"build": _build(), "fetcher": state.fetcher.state}
     return {
         "build": _build(),
         "fetcher": state.fetcher.state,
-        "db": state.db.stats(),
+        "db": state.db.stats(user["id"]),
         "settings": {
             "fetch_interval": state.settings.fetch_interval,
             "retention_days": state.settings.retention_days,

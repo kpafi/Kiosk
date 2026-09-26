@@ -3,7 +3,8 @@
 
 import { api, setUnauthorizedHandler } from './api.js';
 import {
-  applySettings, loadBar, loadBasics, loadSources, on, replaceHash, state,
+  applySettings, loadBar, loadBasics, loadSession, loadSources, on, replaceHash, resetUserState,
+  setSession, state,
 } from './store.js';
 import { isDesktop } from './ui/dom.js';
 import { showBar } from './ui/bar.js';
@@ -34,6 +35,7 @@ let current = { key: null, view: null };   // Inhalt von #view
 let reader = null;                          // offene Leseansicht in #reader
 let listScroll = 0;                         // Scrollposition der Liste (Handy)
 let afterLogin = null;                      // Ziel nach dem Anmelden
+let afterLoginUser = null;                  // Benutzer-ID, zu der afterLogin gehört
 
 // ---- Routen (parseHash in route.js) -------------------------------------------------
 
@@ -83,20 +85,40 @@ function showLogin() {
   closeSheet({ silent: true });
   closeReader();
   const r = parseHash(location.hash);
-  if (r.name !== 'login') afterLogin = location.hash || '#/';
+  if (r.name !== 'login') {
+    afterLogin = location.hash || '#/';
+    // Die Adresse gehört dem bisherigen Benutzer (null = niemand war angemeldet).
+    afterLoginUser = state.user ? state.user.id : null;
+  }
   const view = mount({ key: 'login' }, () => loginView({ onSuccess: loggedIn }));
   setLayout('page', false);
   setTitle(view);
   view.onShow?.();
 }
 
+/** Ziel nach dem Anmelden. Profil-Adressen (#/profile/<id>, #/?p=<id>) gehören evtl. einem anderen
+ *  Benutzer (Profil-IDs sind je Benutzer): dann lieber zur Startliste. */
+function loginTarget(hash) {
+  if (!hash || hash.startsWith('#/login')) return '#/';
+  const r = parseHash(hash);
+  if (r.name === 'editor' || (r.name === 'list' && r.params.get('p'))) return '#/';
+  return hash;
+}
+
 async function loggedIn() {
+  const saved = afterLogin;
+  const savedUser = afterLoginUser;
+  resetUserState();
+  try { await loadSession(); } catch { /* Benutzer unbekannt: Admin-Funktionen bleiben aus */ }
   state.authed = true;
   await loadBasics();
   current = { key: null, view: null };
-  const target = afterLogin && !afterLogin.startsWith('#/login') ? afterLogin : '#/';
   afterLogin = null;
-  replaceHash(target);
+  afterLoginUser = null;
+  // Die gemerkte Adresse gilt für denselben Benutzer und beim Kaltstart ohne vorherige Sitzung
+  // (Lesezeichen wie #/s/taz); wer sich als jemand anderes anmeldet, beginnt auf der Startliste.
+  const same = savedUser === null || (state.user && state.user.id === savedUser);
+  replaceHash(same ? loginTarget(saved) : '#/');
 }
 
 let routedHash = null;   // Adresse des letzten route()-Aufrufs
@@ -192,7 +214,7 @@ async function start() {
     if (err.status !== 401) { state.authed = null; showOffline(err.status); return; }
     session = { authenticated: false };
   }
-  state.authed = !!(session && session.authenticated);
+  setSession(session);
   if (state.authed) await loadBasics();
   current = { key: null, view: null };
   route();

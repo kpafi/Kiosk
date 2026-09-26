@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,8 @@ DEFAULT_UA = (
 # Passwort aus .env.example: darf nie produktiv laufen.
 EXAMPLE_PASSWORD = "bitte-aendern"
 MIN_PASSWORD_LEN = 12
+# Benutzernamen: 2 bis 32 Zeichen, klein geschrieben gespeichert.
+USERNAME_RE = re.compile(r"[a-z0-9._-]{2,32}")
 
 
 @dataclass(frozen=True)
@@ -21,7 +24,7 @@ class Settings:
     db_path: Path
     sources_file: Path
     static_dir: Path
-    password: str
+    password: str               # KIOSK_PASSWORD; nur noch Bootstrap des Admins, "" = nicht gesetzt
     secret: str
     fetch_interval: int
     retention_days: int
@@ -30,6 +33,7 @@ class Settings:
     session_max_age: int
     cookie_secure: bool
     disable_fetcher: bool
+    admin_user: str = "admin"   # KIOSK_ADMIN_USER: Name des Admins beim Bootstrap
 
 
 def _int(name: str, default: int, lo: int | None = None, hi: int | None = None) -> int:
@@ -57,6 +61,28 @@ def docs_enabled() -> bool:
     return _bool("KIOSK_DOCS", False)
 
 
+def admin_username() -> str:
+    """KIOSK_ADMIN_USER (Standard "admin"), klein geschrieben; ungültig: RuntimeError."""
+    raw = os.environ.get("KIOSK_ADMIN_USER", "").strip().lower() or "admin"
+    if not USERNAME_RE.fullmatch(raw):
+        raise RuntimeError("KIOSK_ADMIN_USER: 2 bis 32 Zeichen aus a-z, 0-9, Punkt, Unterstrich, Bindestrich")
+    return raw
+
+
+def bootstrap_password() -> str:
+    """KIOSK_PASSWORD (ohne Leerzeichen am Rand), "" = nicht gesetzt; ungültig: RuntimeError.
+
+    Nur noch das Startpasswort des Admins (Umbau auf Schema 6 oder frische Datenbank). Ob es
+    gebraucht wird, entscheidet die Datenbank; gesetzt muss es gültig sein. Dieselben Regeln für
+    die App (load_settings) und die Kommandozeile (app.users)."""
+    password = os.environ.get("KIOSK_PASSWORD", "").strip()
+    if password == EXAMPLE_PASSWORD:
+        raise RuntimeError("KIOSK_PASSWORD ist noch das Beispiel aus .env.example, bitte ändern")
+    if password and len(password) < MIN_PASSWORD_LEN:
+        raise RuntimeError(f"KIOSK_PASSWORD muss mindestens {MIN_PASSWORD_LEN} Zeichen lang sein")
+    return password
+
+
 def load_settings() -> Settings:
     root = Path(__file__).resolve().parent.parent
     data_dir = Path(os.environ.get("KIOSK_DATA_DIR", root / "data")).resolve()
@@ -79,13 +105,8 @@ def load_settings() -> Settings:
                 with os.fdopen(fd, "w") as f:
                     f.write(secret)
 
-    password = os.environ.get("KIOSK_PASSWORD", "").strip()
-    if not password:
-        raise RuntimeError("KIOSK_PASSWORD ist nicht gesetzt")
-    if password == EXAMPLE_PASSWORD:
-        raise RuntimeError("KIOSK_PASSWORD ist noch das Beispiel aus .env.example, bitte ändern")
-    if len(password) < MIN_PASSWORD_LEN:
-        raise RuntimeError(f"KIOSK_PASSWORD muss mindestens {MIN_PASSWORD_LEN} Zeichen lang sein")
+    password = bootstrap_password()
+    admin_user = admin_username()
 
     return Settings(
         data_dir=data_dir,
@@ -103,4 +124,5 @@ def load_settings() -> Settings:
         cookie_secure=_bool("KIOSK_COOKIE_SECURE", True),
         # Für Tests: kein Sammler, keine Netzwerkzugriffe.
         disable_fetcher=_bool("KIOSK_DISABLE_FETCHER", False),
+        admin_user=admin_user,
     )

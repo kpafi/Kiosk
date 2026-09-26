@@ -17,6 +17,7 @@ class State:
     catalog: Catalog
     fetcher: Fetcher
     auth: Auth
+    verify_slots: asyncio.Semaphore     # begrenzt parallele scrypt-Prüfungen beim Login
     task: asyncio.Task | None = None
     watchdog: asyncio.Task | None = None
     started_at: datetime | None = None

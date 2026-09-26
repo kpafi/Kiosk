@@ -1,7 +1,9 @@
 # Kiosk
 
 Privater Nachrichten-Aggregator: holt RSS-Feeds von über 90 seriösen Zeitungen aus aller Welt,
-extrahiert den Volltext der Artikel und stellt alles gebündelt hinter einem Passwort bereit.
+extrahiert den Volltext der Artikel und stellt alles gebündelt hinter einer Anmeldung bereit.
+Mehrere Personen aus dem engsten Kreis teilen sich die gesammelten Artikel, jede mit eigenem
+Konto, Lesestand, Profilen, Lieblingszeitungen, Leiste und Einstellungen (siehe Benutzer).
 
 ## Aufbau
 
@@ -11,7 +13,8 @@ extrahiert den Volltext der Artikel und stellt alles gebündelt hinter einem Pas
   - `extract.py` Volltext per trafilatura, HTML auf eine Whitelist bereinigt, Paywall-Erkennung
   - `db.py` SQLite mit WAL und FTS5-Volltextsuche
   - `api_ui.py` Routen für die Oberfläche: Profile, Lieblingszeitungen, Leiste, Einstellungen, Zähler
-  - `auth.py` ein Passwort, signiertes Cookie, Login-Bremse
+  - `auth.py` Passwort-Hashes (scrypt), signiertes Cookie pro Benutzer, Login-Bremse
+  - `users.py` Konten verwalten auf der Kommandozeile (`python -m app.users`)
 - `static/` Web-Oberfläche (PWA ohne Build-Schritt: `index.html`, `js/`, `css/`, `sw.js`)
 - `deploy/` Caddy-Block und Deploy-Skript für die Hetzner-Box
 
@@ -19,20 +22,60 @@ extrahiert den Volltext der Artikel und stellt alles gebündelt hinter einem Pas
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-KIOSK_PASSWORD=test KIOSK_COOKIE_SECURE=false KIOSK_DOCS=1 .venv/bin/uvicorn app.main:app --reload --port 8100
+KIOSK_PASSWORD=test-passwort-lokal KIOSK_COOKIE_SECURE=false KIOSK_DOCS=1 .venv/bin/uvicorn app.main:app --reload --port 8100
 ```
 
-Dann http://127.0.0.1:8100 öffnen, API-Doku unter `/docs` (nach Login, nur mit `KIOSK_DOCS=1`).
+Dann http://127.0.0.1:8100 öffnen und als `admin` mit dem Passwort anmelden, API-Doku unter `/docs`
+(nach Login, nur mit `KIOSK_DOCS=1`).
+
+## Benutzer
+
+Die Instanz ist nur für den engsten Kreis gedacht. Es gibt keine Registrierung und kein
+„Passwort vergessen“: Konten legt der Betreiber per SSH auf der Kommandozeile an. Die Artikel,
+Quellen und der Volltextindex sind gemeinsam; Lesestand, Gemerkt, Später lesen, Profile,
+Lieblingszeitungen, Leiste und Einstellungen gehören jedem Benutzer allein.
+
+- Beim ersten Start (oder beim Umbau einer älteren Datenbank auf Schema 6) legt die App den Admin an:
+  Name aus `KIOSK_ADMIN_USER` (Standard `admin`), Passwort aus `KIOSK_PASSWORD`. Der bisherige
+  Lesestand, die Profile, Favoriten und Einstellungen gehen dabei auf den Admin über. Gibt es schon
+  Benutzer, hat `KIOSK_PASSWORD` keine Wirkung mehr (Hinweis im Log).
+  Ohne `KIOSK_PASSWORD` den ersten Admin von Hand anlegen: `python -m app.users add <name> --admin`
+  bzw. vor dem ersten Start `docker compose run --rm kiosk python -m app.users add <name> --admin`
+  (legt die Datenbank bei Bedarf an). Solange es keinen aktiven Admin gibt, wird jeder mit `add`
+  angelegte Benutzer automatisch Admin; ohne aktiven Admin warnt die App beim Start im Log.
+- Nur Admins dürfen Quellen ein- und ausschalten (`PATCH /api/sources/{id}`, `POST /api/sources/bulk`),
+  einen Sammellauf starten (`POST /api/refresh`) und die Server-Werte in `/api/status` sehen; sonst 403.
+- Im Container (vom Laptop aus bequemer mit `deploy/user.sh`, siehe `deploy/README.md`):
+
+```bash
+python -m app.users list
+python -m app.users add <name> [--admin] [--name "Anzeigename"] [--password-stdin]
+python -m app.users passwd <name> [--password-stdin]   # beendet alle Sitzungen des Benutzers
+python -m app.users disable <name> | enable <name>     # sperren beendet ebenfalls alle Sitzungen
+python -m app.users remove <name> [--yes]              # löscht Lesestand, Profile, Favoriten, Einstellungen
+python -m app.users admin <name> --on|--off
+```
+
+Benutzernamen: 2 bis 32 Zeichen aus `a-z`, `0-9`, `.`, `_`, `-` (Groß- und Kleinschreibung zählt beim
+Anmelden nicht). Passwörter: mindestens 12 Zeichen ohne Leerzeichen am Rand, nicht gleich dem
+Benutzernamen, gespeichert als scrypt-Hash
+(`scrypt$n$r$p$salt$hash`, n=2^14, r=8, p=1). Ohne `--password-stdin` wird das Passwort zweimal
+verdeckt abgefragt. Anzeigenamen: höchstens 64 Zeichen (nach NFC-Normalisierung), keine
+Steuerzeichen. Der Admin aus `KIOSK_PASSWORD` heißt anfangs wie sein Benutzername mit großem
+Anfangsbuchstaben („Admin“). Der letzte aktive Admin lässt sich nicht löschen, sperren oder herabstufen.
+`remove` fragt nach (ohne Terminal nur mit `--yes`). Neue Konten bekommen die vier vorgegebenen Profile.
 
 ## API (Kurzfassung)
 
 | Methode | Pfad | Zweck |
 |---|---|---|
-| POST | `/api/login` `{password}` | Anmelden, setzt Cookie |
-| POST | `/api/logout` | Abmelden; macht alle Sessions ungültig |
+| POST | `/api/login` `{username, password}` | Anmelden (204), setzt Cookie; Fehler immer 401 „Benutzername oder Passwort falsch“, 429 bei zu vielen Versuchen |
+| POST | `/api/logout` | Abmelden; beendet alle Sitzungen dieses Benutzers auf allen Geräten |
+| GET | `/api/session` | Ohne Login: `{authenticated, user}`, `user` ist `{id, username, display_name, is_admin}` oder `null` |
+| GET | `/api/me` | Der angemeldete Benutzer `{id, username, display_name, is_admin}` |
 | GET | `/api/sources` | Alle Quellen mit Status und Zählern, Kurzname `short`, `is_favorite` |
-| PATCH | `/api/sources/{id}` `{enabled}` | Quelle ein-/ausschalten |
-| POST | `/api/sources/bulk` `{enabled:[], disabled:[]}` | Mehrere Quellen umschalten |
+| PATCH | `/api/sources/{id}` `{enabled}` | Quelle ein-/ausschalten (nur Admin, sonst 403) |
+| POST | `/api/sources/bulk` `{enabled:[], disabled:[]}` | Mehrere Quellen umschalten (nur Admin) |
 | GET | `/api/articles?source=&country=&profile=&q=&unread=&starred=&later=&free=&days=&before=&offset=&limit=` | Artikelliste, siehe Blättern und Filter |
 | GET | `/api/articles/{id}` | Artikel mit Volltext, siehe Abruf auf Anforderung |
 | GET | `/api/articles/{id}/next?source=&country=&profile=&unread=true&starred=&later=&free=&days=` | Nächster älterer Artikel im selben Filterkontext: `{item}` oder `{item: null}` |
@@ -54,11 +97,14 @@ Dann http://127.0.0.1:8100 öffnen, API-Doku unter `/docs` (nach Login, nur mit 
 | GET | `/api/settings` | Einstellungen der Oberfläche |
 | PATCH | `/api/settings` (Teilfelder) | Einstellungen ändern (validiert); liefert alle |
 | GET | `/api/counts` | `{unread, later, starred, profiles, favorites, sources_enabled, sources_total, sources_failing}` |
-| POST | `/api/refresh` | Sammellauf sofort starten |
-| GET | `/api/status` | Build-Zeitstempel (`build`), Sammler-Status, Datenbankgröße, Einstellungen |
+| POST | `/api/refresh` | Sammellauf sofort starten (nur Admin) |
+| GET | `/api/status` | Admin: Build-Zeitstempel (`build`), Sammler-Status (`fetcher`), Datenbank (`db`), Einstellungen (`settings`); andere Benutzer nur `{build, fetcher}` |
 | GET | `/api/build` | Ohne Login: `{build}` (Version des Service Workers) |
 | GET | `/favicon.ico` | Ohne Login: Icon |
 | GET | `/healthz` | Ohne Login; 503, wenn die Datenbank nicht antwortet, die Sammler-Schleife beendet ist (`fetcher`) oder hängt (`fetcher_stalled`: seit mehr als 3 Intervallen + 10 min kein Lauf fertig, bzw. der laufende Lauf dauert schon über 3 h). Im zweiten und dritten Fall beendet ein Wachhund den Prozess nach spätestens 1 min (Exit-Code 3), Docker startet neu |
+
+Alle Artikel-Flags (`read`, `starred`, `later`), Listen, Zähler, Profile, Lieblingszeitungen, Leiste
+und Einstellungen gelten für den angemeldeten Benutzer; Profile anderer Benutzer liefern 404.
 
 Artikelfelder: `text_status` ist `full`, `partial` (Paywall oder sehr kurz), `empty`, `failed` oder `pending`.
 `paywalled` kommt aus der Schema.org-Markierung der Verlage (`isAccessibleForFree: false`).
@@ -167,11 +213,16 @@ Hat ein `pending`-Artikel schon Text, wird er nach einem Fehlschlag `partial` st
 
 ## Konfiguration
 
-Siehe `.env.example`. `KIOSK_PASSWORD` muss mindestens 12 Zeichen lang sein; der Beispielwert aus
-`.env.example` wird abgelehnt. Artikel werden nach `KIOSK_RETENTION_DAYS` (Standard 90) gelöscht, Favoriten bleiben.
+Siehe `.env.example`. `KIOSK_PASSWORD` (Startpasswort des Admins, siehe Benutzer) muss, wenn gesetzt,
+mindestens 12 Zeichen lang sein; der Beispielwert aus `.env.example` wird abgelehnt. Ohne Benutzer in der
+Datenbank und ohne `KIOSK_PASSWORD` startet die App nicht. Artikel werden nach `KIOSK_RETENTION_DAYS` (Standard 90) gelöscht;
+was irgendein Benutzer als Favorit oder „Später lesen“ gemerkt hat, bleibt erhalten, ist aber nach
+Ablauf der Aufbewahrung nur noch für die Benutzer sichtbar, die es selbst gemerkt haben (Liste,
+Suche, Zähler, Artikel per ID).
 
 | Variable | Standard | Bedeutung |
 |---|---|---|
+| `KIOSK_ADMIN_USER` | `admin` | Name des Admins, den `KIOSK_PASSWORD` beim ersten Start anlegt |
 | `KIOSK_COOKIE_SECURE` | `true` | Cookie `__Host-kiosk_session` mit Secure-Flag; für lokale Entwicklung über http `false` (dann `kiosk_session`) |
 | `KIOSK_DISABLE_FETCHER` | `false` | Kein automatischer Sammellauf (für Tests, keine Netzwerkzugriffe) |
 | `KIOSK_FETCH_INTERVAL` | `900` | Sekunden zwischen Sammelläufen, mindestens 60 |
@@ -182,8 +233,16 @@ Siehe `.env.example`. `KIOSK_PASSWORD` muss mindestens 12 Zeichen lang sein; der
 
 Werte außerhalb der Grenzen brechen den Start mit einer klaren Fehlermeldung ab.
 
-Sessions sind an das Passwort gebunden: Wird `KIOSK_PASSWORD` geändert, sind alle Sessions ungültig.
-Abmelden macht ebenfalls alle Sessions ungültig (Zähler `session_epoch` in der Tabelle `meta`).
+Sessions gehören einem Benutzer (signiertes Cookie mit Benutzer-ID, `users.session_epoch` und einem
+Fingerabdruck des Passwort-Hashes). Abmelden und `passwd` erhöhen die Epoche und beenden damit alle
+Sitzungen dieses Benutzers, andere bleiben angemeldet; gesperrte Benutzer bekommen 401. Abmelden
+gilt also auf allen Geräten dieses Benutzers (Handy, Laptop), nicht nur im aktuellen Browser.
+Login-Bremse: höchstens 8 Versuche in 15 Minuten je IP und 30 je Benutzername, dazu höchstens
+200 pro Minute insgesamt (danach 429). Jeder Versuch zählt schon vor der Passwortprüfung (auch
+parallele Anfragen überholen die Bremse nicht); ein erfolgreicher Login setzt die Zähler für IP und
+Namen zurück. Höchstens zwei scrypt-Prüfungen laufen gleichzeitig. Abwägung: Wer viele IPs hat, kann
+einen Benutzernamen mit 30 falschen Versuchen für 15 Minuten sperren; die höhere Grenze je Name
+macht das teurer, ohne Passwort-Raten über viele IPs wirklich zu erleichtern.
 Mit `KIOSK_COOKIE_SECURE=true` wird nur `__Host-kiosk_session` akzeptiert, sonst nur `kiosk_session`;
 nach einem Umschalten ist also eine neue Anmeldung nötig.
 Schreibende API-Aufrufe mit fremdem `Origin` (bzw. `Sec-Fetch-Site: cross-site`) werden mit 403 abgelehnt.
@@ -192,7 +251,11 @@ Statische Dateien (auch `sw.js`, Schriften, Icons) werden mit `Cache-Control: no
 (die URLs sind nicht versioniert; per ETag nachgefragt), `/api/` ohne diesen Kopf.
 
 Die App muss mit genau einem uvicorn-Worker laufen (Login-Bremse im Speicher, eine Sammler-Schleife,
-eine SQLite-Verbindung). Das Datenbankschema wird beim Start automatisch migriert (`meta.schema_version`).
+eine SQLite-Verbindung). Das Datenbankschema wird beim Start automatisch migriert (`meta.schema_version`,
+aktuell 6: Tabellen `users` und `user_articles`, Profile/Favoriten/Einstellungen mit `user_id`). Die alten
+Spalten `articles.read/starred/later` bleiben physisch stehen, werden aber nicht mehr benutzt.
+Den Test der Migration auf einer Kopie der Produktionsdatenbank aktiviert
+`KIOSK_PRODCOPY_DB=/pfad/zur/kopie.db .venv/bin/python -m pytest tests/test_users.py`.
 
 ## Tests
 

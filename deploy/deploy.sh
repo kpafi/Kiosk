@@ -14,7 +14,7 @@ case "$HEALTH_WAIT" in
 esac
 
 # Gebaut wird nach kiosk:candidate (KIOSK_IMAGE, siehe docker-compose.yml); kiosk:latest und
-# kiosk:good zeigen erst nach dem Login-Test auf das neue Image (siehe Ende). Bis dahin bleibt
+# kiosk:good zeigen erst nach der Prüfung über Caddy auf das neue Image (siehe Ende). Bis dahin bleibt
 # kiosk:latest der bisherige Stand, ein gescheiterter Deploy verändert es nicht.
 # Ziel zum Zurückrollen: kiosk:good ist das zuletzt erfolgreich geprüfte Image. Fehlt es (erster
 # Deploy mit diesem Schema), das gerade laufende Image.
@@ -192,38 +192,35 @@ echo "Caddy-Block aktualisiert und neu geladen"
 REMOTE
 
 echo "== Prüfung: Login über Caddy"
-# Ende-zu-Ende über HTTPS, Caddy und die Proxy-Header. Das Passwort wird auf der Box aus der
-# .env gelesen und per stdin an curl gegeben (nicht in der Prozessliste, nicht im Terminal).
-if ! ssh "$BOX" bash -s -- "$HOST" "$DEST" <<'REMOTE'
+# Ende-zu-Ende über HTTPS, Caddy und die Proxy-Header, ohne Zugangsdaten:
+#  1. GET /api/session antwortet 200 mit {"authenticated": false, ...} (Caddy und App laufen).
+#  2. POST /api/login mit richtigem Origin, einem zufälligen, nicht existierenden Benutzernamen und
+#     falschem Passwort antwortet 401 (Origin-/CSRF-Prüfung, Login-Pfad, Datenbank). 403 hieße: Origin
+#     abgelehnt, 429: Login-Bremse.
+# Kein echtes Konto wird belastet (die Bremse je Benutzername trifft nur den Zufallsnamen); der
+# Fehlversuch zählt aber gegen die IP der Box (8 pro 15 Minuten, siehe README).
+if ! ssh "$BOX" bash -s -- "$HOST" <<'REMOTE'
 set -euo pipefail
 host=$1
-dest=$2
-body=$(python3 - "$dest/.env" <<'PYLOGIN'
-import json
-import sys
-
-password = None
-for line in open(sys.argv[1], encoding="utf-8"):
-    key, sep, value = line.strip().partition("=")
-    if sep and key.strip() == "KIOSK_PASSWORD":
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-            value = value[1:-1]
-        password = value.strip()
-if not password:
-    sys.exit("KIOSK_PASSWORD fehlt in der .env")
-print(json.dumps({"password": password}))
-PYLOGIN
-)
-code=$(printf '%s' "$body" | curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
-  -H "Origin: https://$host" -H 'Content-Type: application/json' \
-  -X POST "https://$host/api/login" --data-binary @-) || true
-if [ "$code" != "204" ]; then
-  echo "FEHLER: Login-Test über https://$host/api/login fehlgeschlagen (HTTP ${code:-000}, erwartet 204)." >&2
+session=$(curl -sS --max-time 20 -w '\n%{http_code}' "https://$host/api/session") || session=$'\n000'
+code=${session##*$'\n'}
+if [ "$code" != "200" ] || ! printf '%s' "${session%$'\n'*}" | grep -Eq '"authenticated": ?false'; then
+  echo "FEHLER: https://$host/api/session antwortet nicht wie erwartet (HTTP $code, erwartet 200 mit authenticated false)." >&2
   echo "Der neue Container läuft weiter. Diagnose: docker logs --tail 100 kiosk; journalctl -u caddy -n 50" >&2
   exit 1
 fi
-echo "Login über Caddy: HTTP 204"
+echo "Sitzung über Caddy: HTTP 200, nicht angemeldet"
+probe="deploy-probe-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+code=$(printf '{"username":"%s","password":"kein-echtes-passwort"}' "$probe" \
+  | curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+    -H "Origin: https://$host" -H 'Content-Type: application/json' \
+    -X POST "https://$host/api/login" --data-binary @-) || true
+if [ "$code" != "401" ]; then
+  echo "FEHLER: Login-Probe über https://$host/api/login lieferte HTTP ${code:-000}, erwartet 401 (falsche Zugangsdaten)." >&2
+  echo "Der neue Container läuft weiter. Diagnose: docker logs --tail 100 kiosk; journalctl -u caddy -n 50" >&2
+  exit 1
+fi
+echo "Login-Probe über Caddy: HTTP 401 wie erwartet"
 REMOTE
 then
   rollback_hint

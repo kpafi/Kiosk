@@ -39,9 +39,15 @@ def make_row(source_id: str, n: int, published_at: str, **extra) -> dict:
     return row
 
 
+# Benutzer der db-Fixture (Admin "tester", angelegt beim Öffnen der frischen Datenbank).
+UID = 1
+ADMIN_PASSWORD = "geheim-und-lang"
+
+
 @pytest.fixture
 def db(tmp_path):
-    d = Database(tmp_path / "kiosk.db")
+    d = Database(tmp_path / "kiosk.db", admin=("tester", ADMIN_PASSWORD))
+    assert d.get_user(UID)["username"] == "tester"
     d.ensure_sources([("alpha", True), ("beta", True), ("gamma", False)])
     yield d
     d.close()

@@ -97,7 +97,7 @@ def test_migration_v5_clears_placeholders(tmp_path):
         rows = {r["guid"]: (r["summary"], r["author"]) for r in d.q("SELECT guid, summary, author FROM articles")}
         assert rows == {"alpha-1": ("", None), "alpha-2": ("", None), "alpha-3": ("Nonetheless", "Anna")}
         idx = {r["name"] for r in d.q("PRAGMA index_list(articles)")}
-        assert "idx_articles_read_paywalled_source" in idx
+        assert "idx_articles_read_paywalled_source" not in idx and "idx_articles_published" in idx
         d.close()
 
 

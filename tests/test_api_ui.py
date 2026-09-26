@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 import app.api_ui as api_ui
 from app.main import app, state
-from conftest import ago, make_row
+from conftest import UID, ago, make_row
 
 ORIGIN = "https://testserver"
 
@@ -15,8 +15,20 @@ ORIGIN = "https://testserver"
 @pytest.fixture
 def authed(app_env):
     with TestClient(app, base_url=ORIGIN) as c:
-        assert c.post("/api/login", json={"password": "geheim-und-lang"}).status_code == 204
+        assert c.post("/api/login", json={"username": "admin", "password": "geheim-und-lang"}).status_code == 204
         yield c
+
+
+def _unread(cols: str = "a.title", where: str = "1") -> list:
+    """Ungelesene Artikel des Admins (UID) direkt aus der Datenbank."""
+    return [r[0] for r in state.db.q(
+        f"SELECT {cols} FROM articles a LEFT JOIN user_articles ua ON ua.article_id=a.id AND ua.user_id=? "
+        f"WHERE COALESCE(ua.read, 0)=0 AND {where} ORDER BY a.id", (UID,))]
+
+
+def _set_read(where: str, value: int = 1) -> None:
+    for aid in state.db.q(f"SELECT id FROM articles WHERE {where}"):
+        state.db.set_flag(UID, aid[0], "read", bool(value))
 
 
 def _ids(body):
@@ -56,9 +68,9 @@ def test_builtin_profiles_are_seeded(authed):
 
 def test_seeding_happens_only_once(app_env):
     with TestClient(app, base_url=ORIGIN):
-        state.db.delete_profile(state.db.list_profiles()[-1]["id"])  # direkt in der DB
+        state.db.delete_profile(UID, state.db.list_profiles(UID)[-1]["id"])  # direkt in der DB
     with TestClient(app, base_url=ORIGIN):
-        assert len(state.db.list_profiles()) == 3  # nicht leer: kein erneutes Säen
+        assert len(state.db.list_profiles(UID)) == 3  # nicht leer: kein erneutes Säen
 
 
 def test_business_profile_uses_business_sources_when_active(app_env):
@@ -67,7 +79,7 @@ def test_business_profile_uses_business_sources_when_active(app_env):
              'feed: "https://money.example/feed", homepage: "https://money.example"}\n')
     (app_env / "sources.yaml").write_text(yaml, encoding="utf-8")
     with TestClient(app, base_url=ORIGIN):
-        business = next(p for p in state.db.list_profiles() if p["builtin"] == "business")
+        business = next(p for p in state.db.list_profiles(UID) if p["builtin"] == "business")
         assert business["sources"] == ["money"]
 
 
@@ -116,7 +128,7 @@ def test_search_total_is_capped(authed, monkeypatch):
     body = authed.get("/api/articles", params={"q": "wetter", "limit": 2}).json()
     assert body["total"] == 6 and len(body["items"]) == 2
     real = state.db.count_articles
-    monkeypatch.setattr(state.db, "count_articles", lambda **kw: real(**{**kw, "cap": 3}))
+    monkeypatch.setattr(state.db, "count_articles", lambda uid, **kw: real(uid, **{**kw, "cap": 3}))
     assert authed.get("/api/articles", params={"q": "wetter"}).json()["total"] == 3
 
 
@@ -246,12 +258,12 @@ def test_profile_unread_is_cached_and_invalidated(authed, monkeypatch):
     _seed_terms()
     business = _profile(authed, "business")
     assert business["unread"] == 4
-    state.db.q("UPDATE articles SET read=1 WHERE title LIKE 'Inflation%' AND source_id='alpha'")
+    _set_read("title LIKE 'Inflation%' AND source_id='alpha'")
     assert _profile(authed, "business")["unread"] == 4           # aus dem Zwischenspeicher
     monkeypatch.setattr(api_ui, "UNREAD_TTL", 0.0)
     assert _profile(authed, "business")["unread"] == 2            # abgelaufen
     monkeypatch.setattr(api_ui, "UNREAD_TTL", 60.0)
-    state.db.q("UPDATE articles SET read=0")
+    _set_read("1", 0)
     monkeypatch.setitem(state.fetcher.state, "last_finished", ago(seconds=0))  # Sammellauf beendet
     assert _profile(authed, "business")["unread"] == 4
     authed.post("/api/articles/read-all", json={"profile": business["id"]})
@@ -271,10 +283,10 @@ def test_read_all_scoped_to_profile_and_source(authed):
     _seed_terms()
     business = _profile(authed, "business")
     assert authed.post("/api/articles/read-all", json={"profile": business["id"]}).json() == {"marked": 4}
-    unread = {r["title"] for r in state.db.q("SELECT title FROM articles WHERE read=0")}
+    unread = set(_unread())
     assert all(t.startswith("Wetter") for t in unread) and len(unread) == 6
     assert authed.post("/api/articles/read-all", json={"source": "beta"}).json()["marked"] == 3
-    assert {r["source_id"] for r in state.db.q("SELECT source_id FROM articles WHERE read=0")} == {"alpha"}
+    assert set(_unread("a.source_id")) == {"alpha"}
     assert authed.post("/api/articles/read-all", json={"source": "beta", "sources": ["alpha"]}).json()["marked"] == 0
     assert authed.post("/api/articles/read-all", json={"profile": 999}).status_code == 404
     assert authed.post("/api/articles/read-all", json={}).json()["marked"] == 3
@@ -286,7 +298,7 @@ def test_read_all_max_id_and_paywalled_count(authed):
     state.db.q("UPDATE articles SET paywalled=1 WHERE id=?", (ids[0],))
     # Nur bis max_id; der Paywall-Artikel wird markiert, zählt aber nicht mit
     assert authed.post("/api/articles/read-all", json={"max_id": ids[2]}).json() == {"marked": 2}
-    assert [r["id"] for r in state.db.q("SELECT id FROM articles WHERE read=0")] == [ids[3]]
+    assert _unread("a.id") == [ids[3]]
     assert authed.post("/api/articles/read-all", json={"max_id": 0}).status_code == 422
     assert authed.post("/api/articles/read-all", json={"max_id": ids[3]}).json() == {"marked": 1}
 
@@ -374,16 +386,17 @@ def test_settings_defaults_and_validation(authed):
         assert authed.patch("/api/settings", json=bad).status_code == 422, bad
     assert authed.get("/api/settings").json()["theme"] == "light"
     # Kaputter gespeicherter Wert: Standard gilt
-    state.db.q("INSERT OR REPLACE INTO settings (key, value) VALUES ('text_size', '42')")
+    state.db.q("INSERT OR REPLACE INTO settings (user_id, key, value) VALUES (?, 'text_size', '42')", (UID,))
     assert authed.get("/api/settings").json()["text_size"] == "m"
 
 
 def test_counts(authed):
     state.db.upsert_articles([make_row("alpha", i, ago(hours=i)) for i in range(4)])
     ids = [r["id"] for r in state.db.q("SELECT id FROM articles ORDER BY id")]
-    state.db.q("UPDATE articles SET paywalled=1, starred=1 WHERE id=?", (ids[0],))
-    state.db.set_flag(ids[1], "read", True)
-    state.db.set_flag(ids[2], "starred", True)
+    state.db.q("UPDATE articles SET paywalled=1 WHERE id=?", (ids[0],))
+    state.db.set_flag(UID, ids[0], "starred", True)
+    state.db.set_flag(UID, ids[1], "read", True)
+    state.db.set_flag(UID, ids[2], "starred", True)
     state.db.record_fetch("beta", ok=False, error="HTTP 500")
     state.db.record_fetch("gamma", ok=False, error="HTTP 500")  # aus: zählt nicht als fehlerhaft
     assert authed.get("/api/counts").json() == {
@@ -431,7 +444,7 @@ def test_disabled_source_leaves_all_list_counts_bar_next_and_read_all(authed):
     assert len(authed.get("/api/articles", params={"source": "beta"}).json()["items"]) == 1
     # read-all ohne Kontext markiert nur aktivierte Quellen
     assert authed.post("/api/articles/read-all", json={}).json()["marked"] == 2
-    assert state.db.one("SELECT read FROM articles WHERE id=?", (ids["beta-2"],))["read"] == 0
+    assert _unread("a.id", "a.source_id='beta'") == [ids["beta-2"]]
 
 
 # ---- Wasserstand für read-all --------------------------------------------------
@@ -466,8 +479,8 @@ def test_paywalled_article_detail_has_no_text(authed):
 
 def test_saved_lists_keep_paywalled_articles(authed):
     aid = _paywalled_article()
-    state.db.set_flag(aid, "starred", True)
-    state.db.set_flag(aid, "later", True)
+    state.db.set_flag(UID, aid, "starred", True)
+    state.db.set_flag(UID, aid, "later", True)
     assert _ids(authed.get("/api/articles").json()) == []
     assert _ids(authed.get("/api/articles", params={"starred": "true"}).json()) == [aid]
     assert _ids(authed.get("/api/articles", params={"later": "true"}).json()) == [aid]
@@ -516,7 +529,7 @@ def test_saved_list_hides_summary_of_paywalled_articles(authed):
     state.db.store_extraction(ids["alpha-1"], status="full", body_html=None, body_text=None, body_len=0,
                               paywalled=True)
     for aid in ids.values():
-        state.db.set_flag(aid, "later", True)
+        state.db.set_flag(UID, aid, "later", True)
     items = {it["id"]: it for it in authed.get("/api/articles", params={"later": "true"}).json()["items"]}
     assert items[ids["alpha-1"]]["paywalled"] == 1 and items[ids["alpha-1"]]["summary"] == ""
     assert items[ids["alpha-2"]]["summary"] == "Zusammenfassung 2"

@@ -9,7 +9,7 @@ import { markAllRead } from './menu.js';
 import { api } from '../api.js';
 import { ago } from '../format.js';
 import {
-  emit, keepWatermark, loadBar, loadSources, loadStatus, on, readAllWatermark, state,
+  emit, isAdmin, keepWatermark, loadBar, loadSources, loadStatus, on, readAllWatermark, state,
 } from '../store.js';
 
 export function sourceView(route) {
@@ -25,7 +25,7 @@ export function sourceView(route) {
   const readBtn = iconButton(checkCheck(20), 'Alle gelesen', { onClick: () => { confirming = !confirming; confirmMaxId = readAllWatermark(); paintConfirm(); } });
   const confirmSlot = h('div', {});
   const chipsEl = h('div', { class: 'chips', 'aria-label': 'Filter' });
-  const feedHolder = h('div', {});
+  const feedHolder = h('div', { class: 'feed-holder' });
   let feed = null;
 
   const src = () => state.sourceMap.get(id);
@@ -123,6 +123,14 @@ export function sourceView(route) {
       empty: () => {
         const s = src();
         const name = s ? s.name : id;
+        if (s && !s.enabled && !isAdmin()) {
+          // Einschalten darf nur der Admin; als Ausweg die Liste aller Artikel.
+          return emptyState({
+            title: 'AUSGESCHALTET',
+            text: 'Diese Zeitung ist ausgeschaltet. Nur der Admin kann sie einschalten.',
+            actions: [h('a', { class: 'pill', href: '#/', text: 'Alle Artikel zeigen' })],
+          });
+        }
         if (s && !s.enabled) {
           // Ausgeschaltete Zeitung: kein Hinweis auf den nächsten Sammellauf, stattdessen Einschalten.
           const onBtn = h('button', {
@@ -145,7 +153,7 @@ export function sourceView(route) {
                   rebuild();
                 } catch (err) {
                   onBtn.disabled = false;
-                  toast(`Fehler: ${err.detail || err.message}`);
+                  toast(err.status === 403 ? 'Nur der Admin kann Zeitungen einschalten' : `Fehler: ${err.detail || err.message}`);
                 }
               },
             },

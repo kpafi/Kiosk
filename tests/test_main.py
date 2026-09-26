@@ -20,8 +20,8 @@ def client(app_env):
         yield c
 
 
-def login(c, password="geheim-und-lang", **headers):
-    return c.post("/api/login", json={"password": password}, headers=headers)
+def login(c, password="geheim-und-lang", username="admin", **headers):
+    return c.post("/api/login", json={"username": username, "password": password}, headers=headers)
 
 
 @pytest.fixture
@@ -39,7 +39,7 @@ def test_401_without_cookie(client):
         assert client.get(path).status_code == 401, path
     assert client.post("/api/refresh").status_code == 401
     assert client.get("/healthz").status_code == 200
-    assert client.get("/api/session").json() == {"authenticated": False}
+    assert client.get("/api/session").json() == {"authenticated": False, "user": None}
 
 
 def test_static_page_has_no_inline_script(client):
@@ -77,7 +77,8 @@ def test_login_sets_host_prefixed_secure_cookie(client):
     assert cookie.startswith("__Host-kiosk_session=")
     low = cookie.lower()
     assert "secure" in low and "httponly" in low and "path=/" in low and "domain" not in low
-    assert client.get("/api/session").json() == {"authenticated": True}
+    assert client.get("/api/session").json() == {
+        "authenticated": True, "user": {"id": 1, "username": "admin", "display_name": "Admin", "is_admin": True}}
     assert client.get("/api/sources").status_code == 200
 
 
@@ -97,6 +98,66 @@ def test_wrong_password_and_rate_limit(client):
     assert login(client).status_code == 429
 
 
+def test_success_does_not_reset_ip_failures(client):
+    """7 Fehlversuche + 1 erfolgreicher Login: Der Erfolg gibt nur die eigene Reservierung zurück,
+    die IP hat danach noch 8 - 7 = 1 Versuch."""
+    for _ in range(7):
+        assert login(client, "falsch").status_code == 401
+    assert login(client).status_code == 204
+    assert login(client, "falsch").status_code == 401
+    assert login(client, "falsch").status_code == 429
+    assert login(client).status_code == 429
+
+
+def test_login_brake_holds_under_parallel_requests(app_env, monkeypatch):
+    """40 parallele Fehlversuche von einer IP: höchstens 8 echte scrypt-Prüfungen, höchstens zwei
+    gleichzeitig, der Rest 429 (der Versuch wird vor dem await gezählt)."""
+    import threading
+
+    import httpx
+
+    import app.main as main_mod
+    calls, running, peak = [], [0], [0]
+    lock = threading.Lock()
+    real_verify, real_burn = main_mod.verify_password, main_mod.burn_time
+
+    def counted(fn):
+        def wrapper(*args):
+            with lock:
+                calls.append(1)
+                running[0] += 1
+                peak[0] = max(peak[0], running[0])
+            try:
+                time.sleep(0.02)  # Prüfungen überlappen sicher
+                return fn(*args)
+            finally:
+                with lock:
+                    running[0] -= 1
+        return wrapper
+
+    monkeypatch.setattr(main_mod, "verify_password", counted(real_verify))
+    monkeypatch.setattr(main_mod, "burn_time", counted(real_burn))
+
+    async def run():
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app, client=("203.0.113.9", 1234))
+            async with httpx.AsyncClient(transport=transport, base_url=ORIGIN) as c:
+                async def bad(i):
+                    r = await c.post("/api/login", json={"username": "admin" if i % 2 else f"nobody{i}",
+                                                         "password": f"falsch-{i}"})
+                    return r.status_code
+                codes = await asyncio.gather(*[bad(i) for i in range(40)])
+                after = (await c.post("/api/login", json={"username": "admin",
+                                                          "password": "geheim-und-lang"})).status_code
+                return codes, after
+
+    codes, after = asyncio.run(run())
+    assert codes.count(401) == len(calls) <= 8 and codes.count(429) == 40 - len(calls)
+    assert codes.count(401) == 8
+    assert peak[0] <= 2
+    assert after == 429  # auch das richtige Passwort wartet, bis die IP-Sperre abläuft
+
+
 def test_logout(authed):
     assert authed.post("/api/logout").status_code == 204
     assert authed.get("/api/sources").status_code == 401
@@ -107,7 +168,7 @@ def test_logout_revokes_copied_session(authed):
     assert authed.post("/api/logout").status_code == 204
     authed.cookies.set("__Host-kiosk_session", token)  # z. B. ein gestohlenes Cookie
     assert authed.get("/api/sources").status_code == 401
-    assert state.db.session_epoch() == 2
+    assert state.db.get_user_by_name("admin")["session_epoch"] == 2
     authed.cookies.clear()
     assert login(authed).status_code == 204  # neue Anmeldung funktioniert wieder
     assert authed.get("/api/sources").status_code == 200
@@ -268,7 +329,7 @@ def test_watchdog_exits_only_on_fetcher_problem(client, monkeypatch):
 
 
 @pytest.mark.parametrize("password,message", [
-    ("bitte-aendern", "Beispiel"), ("elf-zeichen", "mindestens 12 Zeichen"), ("   ", "nicht gesetzt"),
+    ("bitte-aendern", "Beispiel"), ("elf-zeichen", "mindestens 12 Zeichen"),
 ])
 def test_config_rejects_weak_passwords(app_env, monkeypatch, password, message):
     from app.config import load_settings
@@ -321,14 +382,40 @@ def test_config_accepts_bounds(app_env, monkeypatch):
     assert (s.fetch_interval, s.extract_concurrency, s.retention_days, s.session_max_age) == (60, 32, 3650, 365 * 86400)
 
 
-def test_password_change_invalidates_session(app_env, monkeypatch):
+def test_kiosk_password_only_bootstraps_the_admin(app_env, monkeypatch, caplog):
+    """Gibt es schon Benutzer, hat KIOSK_PASSWORD keine Wirkung mehr (mit Hinweis im Log)."""
     with TestClient(app, base_url=ORIGIN) as c:
         login(c)
         token = c.cookies.get("__Host-kiosk_session")
     monkeypatch.setenv("KIOSK_PASSWORD", "anderes-passwort")
-    with TestClient(app, base_url=ORIGIN) as c:
+    with caplog.at_level("INFO", logger="kiosk"), TestClient(app, base_url=ORIGIN) as c:
+        assert "KIOSK_PASSWORD ist gesetzt, wird aber ignoriert" in caplog.text
         c.cookies.set("__Host-kiosk_session", token)
-        assert c.get("/api/sources").status_code == 401
+        assert c.get("/api/sources").status_code == 200
+        assert login(c, "anderes-passwort").status_code == 401
+        assert login(c).status_code == 204
+    monkeypatch.setenv("KIOSK_PASSWORD", "")
+    with TestClient(app, base_url=ORIGIN) as c:  # ohne KIOSK_PASSWORD startet die App weiter
+        assert login(c).status_code == 204
+
+
+def test_fresh_database_without_password_does_not_start(app_env, monkeypatch):
+    monkeypatch.setenv("KIOSK_PASSWORD", "")
+    with pytest.raises(RuntimeError, match="Keine Benutzer"):
+        with TestClient(app, base_url=ORIGIN):
+            pass
+
+
+def test_admin_user_from_env(app_env, monkeypatch):
+    monkeypatch.setenv("KIOSK_ADMIN_USER", "Chefin")
+    with TestClient(app, base_url=ORIGIN) as c:
+        assert login(c).status_code == 401
+        assert login(c, username="chefin").status_code == 204
+        assert c.get("/api/me").json()["username"] == "chefin"
+    monkeypatch.setenv("KIOSK_ADMIN_USER", "nicht erlaubt!")
+    from app.config import load_settings
+    with pytest.raises(RuntimeError, match="KIOSK_ADMIN_USER"):
+        load_settings()
 
 
 # ---- CSRF -----------------------------------------------------------------
@@ -595,8 +682,8 @@ def test_proxy_chain_from_docker_gateway(app_env):
     headers = {"X-Forwarded-Proto": "https", "Origin": "https://testserver"}
     with TestClient(_behind_proxy("172.19.0.1"), base_url="http://testserver") as c:
         assert login(c, **headers, **{"X-Forwarded-For": "203.0.113.7"}).status_code == 204
-        for _ in range(8):
-            assert login(c, "falsch", **headers, **{"X-Forwarded-For": "203.0.113.7"}).status_code == 401
+        for i in range(8):  # wechselnde Namen: greift die Bremse pro IP, nicht die pro Benutzername
+            assert login(c, "falsch", f"x{i}", **headers, **{"X-Forwarded-For": "203.0.113.7"}).status_code == 401
         assert login(c, **headers, **{"X-Forwarded-For": "203.0.113.7"}).status_code == 429
         # Andere Client-IP hinter demselben Proxy ist nicht betroffen
         assert login(c, **headers, **{"X-Forwarded-For": "203.0.113.8"}).status_code == 204

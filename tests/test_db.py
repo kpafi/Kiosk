@@ -5,8 +5,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.db import SCHEMA_VERSION, Database, _fts_query
-from conftest import ago, make_row
+from app.db import SCHEMA_VERSION, Database, MigrationError, _fts_query
+from conftest import UID, ago, make_row
 
 OLD_SCHEMA = """
 CREATE TABLE source_state (
@@ -39,11 +39,11 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
 
-def list_all(db, **kw):
+def list_all(db, user=UID, **kw):
     params = dict(sources=None, query=None, unread=False, starred=False,
                   free_only=False, before=None, limit=50)
     params.update(kw)
-    return db.list_articles(**params)
+    return db.list_articles(user, **params)
 
 
 def fts_integrity(db) -> None:
@@ -128,7 +128,7 @@ def test_purge_keeps_starred_and_fts_consistent(db):
     ids = {r["guid"]: r["id"] for r in db.q("SELECT id, guid FROM articles")}
     for aid in ids.values():
         store_full(db, aid, "Text zum Suchen")
-    db.set_flag(ids["alpha-2"], "starred", True)
+    db.set_flag(UID, ids["alpha-2"], "starred", True)
     assert db.purge(90) == 1
     left = {r["guid"] for r in db.q("SELECT guid FROM articles")}
     assert left == {"alpha-2", "alpha-3"}
@@ -143,7 +143,7 @@ def test_purge_keeps_read_later(db):
         make_row("alpha", 2, ago(days=200), title="Uralt Später"),
     ])
     ids = {r["guid"]: r["id"] for r in db.q("SELECT id, guid FROM articles")}
-    db.set_flag(ids["alpha-2"], "later", True)
+    db.set_flag(UID, ids["alpha-2"], "later", True)
     assert db.purge(90) == 1
     assert {r["guid"] for r in db.q("SELECT guid FROM articles")} == {"alpha-2"}
 
@@ -321,10 +321,11 @@ def test_is_due_pending(db):
     assert not db.is_due_pending(aid) and not db.is_due_pending(999999)
 
 
-def test_session_epoch(db):
-    assert db.session_epoch() == 1
-    assert db.bump_session_epoch() == 2
-    assert db.session_epoch() == 2
+def test_session_epoch_per_user(db):
+    other = db.create_user("anna", "x")
+    assert db.get_user(UID)["session_epoch"] == 1
+    db.end_sessions(UID)
+    assert db.get_user(UID)["session_epoch"] == 2 and db.get_user(other)["session_epoch"] == 1
     assert db.ping()
 
 
@@ -390,39 +391,50 @@ def _tables(db) -> set[str]:
     return {r["name"] for r in db.q("SELECT name FROM sqlite_master WHERE type='table'")}
 
 
-def test_migration_v3_to_v4(tmp_path):
-    path = tmp_path / "v3.db"
-    db = Database(path)
-    db.upsert_articles([make_row("alpha", i, ago(hours=i), title=f"Inflation {i}") for i in range(3)])
-    db.set_flag(db.q("SELECT id FROM articles")[0]["id"], "starred", True)
-    # Zurück auf den Stand v3: ohne Spalte later und ohne die neuen Tabellen
-    db.q("ALTER TABLE articles DROP COLUMN later")
-    for table in V4_TABLES:
-        db.q(f"DROP TABLE {table}")
-    db.set_meta("schema_version", "3")
-    db.close()
+def test_migration_v1_to_v6_in_one_pass(tmp_path):
+    """Alte Datenbank (v1) mit Lesestand: in einem Durchlauf auf v6, der Lesestand geht an den Admin."""
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(OLD_SCHEMA)
+    for i in range(3):
+        conn.execute("INSERT INTO articles (source_id, guid, url, title, published_at, fetched_at, read, starred) "
+                     "VALUES ('alpha', ?, ?, 'Alt', ?, ?, ?, ?)",
+                     (f"g{i}", f"https://a.example/{i}", ago(hours=i), ago(hours=i), int(i == 0), int(i == 1)))
+    conn.commit()
+    conn.close()
+    # Ohne Admin-Passwort lässt sich der Lesestand keinem Benutzer zuordnen: Abbruch, nichts geändert.
+    with pytest.raises(MigrationError, match="KIOSK_PASSWORD"):
+        Database(path)
+    conn = sqlite3.connect(path)
+    assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='articles_fts'").fetchone()[0] == 1
+    assert conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone() is None
+    conn.close()
 
-    db = Database(path)
+    db = Database(path, admin=("chef", "geheim-und-lang"))
     try:
-        assert db.get_meta("schema_version") == "5" == str(SCHEMA_VERSION)
-        assert "later" in {r["name"] for r in db.q("PRAGMA table_info(articles)")}
-        assert V4_TABLES <= _tables(db)
-        assert db.one("SELECT COUNT(*) AS n FROM articles WHERE later=0 AND starred=1")["n"] == 1
-        aid = db.q("SELECT id FROM articles")[1]["id"]
-        assert db.set_flag(aid, "later", True)
-        assert [r["id"] for r in list_all(db, later=True)] == [aid]
-        assert db.seed_profiles(["alpha"], None) is True
+        assert db.admin_created and db.get_meta("schema_version") == "6" == str(SCHEMA_VERSION)
+        admin = db.get_user_by_name("chef")
+        assert admin["is_admin"] == 1 and admin["display_name"] == "Chef"
+        assert V4_TABLES <= _tables(db) and {"users", "user_articles"} <= _tables(db)
+        rows = list_all(db, user=admin["id"])
+        flags = {r["url"][-1]: (r["read"], r["starred"], r["later"]) for r in rows}
+        assert flags == {"0": (1, 0, 0), "1": (0, 1, 0), "2": (0, 0, 0)}
+        assert db.set_flag(admin["id"], rows[2]["id"], "later", True)
+        assert [r["id"] for r in list_all(db, user=admin["id"], later=True)] == [rows[2]["id"]]
+        assert db.seed_profiles(admin["id"], ["alpha"], None) is True
         fts_integrity(db)
     finally:
         db.close()
-    db = Database(path)  # erneutes Öffnen: nichts mehr zu tun, Daten bleiben
+    db = Database(path, admin=("chef", "anderes-passwort"))  # erneutes Öffnen: nichts mehr zu tun
     try:
-        assert len(db.list_profiles()) == 4 and db.one("SELECT later FROM articles WHERE id=?", (aid,))["later"] == 1
+        assert not db.admin_created and db.user_count() == 1
+        assert len(db.list_profiles(admin["id"])) == 4
+        assert db.one("SELECT COUNT(*) AS n FROM user_articles")["n"] == 3
     finally:
         db.close()
 
 
-def test_migration_v1_to_v4_has_new_tables(tmp_path):
+def test_migration_v1_without_state_needs_no_admin(tmp_path):
     path = tmp_path / "old.db"
     conn = sqlite3.connect(path)
     conn.executescript(OLD_SCHEMA)
@@ -433,17 +445,16 @@ def test_migration_v1_to_v4_has_new_tables(tmp_path):
     db = Database(path)
     try:
         assert db.get_meta("schema_version") == str(SCHEMA_VERSION)
-        assert V4_TABLES <= _tables(db)
-        assert db.one("SELECT later FROM articles")["later"] == 0
+        assert V4_TABLES <= _tables(db) and db.user_count() == 0
         assert list_all(db)[0]["later"] == 0
     finally:
         db.close()
 
 
 def test_seed_profiles(db):
-    assert db.seed_profiles(["alpha"], ["beta"]) is True
-    assert db.seed_profiles(["x"], None) is False  # nur wenn leer
-    profiles = db.list_profiles()
+    assert db.seed_profiles(UID, ["alpha"], ["beta"]) is True
+    assert db.seed_profiles(UID, ["x"], None) is False  # nur wenn leer
+    profiles = db.list_profiles(UID)
     assert [(p["name"], p["builtin"], p["sources"], p["in_bar"], p["position"]) for p in profiles] == [
         ("Deutschland", "de", ["alpha"], True, 0), ("Weltweit", "world", None, False, 1),
         ("Wirtschaft", "business", ["beta"], True, 2), ("Militär", "military", None, False, 3)]
@@ -464,14 +475,14 @@ def test_terms_filter_is_prefix_or_and_keeps_chronology(db):
     assert list_all(db, terms=["interest rise"]) == []  # Begriff mit Leerzeichen ist eine Phrase
     rows = list_all(db, terms=["Zins", "Wett"])
     assert [r["url"][-1] for r in rows] == ["3", "4"]
-    assert db.count_articles(cap=10, terms=["Zins", "Wett"]) == 2
-    assert db.count_articles(cap=1, terms=["Zins", "Wett"]) == 1
+    assert db.count_articles(UID, cap=10, terms=["Zins", "Wett"]) == 2
+    assert db.count_articles(UID, cap=1, terms=["Zins", "Wett"]) == 1
     assert list_all(db, sources=[]) == []  # leere Quellenliste: nichts
-    assert db.mark_all_read(["alpha"], ["Wett"]) == 1
-    assert db.one("SELECT read FROM articles WHERE guid='alpha-3'")["read"] == 1
+    assert db.mark_all_read(UID, ["alpha"], ["Wett"]) == 1
+    assert [r["url"][-1] for r in list_all(db, unread=True)] == ["1", "2", "4"]
 
 
 def test_settings_roundtrip(db):
-    assert db.get_settings() == {}
-    db.set_settings({"theme": "dark", "bar_order": ["source:alpha"]})
-    assert db.get_settings() == {"theme": "dark", "bar_order": ["source:alpha"]}
+    assert db.get_settings(UID) == {}
+    db.set_settings(UID, {"theme": "dark", "bar_order": ["source:alpha"]})
+    assert db.get_settings(UID) == {"theme": "dark", "bar_order": ["source:alpha"]}

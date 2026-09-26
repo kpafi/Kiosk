@@ -1,7 +1,8 @@
 """API für die Oberfläche: Profile, Lieblingszeitungen, Leiste, Einstellungen, Zähler.
 
-Dazu Hilfsfunktionen, die auch die Artikel-Routen in main.py nutzen (Filterkontext aus
-Quelle/Land/Profil, Einstellungen, Zwischenspeicher der Profil-Zähler).
+Alles hier gehört dem angemeldeten Benutzer (Dependency current_user). Dazu Hilfsfunktionen,
+die auch die Artikel-Routen in main.py nutzen (angemeldeter Benutzer, Filterkontext aus
+Quelle/Land/Profil, Zwischenspeicher der Profil-Zähler).
 """
 from __future__ import annotations
 
@@ -25,20 +26,39 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
 }
 
 
-def _authed(request: Request) -> None:
-    # Die Middleware in main.py prüft bereits; hier nur als zweite Sicherung wie bei den anderen Routen.
-    if state.auth.token_from_cookies(request.cookies) is None:
+# ---- Benutzer (auch für main.py) ---------------------------------------------
+
+def current_user(request: Request) -> dict[str, Any]:
+    """Der angemeldete Benutzer; die Middleware in main.py lädt ihn einmal pro Request
+    (request.state.user). Fehlt er, 401 (zweite Sicherung neben der Middleware)."""
+    user = getattr(request.state, "user", None)
+    if user is None:
         raise HTTPException(401, "Nicht angemeldet")
+    return user
 
 
-router = APIRouter(prefix="/api", dependencies=[Depends(_authed)])
+def admin_user(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    if not user["is_admin"]:
+        raise HTTPException(403, "Nur für den Admin")
+    return user
+
+
+def public_user(user: dict[str, Any]) -> dict[str, Any]:
+    """Das Benutzer-Objekt für die Oberfläche (/api/session, /api/me)."""
+    return {"id": user["id"], "username": user["username"], "display_name": user["display_name"],
+            "is_admin": bool(user["is_admin"])}
+
+
+User = Annotated[dict[str, Any], Depends(current_user)]
+
+router = APIRouter(prefix="/api", dependencies=[Depends(current_user)])
 
 
 # ---- Hilfsfunktionen (auch für main.py) ------------------------------------
 
-def ui_settings() -> dict[str, Any]:
+def ui_settings(user_id: int) -> dict[str, Any]:
     """Einstellungen mit Standardwerten; unbekannte oder ungültige gespeicherte Werte zählen nicht."""
-    stored = state.db.get_settings()
+    stored = state.db.get_settings(user_id)
     out = dict(SETTINGS_DEFAULTS)
     for key, default in SETTINGS_DEFAULTS.items():
         if key in stored and type(stored[key]) is type(default):
@@ -68,7 +88,7 @@ def _intersect(scope: list[str] | None, other: list[str]) -> list[str]:
     return [s for s in scope if s in keep]
 
 
-def article_scope(sources: list[str], countries: set[str], profile_id: int | None,
+def article_scope(user_id: int, sources: list[str], countries: set[str], profile_id: int | None,
                   *, only_enabled: bool = True) -> tuple[list[str] | None, list[str]]:
     """Filterkontext: (Quellen oder None = alle, Profil-Begriffe). Leere Liste = nichts passt.
 
@@ -81,7 +101,7 @@ def article_scope(sources: list[str], countries: set[str], profile_id: int | Non
         scope = _intersect(scope, [s.id for s in state.catalog.all() if s.country in countries])
     terms: list[str] = []
     if profile_id is not None:
-        profile = state.db.get_profile(profile_id)
+        profile = state.db.get_profile(user_id, profile_id)
         if profile is None:
             raise HTTPException(404, "Profil nicht gefunden")
         scope = _intersect(scope, effective_sources(profile))
@@ -89,31 +109,38 @@ def article_scope(sources: list[str], countries: set[str], profile_id: int | Non
     return scope, terms
 
 
-# Profil-ID -> (Zeitpunkt, Ende des letzten Sammellaufs, Zahl)
-_unread_cache: dict[int, tuple[float, Any, int]] = {}
+# (Benutzer-ID, Profil-ID) -> (Zeitpunkt, Ende des letzten Sammellaufs, Zahl)
+_unread_cache: dict[tuple[int, int], tuple[float, Any, int]] = {}
 
 
-def invalidate_unread() -> None:
-    _unread_cache.clear()
+def invalidate_unread(user_id: int | None = None) -> None:
+    """Profil-Zähler verwerfen: die eines Benutzers (sein Lesestand hat sich geändert) oder alle
+    (Quellen umgeschaltet, Start)."""
+    if user_id is None:
+        _unread_cache.clear()
+        return
+    for key in [k for k in _unread_cache if k[0] == user_id]:
+        del _unread_cache[key]
 
 
-def profile_unread(profile: dict[str, Any], sources: list[str]) -> int:
+def profile_unread(user_id: int, profile: dict[str, Any], sources: list[str]) -> int:
     """Ungelesene, Paywall-freie Artikel im Profil (höchstens UNREAD_CAP), höchstens alle 60 s neu
     berechnet; ein beendeter Sammellauf macht den Wert sofort ungültig."""
     run = state.fetcher.state.get("last_finished")
-    hit = _unread_cache.get(profile["id"])
+    key = (user_id, profile["id"])
+    hit = _unread_cache.get(key)
     now = time.monotonic()
     if hit and now - hit[0] < UNREAD_TTL and hit[1] == run:
         return hit[2]
-    n = state.db.count_articles(cap=UNREAD_CAP, sources=sources, terms=profile["terms"] or None,
+    n = state.db.count_articles(user_id, cap=UNREAD_CAP, sources=sources, terms=profile["terms"] or None,
                                 unread=True, free_only=True)
-    _unread_cache[profile["id"]] = (now, run, n)
+    _unread_cache[key] = (now, run, n)
     return n
 
 
-def _profile_view(profile: dict[str, Any]) -> dict[str, Any]:
+def _profile_view(user_id: int, profile: dict[str, Any]) -> dict[str, Any]:
     sources = effective_sources(profile)
-    return {**profile, "source_count": len(sources), "unread": profile_unread(profile, sources)}
+    return {**profile, "source_count": len(sources), "unread": profile_unread(user_id, profile, sources)}
 
 
 def _check_reorder(ids: list, known: set) -> None:
@@ -165,17 +192,17 @@ def _clean_fields(body: BaseModel) -> dict[str, Any]:
 
 
 @router.get("/profiles")
-async def list_profiles():
-    return [_profile_view(p) for p in state.db.list_profiles()]
+async def list_profiles(user: User):
+    return [_profile_view(user["id"], p) for p in state.db.list_profiles(user["id"])]
 
 
 @router.post("/profiles", status_code=201)
-async def create_profile(body: ProfileIn):
+async def create_profile(body: ProfileIn, user: User):
     fields = _clean_fields(body)
-    pid = state.db.create_profile(name=body.name, sources=fields.get("sources", body.sources),
+    pid = state.db.create_profile(user["id"], name=body.name, sources=fields.get("sources", body.sources),
                                   terms=fields.get("terms", []), in_bar=body.in_bar)
-    invalidate_unread()
-    return _profile_view(state.db.get_profile(pid))
+    invalidate_unread(user["id"])
+    return _profile_view(user["id"], state.db.get_profile(user["id"], pid))
 
 
 class IdOrder(BaseModel):
@@ -183,43 +210,43 @@ class IdOrder(BaseModel):
 
 
 @router.post("/profiles/reorder")
-async def reorder_profiles(body: IdOrder):
-    _check_reorder(body.ids, {p["id"] for p in state.db.list_profiles()})
-    state.db.reorder("profiles", "id", body.ids)
-    return await list_profiles()
+async def reorder_profiles(body: IdOrder, user: User):
+    _check_reorder(body.ids, {p["id"] for p in state.db.list_profiles(user["id"])})
+    state.db.reorder(user["id"], "profiles", "id", body.ids)
+    return await list_profiles(user)
 
 
-def _profile_or_404(profile_id: int) -> dict[str, Any]:
-    profile = state.db.get_profile(profile_id)
+def _profile_or_404(user_id: int, profile_id: int) -> dict[str, Any]:
+    profile = state.db.get_profile(user_id, profile_id)
     if profile is None:
         raise HTTPException(404, "Profil nicht gefunden")
     return profile
 
 
 @router.patch("/profiles/{profile_id}")
-async def patch_profile(body: ProfilePatch, profile_id: int = PathParam(ge=1, le=MAX_ID)):
-    _profile_or_404(profile_id)
-    state.db.update_profile(profile_id, _clean_fields(body))
-    invalidate_unread()
-    return _profile_view(state.db.get_profile(profile_id))
+async def patch_profile(body: ProfilePatch, user: User, profile_id: int = PathParam(ge=1, le=MAX_ID)):
+    _profile_or_404(user["id"], profile_id)
+    state.db.update_profile(user["id"], profile_id, _clean_fields(body))
+    invalidate_unread(user["id"])
+    return _profile_view(user["id"], state.db.get_profile(user["id"], profile_id))
 
 
 @router.delete("/profiles/{profile_id}", status_code=204)
-async def delete_profile(profile_id: int = PathParam(ge=1, le=MAX_ID)):
-    if _profile_or_404(profile_id)["builtin"]:
+async def delete_profile(user: User, profile_id: int = PathParam(ge=1, le=MAX_ID)):
+    if _profile_or_404(user["id"], profile_id)["builtin"]:
         raise HTTPException(409, "Vorgegebene Profile lassen sich nicht löschen")
-    state.db.delete_profile(profile_id)
-    invalidate_unread()
+    state.db.delete_profile(user["id"], profile_id)
+    invalidate_unread(user["id"])
     return Response(status_code=204)
 
 
 # ---- Lieblingszeitungen -----------------------------------------------------
 
-def _favorites_view() -> list[dict[str, Any]]:
-    unread = state.db.unread_free_by_source()
+def _favorites_view(user_id: int) -> list[dict[str, Any]]:
+    unread = state.db.unread_free_by_source(user_id)
     enabled = set(state.db.enabled_source_ids())
     out = []
-    for f in state.db.list_favorites():
+    for f in state.db.list_favorites(user_id):
         src = state.catalog.get(f["source_id"])
         if src is None:  # aus dem Katalog entfernt
             continue
@@ -232,8 +259,8 @@ def _favorites_view() -> list[dict[str, Any]]:
 
 
 @router.get("/favorites/sources")
-async def list_favorites():
-    return _favorites_view()
+async def list_favorites(user: User):
+    return _favorites_view(user["id"])
 
 
 class FavoriteBody(BaseModel):
@@ -246,23 +273,23 @@ class SourceOrder(BaseModel):
 
 
 @router.post("/favorites/sources/reorder")
-async def reorder_favorites(body: SourceOrder):
-    _check_reorder(body.ids, {f["source_id"] for f in state.db.list_favorites()})
-    state.db.reorder("favorite_sources", "source_id", body.ids)
-    return _favorites_view()
+async def reorder_favorites(body: SourceOrder, user: User):
+    _check_reorder(body.ids, {f["source_id"] for f in state.db.list_favorites(user["id"])})
+    state.db.reorder(user["id"], "favorite_sources", "source_id", body.ids)
+    return _favorites_view(user["id"])
 
 
 @router.put("/favorites/sources/{source_id}")
-async def put_favorite(source_id: str, body: FavoriteBody = FavoriteBody()):
+async def put_favorite(source_id: str, user: User, body: FavoriteBody = FavoriteBody()):
     if source_id not in state.catalog:
         raise HTTPException(404, "Unbekannte Quelle")
-    state.db.put_favorite(source_id, body.in_bar)
-    return next(f for f in _favorites_view() if f["source_id"] == source_id)
+    state.db.put_favorite(user["id"], source_id, body.in_bar)
+    return next(f for f in _favorites_view(user["id"]) if f["source_id"] == source_id)
 
 
 @router.delete("/favorites/sources/{source_id}", status_code=204)
-async def delete_favorite(source_id: str):
-    state.db.delete_favorite(source_id)
+async def delete_favorite(source_id: str, user: User):
+    state.db.delete_favorite(user["id"], source_id)
     return Response(status_code=204)
 
 
@@ -271,28 +298,28 @@ async def delete_favorite(source_id: str):
 BarKey = Annotated[str, StringConstraints(pattern=r"^(source:[A-Za-z0-9_-]{1,64}|profile:[0-9]{1,18})$")]
 
 
-def _bar() -> dict[str, Any]:
-    unread = state.db.unread_free_by_source()
+def _bar(user_id: int) -> dict[str, Any]:
+    unread = state.db.unread_free_by_source(user_id)
     entries: dict[str, dict[str, Any]] = {}
-    for f in state.db.list_favorites():
+    for f in state.db.list_favorites(user_id):
         src = state.catalog.get(f["source_id"])
         if f["in_bar"] and src is not None:
             entries[f"source:{src.id}"] = {"type": "source", "id": src.id, "key": f"source:{src.id}",
                                            "label": src.short, "unread": unread.get(src.id, 0)}
-    for p in state.db.list_profiles():
+    for p in state.db.list_profiles(user_id):
         if p["in_bar"]:
             entries[f"profile:{p['id']}"] = {"type": "profile", "id": p["id"], "key": f"profile:{p['id']}",
                                              "label": p["name"].upper(),
-                                             "unread": profile_unread(p, effective_sources(p))}
-    ordered = [entries.pop(k) for k in ui_settings()["bar_order"] if k in entries]
-    total = state.db.article_counts(enabled_sources())["unread"]
+                                             "unread": profile_unread(user_id, p, effective_sources(p))}
+    ordered = [entries.pop(k) for k in ui_settings(user_id)["bar_order"] if k in entries]
+    total = state.db.article_counts(user_id, enabled_sources())["unread"]
     return {"items": [{"type": "all", "key": "all", "label": "ALLE", "unread": total},
                       *ordered, *entries.values()]}
 
 
 @router.get("/bar")
-async def get_bar():
-    return _bar()
+async def get_bar(user: User):
+    return _bar(user["id"])
 
 
 class BarBody(BaseModel):
@@ -300,9 +327,9 @@ class BarBody(BaseModel):
     order: list[BarKey] = Field(max_length=400)
 
 
-def _check_bar_keys(keys: list[str]) -> None:
-    """Nur Schlüssel bekannter Zeitungen und vorhandener Profile (sonst 400)."""
-    profile_ids = {str(p["id"]) for p in state.db.list_profiles()}
+def _check_bar_keys(user_id: int, keys: list[str]) -> None:
+    """Nur Schlüssel bekannter Zeitungen und eigener Profile (sonst 400)."""
+    profile_ids = {str(p["id"]) for p in state.db.list_profiles(user_id)}
     unknown = [k for k in keys
                if not ((k.startswith("source:") and k[7:] in state.catalog)
                        or (k.startswith("profile:") and k[8:] in profile_ids))]
@@ -311,10 +338,10 @@ def _check_bar_keys(keys: list[str]) -> None:
 
 
 @router.patch("/bar")
-async def patch_bar(body: BarBody):
-    _check_bar_keys(body.order)
-    state.db.set_settings({"bar_order": list(dict.fromkeys(body.order))})
-    return _bar()
+async def patch_bar(body: BarBody, user: User):
+    _check_bar_keys(user["id"], body.order)
+    state.db.set_settings(user["id"], {"bar_order": list(dict.fromkeys(body.order))})
+    return _bar(user["id"])
 
 
 # ---- Einstellungen ----------------------------------------------------------
@@ -330,35 +357,35 @@ class SettingsPatch(BaseModel):
 
 
 @router.get("/settings")
-async def get_settings():
-    return ui_settings()
+async def get_settings(user: User):
+    return ui_settings(user["id"])
 
 
 @router.patch("/settings")
-async def patch_settings(body: SettingsPatch):
+async def patch_settings(body: SettingsPatch, user: User):
     values = body.model_dump(exclude_unset=True)
     nulls = [k for k, v in values.items() if v is None]
     if nulls:
         raise HTTPException(422, f"{', '.join(nulls)} darf nicht null sein")
     if "bar_order" in values:
-        _check_bar_keys(values["bar_order"])
+        _check_bar_keys(user["id"], values["bar_order"])
         values["bar_order"] = list(dict.fromkeys(values["bar_order"]))
-    state.db.set_settings(values)
-    return ui_settings()
+    state.db.set_settings(user["id"], values)
+    return ui_settings(user["id"])
 
 
 # ---- Zähler -----------------------------------------------------------------
 
 @router.get("/counts")
-async def counts():
+async def counts(user: User):
     states = state.db.source_states()
     catalog_ids = [s.id for s in state.catalog.all()]
     enabled = [sid for sid in catalog_ids if sid in states and states[sid]["enabled"]]
     return {
         # unread: aktivierte Quellen ohne Paywall; later/starred: alle gemerkten (wie Gemerkt)
-        **state.db.article_counts(enabled),
-        "profiles": len(state.db.list_profiles()),
-        "favorites": sum(1 for f in state.db.list_favorites() if f["source_id"] in state.catalog),
+        **state.db.article_counts(user["id"], enabled),
+        "profiles": len(state.db.list_profiles(user["id"])),
+        "favorites": sum(1 for f in state.db.list_favorites(user["id"]) if f["source_id"] in state.catalog),
         "sources_enabled": len(enabled),
         "sources_total": len(catalog_ids),
         "sources_failing": sum(1 for sid in enabled if states[sid]["last_error"]),

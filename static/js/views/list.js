@@ -7,7 +7,7 @@ import { articlesLoader, createFeed } from '../ui/feed.js';
 import { emptyState, nextRunSentence } from '../ui/empty.js';
 import { openMenu } from './menu.js';
 import {
-  ctxParams, keepWatermark, loadBar, loadStatus, on, profileById, replaceHash, setUnreadFilter, state,
+  ctxParams, isAdmin, keepWatermark, loadBar, loadStatus, on, profileById, replaceHash, setUnreadFilter, state,
 } from '../store.js';
 import { api } from '../api.js';
 
@@ -100,7 +100,8 @@ export function listView(route) {
       }));
     }
     if (profile) actions.push(h('a', { class: 'pill', href: `#/profile/${profile.id}`, text: 'Profil erweitern' }));
-    else {
+    else if (isAdmin()) {
+      // Sammellauf starten darf nur der Admin.
       actions.push(h('button', {
         type: 'button', class: 'pill', text: 'Jetzt abrufen',
         on: { click: async () => { try { await api('refresh', { method: 'POST' }); } catch { /* läuft schon */ } poll(); } },
@@ -130,7 +131,7 @@ export function listView(route) {
     timer = setTimeout(poll, running ? 5000 : 60000);
   }
 
-  const feedHolder = h('div', {}, feed.el);
+  const feedHolder = h('div', { class: 'feed-holder' }, feed.el);
   const header = h('header', { class: 'hdr hdr--home' },
     h('h1', { class: 'hdr-wordmark t-wordmark', text: 'KIOSK' }),
     iconButton(search(20), 'Suchen', { href: '#/suche' }),

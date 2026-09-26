@@ -6,7 +6,7 @@ import { chipGroup } from '../ui/chips.js';
 import { toggle } from '../ui/toggle.js';
 import { api } from '../api.js';
 import { ago, countryName, formatCount, groupByCountry } from '../format.js';
-import { loadBar, loadSources, loadStatus, state } from '../store.js';
+import { isAdmin, loadBar, loadSources, loadStatus, state } from '../store.js';
 
 const FILTERS = [
   { value: 'all', label: 'Alle' },
@@ -17,10 +17,17 @@ const FILTERS = [
 ];
 
 const hasError = (s) => s.enabled && !!s.last_error;
+const ADMIN_ONLY = 'Nur der Admin kann Zeitungen ein- und ausschalten';
 
-function subLine(s) {
+/** Fehlertext; 403 heißt: kein Admin (sollte ohne Schalter nicht vorkommen). */
+function errText(err) {
+  return err.status === 403 ? ADMIN_ONLY : `Fehler: ${err.detail || err.message}`;
+}
+
+function subLine(s, admin) {
   const cc = s.country || '?';
-  if (!s.enabled) return h('span', { class: 't-caption', text: `${cc} · Aus` });
+  // Nicht-Admins sehen AUS schon rechts in der Zeile, hier nicht noch einmal.
+  if (!s.enabled) return h('span', { class: 't-caption', text: admin ? `${cc} · Aus` : cc });
   if (s.last_error) {
     return h('span', { class: 't-caption' }, `${cc} · `,
       h('span', { class: 'err-inline', text: `Fehler: ${s.last_error}` }));
@@ -32,13 +39,16 @@ function subLine(s) {
 
 export function sourcesView() {
   let filter = 'all';
+  // Schalten und Sammellauf nur für den Admin; alle anderen sehen den Stand als AN/AUS.
+  const admin = isAdmin();
   const header = subHeader({ title: 'ZEITUNGEN', sub: ' ', fallback: '#/einstellungen' });
   const subEl = header.querySelector('.t-caption');
   const refreshBtn = iconButton(clock(16), 'Jetzt abrufen', { onClick: refresh });
-  header.append(refreshBtn);
+  if (admin) header.append(refreshBtn);
   const chipsEl = h('div', { class: 'chips', role: 'group', 'aria-label': 'Filter' });
   const listEl = h('div', { class: 'page', style: { paddingTop: '0' } });
-  const el = h('div', { class: 'view-page' }, header, chipsEl, listEl);
+  const el = h('div', { class: 'view-page' }, header, chipsEl,
+    admin ? null : hint('NUR DER ADMIN SCHALTET ZEITUNGEN', 'hint--pad hint--admin'), listEl);
 
   async function refresh() {
     refreshBtn.disabled = true;
@@ -46,7 +56,7 @@ export function sourcesView() {
       await api('refresh', { method: 'POST' });
       toast('Sammellauf gestartet');
     } catch (err) {
-      toast(err.status === 409 ? 'Läuft bereits' : `Fehler: ${err.detail || err.message}`);
+      toast(err.status === 409 ? 'Läuft bereits' : errText(err));
     } finally {
       refreshBtn.disabled = false;
       loadStatus().catch(() => {});
@@ -72,10 +82,13 @@ export function sourcesView() {
     return h('div', { class: 'set-row' },
       h('a', { class: 'set-row-text set-row-link', href: `#/s/${encodeURIComponent(s.id)}` },
         h('span', { class: 't-ui', text: s.name }),
-        subLine(s)),
-      toggle(s.enabled, `${s.name} aktiv`, async (value) => {
+        subLine(s, admin)),
+      admin ? null : h('span', {
+        class: `set-value t-caption ${s.enabled ? 'set-value--on' : 'set-value--off'}`, text: s.enabled ? 'AN' : 'AUS',
+      }),
+      admin && toggle(s.enabled, `${s.name} aktiv`, async (value) => {
         const updated = await api(`sources/${encodeURIComponent(s.id)}`, { method: 'PATCH', body: { enabled: value } })
-          .catch((err) => { toast(`Fehler: ${err.detail || err.message}`); err.toasted = true; throw err; });
+          .catch((err) => { toast(errText(err)); err.toasted = true; throw err; });
         Object.assign(s, updated || { enabled: value });
         const hadFocus = document.activeElement && document.activeElement.getAttribute('aria-label');
         paintHead();

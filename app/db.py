@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS source_state (
@@ -42,16 +42,16 @@ CREATE TABLE IF NOT EXISTS articles (
     attempts        INTEGER NOT NULL DEFAULT 0,     -- vorübergehende Fehlschläge in Folge
     next_attempt_at TEXT,                           -- frühester nächster Versuch (NULL = sofort)
     paywalled       INTEGER NOT NULL DEFAULT 0,
+    -- Seit Schema 6 unbenutzt (Lesestand steht in user_articles). SQLite kann Spalten nicht billig
+    -- entfernen; kein Code darf sie lesen oder schreiben (tests/test_users.py prüft das).
     read            INTEGER NOT NULL DEFAULT 0,
     starred         INTEGER NOT NULL DEFAULT 0,
-    later           INTEGER NOT NULL DEFAULT 0,     -- "Später lesen"
+    later           INTEGER NOT NULL DEFAULT 0,
     UNIQUE (source_id, guid)
 );
 CREATE INDEX IF NOT EXISTS idx_articles_published ON articles (published_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_articles_source ON articles (source_id, published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_articles_status ON articles (text_status);
--- Zähler je Quelle (ungelesen ohne Paywall)
-CREATE INDEX IF NOT EXISTS idx_articles_read_paywalled_source ON articles (read, paywalled, source_id);
 
 -- Bereits gesehene Feed-Einträge. Bleiben nach dem Löschen der Artikel (purge) länger erhalten,
 -- damit Einträge ohne Datum (published_at = Zeitpunkt des ersten Abrufs) nicht nach Ablauf der
@@ -69,9 +69,41 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT
 );
 
--- Profile: gespeicherte Filter aus Quellen und Suchbegriffen (v4).
+-- Konten (v6). Angelegt per Kommandozeile (python -m app.users), keine Registrierung.
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT NOT NULL UNIQUE COLLATE NOCASE,  -- 2–32 Zeichen, [a-z0-9._-], klein geschrieben
+    display_name  TEXT NOT NULL,
+    password_hash TEXT NOT NULL,        -- "scrypt$<n>$<r>$<p>$<salt_b64>$<hash_b64>"
+    is_admin      INTEGER NOT NULL DEFAULT 0,
+    disabled      INTEGER NOT NULL DEFAULT 0,
+    session_epoch INTEGER NOT NULL DEFAULT 1,
+    created_at    TEXT NOT NULL,
+    last_login_at TEXT
+);
+
+-- Lesestand pro Benutzer (v6); eine Zeile entsteht beim ersten Setzen eines Flags.
+CREATE TABLE IF NOT EXISTS user_articles (
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+    read       INTEGER NOT NULL DEFAULT 0,
+    starred    INTEGER NOT NULL DEFAULT 0,
+    later      INTEGER NOT NULL DEFAULT 0,     -- "Später lesen"
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, article_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_user_articles_flags ON user_articles (user_id, read, starred, later);
+-- Für purge (gemerkt von irgendwem?) und das Löschen per Cascade beim Entfernen alter Artikel.
+CREATE INDEX IF NOT EXISTS idx_user_articles_article ON user_articles (article_id);
+"""
+
+# Tabellen pro Benutzer (v6). Ältere Datenbanken haben sie ohne user_id; die Migration legt sie
+# neu an und kopiert um (SQLite kann Primärschlüssel nicht ändern).
+USER_TABLES = """
+-- Profile: gespeicherte Filter aus Quellen und Suchbegriffen; position gilt pro Benutzer.
 CREATE TABLE IF NOT EXISTS profiles (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name         TEXT NOT NULL,
     builtin      TEXT,                          -- 'de' | 'world' | 'business' | 'military' | NULL (eigenes)
     sources_json TEXT,                          -- JSON-Liste von Quellen-IDs oder NULL = alle aktiven
@@ -80,21 +112,33 @@ CREATE TABLE IF NOT EXISTS profiles (
     position     INTEGER NOT NULL DEFAULT 0,
     created_at   TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_profiles_user ON profiles (user_id, position);
 
--- Lieblingszeitungen (v4).
+-- Lieblingszeitungen.
 CREATE TABLE IF NOT EXISTS favorite_sources (
-    source_id  TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    source_id  TEXT NOT NULL,
     in_bar     INTEGER NOT NULL DEFAULT 1,
     position   INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, source_id)
 );
 
--- Einstellungen der Oberfläche, Werte als JSON (v4).
+-- Einstellungen der Oberfläche, Werte als JSON.
 CREATE TABLE IF NOT EXISTS settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    key     TEXT NOT NULL,
+    value   TEXT NOT NULL,
+    PRIMARY KEY (user_id, key)
 );
 """
+
+# Spalten der Tabellen aus USER_TABLES ohne user_id (für das Umkopieren in der Migration).
+LEGACY_USER_COLUMNS = {
+    "profiles": "id, name, builtin, sources_json, terms_json, in_bar, position, created_at",
+    "favorite_sources": "source_id, in_bar, position, created_at",
+    "settings": "key, value",
+}
 
 # Spalten, die ältere Datenbanken noch nicht haben (Name, Definition für ALTER TABLE).
 ADDED_COLUMNS = (
@@ -134,12 +178,26 @@ FTS_DDL = (
 RETRY_BACKOFF = (timedelta(hours=1), timedelta(hours=4), timedelta(hours=12))
 MAX_RETRY_DELAY = timedelta(hours=12)
 
+# Lesestand des Benutzers aus user_articles (Alias ua, per LEFT JOIN; ohne Zeile: 0).
+FLAG_COLS = ("COALESCE(ua.read, 0) AS read, COALESCE(ua.starred, 0) AS starred, "
+             "COALESCE(ua.later, 0) AS later")
+USER_JOIN = "LEFT JOIN user_articles ua ON ua.article_id = a.id AND ua.user_id = ?"
+
 ARTICLE_LIST_COLS = ", ".join(
     f"a.{c}" for c in (
         "id", "source_id", "url", "title", "summary", "author", "image_url", "published_at",
-        "fetched_at", "body_len", "text_status", "paywalled", "read", "starred", "later",
+        "fetched_at", "body_len", "text_status", "paywalled",
     )
-)
+) + ", " + FLAG_COLS
+
+# Alle Spalten eines Artikels außer den alten Flags (die kommen aus user_articles).
+ARTICLE_DETAIL_COLS = ", ".join(
+    f"a.{c}" for c in (
+        "id", "source_id", "guid", "url", "title", "summary", "author", "image_url", "published_at",
+        "fetched_at", "body_html", "body_text", "body_len", "text_status", "text_error",
+        "extracted_at", "attempts", "next_attempt_at", "paywalled",
+    )
+) + ", " + FLAG_COLS
 
 
 def utcnow() -> str:
@@ -150,11 +208,23 @@ def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
 
-class Database:
-    """Eine Verbindung, ein Lock. Für einen einzelnen Nutzer völlig ausreichend."""
+class MigrationError(RuntimeError):
+    """Die Datenbank lässt sich ohne weitere Angaben nicht migrieren (z. B. fehlt der Admin)."""
 
-    def __init__(self, path: Path):
+
+class Database:
+    """Eine Verbindung, ein Lock. Für eine Handvoll Benutzer völlig ausreichend.
+
+    `admin` = (Benutzername, Passwort) legt den Admin an, wenn es noch keine Benutzer gibt
+    (frische Datenbank oder Umbau auf Schema 6); `admin_created` sagt, ob das passiert ist.
+    """
+
+    def __init__(self, path: Path, admin: tuple[str, str] | None = None):
         self.path = path
+        self.admin_created = False
+        # Aufbewahrung in Tagen (settings.retention_days, setzt die App): Ältere Artikel, die nur
+        # noch wegen eines Favoriten/„Später lesen“ existieren, sieht nur, wer sie gemerkt hat.
+        self.retention_days: int | None = None
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
@@ -162,12 +232,31 @@ class Database:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=5000")
-        with self._lock:
-            self._conn.executescript(SCHEMA)  # executescript verwaltet die Transaktion selbst
-            self._migrate()
+        try:
+            with self._lock:
+                self._conn.executescript(SCHEMA)  # executescript verwaltet die Transaktion selbst
+                self._migrate(admin)
+                if admin and not self.one("SELECT 1 FROM users LIMIT 1"):
+                    with self.tx() as c:
+                        self._create_admin(c, admin)
+        except BaseException:
+            self._conn.close()
+            raise
 
-    def _migrate(self) -> None:
-        """Bringt eine bestehende Datenbank auf SCHEMA_VERSION. Mehrfach ausführbar."""
+    def _create_admin(self, c: sqlite3.Connection, admin: tuple[str, str]) -> int:
+        from .auth import hash_password  # hier importiert: Hashen nur, wenn wirklich nötig
+
+        username, password = admin
+        # Anzeigename: Benutzername mit großem Anfangsbuchstaben ("admin" -> "Admin").
+        cur = c.execute(
+            "INSERT INTO users (username, display_name, password_hash, is_admin, created_at) "
+            "VALUES (?, ?, ?, 1, ?)", (username, username.capitalize(), hash_password(password), utcnow()))
+        self.admin_created = True
+        return cur.lastrowid
+
+    def _migrate(self, admin: tuple[str, str] | None) -> None:
+        """Bringt eine bestehende Datenbank auf SCHEMA_VERSION, alles in einer Transaktion.
+        Mehrfach ausführbar."""
         row = self._conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
         version = int(row["value"]) if row else 1
         if version >= SCHEMA_VERSION:
@@ -191,6 +280,8 @@ class Database:
                           "WHERE lower(trim(summary)) IN ('none', 'null', 'undefined')")
                 c.execute("UPDATE articles SET author=NULL "
                           "WHERE lower(trim(author)) IN ('none', 'null', 'undefined', '')")
+            if version < 6:
+                self._migrate_v6(c, admin)
             c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
                       (str(SCHEMA_VERSION),))
 
@@ -223,6 +314,51 @@ class Database:
         for stmt in FTS_DDL[4:]:
             c.execute(stmt)
         c.execute("INSERT INTO articles_fts(articles_fts) VALUES('rebuild')")
+
+    def _migrate_v6(self, c: sqlite3.Connection, admin: tuple[str, str] | None) -> None:
+        """v5 -> v6: Benutzer. Lesestand, Profile, Lieblingszeitungen und Einstellungen gehen auf
+        den Admin über; die Tabellen pro Benutzer werden neu angelegt und umkopiert.
+
+        Einzige Stelle, die die alten Spalten articles.read/starred/later noch liest."""
+        tables = {r["name"] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        # Alte Tabellen ohne user_id beiseitelegen (vor v4 gibt es sie noch gar nicht).
+        legacy = []
+        for table in LEGACY_USER_COLUMNS:
+            if table in tables and "user_id" not in {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}:
+                c.execute(f"ALTER TABLE {table} RENAME TO {table}_v5")
+                legacy.append(table)
+        for stmt in _statements(USER_TABLES):
+            c.execute(stmt)
+        # Index über die alte Spalte read; ein Ersatz über paywalled ist zu unselektiv (der Planer
+        # sortierte dann, statt idx_articles_published zu nutzen).
+        c.execute("DROP INDEX IF EXISTS idx_articles_read_paywalled_source")
+
+        has_state = c.execute(
+            "SELECT 1 FROM articles WHERE read=1 OR starred=1 OR later=1 LIMIT 1").fetchone() is not None
+        has_state = has_state or any(
+            c.execute(f"SELECT 1 FROM {t}_v5 LIMIT 1").fetchone() for t in legacy)
+        admin_row = c.execute("SELECT id FROM users WHERE is_admin=1 ORDER BY id LIMIT 1").fetchone()
+        if admin_row:
+            admin_id = admin_row["id"]
+        elif admin:
+            admin_id = self._create_admin(c, admin)
+        elif has_state:
+            raise MigrationError("Umbau auf Schema 6: KIOSK_PASSWORD muss gesetzt sein, der bisherige "
+                                 "Lesestand geht auf den Admin (KIOSK_ADMIN_USER, Standard admin) über")
+        else:
+            admin_id = None  # frische oder leere Datenbank: Der Admin kommt beim Start
+
+        if admin_id is not None:
+            c.execute(
+                "INSERT OR IGNORE INTO user_articles (user_id, article_id, read, starred, later, updated_at) "
+                "SELECT ?, id, read, starred, later, ? FROM articles WHERE read=1 OR starred=1 OR later=1",
+                (admin_id, utcnow()))
+            for table in legacy:
+                cols = LEGACY_USER_COLUMNS[table]
+                c.execute(f"INSERT INTO {table} (user_id, {cols}) SELECT ?, {cols} FROM {table}_v5",
+                          (admin_id,))
+        for table in legacy:
+            c.execute(f"DROP TABLE {table}_v5")
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -284,10 +420,15 @@ class Database:
                     (now, (error or "unbekannter Fehler")[:500], sid),
                 )
 
-    def source_counts(self) -> dict[str, dict[str, int]]:
+    def source_counts(self, user_id: int) -> dict[str, dict[str, int]]:
+        # Aufbewahrungsgrenze wie in der Liste: Alte Artikel zählen nur für den, der sie gemerkt hat.
+        where, params = _article_filter(sources=None, unread=False, starred=False, free_only=False,
+                                        cutoff=self.retention_cutoff())
+        cond = f"WHERE {' AND '.join(where)} " if where else ""
         rows = self.q(
-            "SELECT source_id, SUM(paywalled=0) AS total, SUM(read=0 AND paywalled=0) AS unread "
-            "FROM articles GROUP BY source_id"
+            "SELECT a.source_id, SUM(a.paywalled=0) AS total, "
+            "SUM(COALESCE(ua.read, 0)=0 AND a.paywalled=0) AS unread "
+            f"FROM articles a {USER_JOIN} {cond}GROUP BY a.source_id", (user_id, *params)
         )
         return {r["source_id"]: {"total": r["total"], "unread": r["unread"]} for r in rows}
 
@@ -423,16 +564,24 @@ class Database:
         r = self.one("SELECT published_at FROM articles WHERE id=?", (article_id,))
         return r["published_at"] if r else None
 
-    def list_articles(self, *, sources: list[str] | None,
+    def retention_cutoff(self) -> str | None:
+        """Zeitpunkt (wie published_at gespeichert), vor dem Artikel nur noch für Benutzer
+        sichtbar sind, die sie gemerkt haben; None = keine Aufbewahrungsgrenze gesetzt."""
+        if not self.retention_days:
+            return None
+        return (datetime.now(timezone.utc) - timedelta(days=self.retention_days)).isoformat()
+
+    def list_articles(self, user_id: int, *, sources: list[str] | None,
                       query: str | None, unread: bool, starred: bool, free_only: bool,
                       before: tuple[str, int] | None, limit: int, offset: int = 0,
                       later: bool = False, terms: list[str] | None = None,
                       since: str | None = None) -> list[sqlite3.Row]:
         """Artikelliste. Ohne Suche per Keyset-Cursor `before` = (published_at, id),
         mit Suche (bm25-Sortierung) per `offset`. `terms` (Profil-Begriffe) filtern nur,
-        die Sortierung bleibt chronologisch."""
+        die Sortierung bleibt chronologisch. Flags und Filter gelten für `user_id`."""
         where, params = _article_filter(sources=sources, unread=unread, starred=starred,
-                                        free_only=free_only, later=later, terms=terms, since=since)
+                                        free_only=free_only, later=later, terms=terms, since=since,
+                                        cutoff=self.retention_cutoff())
         join = ""
         order = "a.published_at DESC, a.id DESC"
         if query:
@@ -444,96 +593,135 @@ class Database:
             where.append("(a.published_at, a.id) < (?, ?)")
             params += [before[0], before[1]]
         sql = (
-            f"SELECT {ARTICLE_LIST_COLS} FROM articles a {join} "
+            f"SELECT {ARTICLE_LIST_COLS} FROM articles a {USER_JOIN} {join} "
             + (("WHERE " + " AND ".join(where)) if where else "")
             + f" ORDER BY {order} LIMIT ?"
         )
-        params.append(limit)
+        params = [user_id, *params, limit]
         if query and offset:
             sql += " OFFSET ?"
             params.append(offset)
         return self.q(sql, tuple(params))
 
-    def count_articles(self, *, cap: int, sources: list[str] | None = None, query: str | None = None,
+    def count_articles(self, user_id: int, *, cap: int, sources: list[str] | None = None, query: str | None = None,
                        unread: bool = False, starred: bool = False, free_only: bool = False,
                        later: bool = False, terms: list[str] | None = None,
                        since: str | None = None) -> int:
         """Anzahl passender Artikel, höchstens `cap` (zählt nie mehr Zeilen als nötig)."""
         where, params = _article_filter(sources=sources, unread=unread, starred=starred,
-                                        free_only=free_only, later=later, terms=terms, since=since)
+                                        free_only=free_only, later=later, terms=terms, since=since,
+                                        cutoff=self.retention_cutoff())
         if query:
             where.append("a.id IN (SELECT rowid FROM articles_fts WHERE articles_fts MATCH ?)")
             params.append(_fts_query(query))
-        sql = ("SELECT COUNT(*) AS n FROM (SELECT 1 FROM articles a "
+        sql = (f"SELECT COUNT(*) AS n FROM (SELECT 1 FROM articles a {USER_JOIN} "
                + (("WHERE " + " AND ".join(where)) if where else "") + " LIMIT ?)")
-        return self.one(sql, (*params, cap))["n"]
+        return self.one(sql, (user_id, *params, cap))["n"]
 
-    def get_article(self, article_id: int) -> sqlite3.Row | None:
-        return self.one("SELECT * FROM articles WHERE id=?", (article_id,))
+    def get_article(self, article_id: int, user_id: int | None = None) -> sqlite3.Row | None:
+        """Artikel mit Volltext; read/starred/later von `user_id` (ohne Benutzer alle 0). Für einen
+        Benutzer None, wenn der Artikel hinter der Aufbewahrungsgrenze liegt und er ihn nicht gemerkt hat."""
+        where, params = ["a.id=?"], [article_id]
+        if user_id is not None:
+            where, params = _article_filter(sources=None, unread=False, starred=False, free_only=False,
+                                            cutoff=self.retention_cutoff())
+            where.append("a.id=?")
+            params.append(article_id)
+        return self.one(f"SELECT {ARTICLE_DETAIL_COLS} FROM articles a {USER_JOIN} WHERE {' AND '.join(where)}",
+                        (user_id, *params))
 
-    def set_flag(self, article_id: int, flag: str, value: bool) -> bool:
+    def set_flag(self, user_id: int, article_id: int, flag: str, value: bool) -> bool:
+        """Setzt ein Flag des Benutzers; False, wenn es den Artikel nicht gibt."""
         assert flag in ("read", "starred", "later")
+        where, params = _article_filter(sources=None, unread=False, starred=False, free_only=False,
+                                        cutoff=self.retention_cutoff())
+        where.append("a.id=?")
         with self.tx() as c:
-            cur = c.execute(f"UPDATE articles SET {flag}=? WHERE id=?", (1 if value else 0, article_id))
-            return cur.rowcount > 0
+            # Nur sichtbare Artikel (siehe get_article): Wer einen alten, von anderen gemerkten
+            # Artikel per ID merkt, soll ihn dadurch nicht sehen können.
+            if not c.execute(f"SELECT 1 FROM articles a {USER_JOIN} WHERE {' AND '.join(where)}",
+                             (user_id, *params, article_id)).fetchone():
+                return False
+            c.execute(
+                f"INSERT INTO user_articles (user_id, article_id, {flag}, updated_at) VALUES (?, ?, ?, ?) "
+                f"ON CONFLICT (user_id, article_id) DO UPDATE SET {flag}=excluded.{flag}, "
+                "updated_at=excluded.updated_at",
+                (user_id, article_id, 1 if value else 0, utcnow()))
+            # Zeilen ohne jedes Flag sind überflüssig
+            c.execute("DELETE FROM user_articles WHERE user_id=? AND article_id=? "
+                      "AND read=0 AND starred=0 AND later=0", (user_id, article_id))
+            return True
 
-    def mark_all_read(self, sources: list[str] | None, terms: list[str] | None = None,
+    def mark_all_read(self, user_id: int, sources: list[str] | None, terms: list[str] | None = None,
                       max_id: int | None = None) -> int:
         """Markiert alle Artikel der Menge als gelesen (sources None = alle, [] = keine), mit
         `max_id` nur Artikel bis zu dieser ID. Gibt die Zahl der markierten Artikel ohne Paywall
         zurück (so viele, wie die Oberfläche als ungelesen gezählt hat)."""
         where, params = _article_filter(sources=sources, unread=True, starred=False,
-                                        free_only=False, terms=terms)
+                                        free_only=False, terms=terms, cutoff=self.retention_cutoff())
         if max_id is not None:
             where.append("a.id <= ?")
             params.append(max_id)
         cond = " AND ".join(where)
         with self.tx() as c:
-            visible = c.execute(f"SELECT COUNT(*) AS n FROM articles a WHERE {cond} AND a.paywalled=0",
-                                tuple(params)).fetchone()["n"]
-            c.execute(f"UPDATE articles AS a SET read=1 WHERE {cond}", tuple(params))
+            visible = c.execute(f"SELECT COUNT(*) AS n FROM articles a {USER_JOIN} WHERE {cond} "
+                                "AND a.paywalled=0", (user_id, *params)).fetchone()["n"]
+            # WHERE ist Pflicht vor ON CONFLICT (sonst mehrdeutig für den SQLite-Parser); cond ist nie leer.
+            c.execute(
+                "INSERT INTO user_articles (user_id, article_id, read, updated_at) "
+                f"SELECT ?, a.id, 1, ? FROM articles a {USER_JOIN} WHERE {cond} "
+                "ON CONFLICT (user_id, article_id) DO UPDATE SET read=1, updated_at=excluded.updated_at",
+                (user_id, utcnow(), user_id, *params))
             return visible
 
-    def article_counts(self, unread_sources: list[str] | None = None) -> dict[str, int]:
+    def article_counts(self, user_id: int, unread_sources: list[str] | None = None) -> dict[str, int]:
         """Zähler für Menü und Kopfzeilen. `unread` ohne Paywall-Artikel und nur aus
         `unread_sources` (None = alle Quellen); `later` und `starred` zählen alle gemerkten
         Artikel (Gemerkt zeigt auch Bezahlartikel und ausgeschaltete Quellen)."""
         where, params = _article_filter(sources=unread_sources, unread=True, starred=False,
-                                        free_only=True)
-        unread = self.one(f"SELECT COUNT(*) AS n FROM articles a WHERE {' AND '.join(where)}",
-                          tuple(params))["n"]
-        row = self.one("SELECT COALESCE(SUM(later=1), 0) AS later, COALESCE(SUM(starred=1), 0) AS starred "
-                       "FROM articles")
+                                        free_only=True, cutoff=self.retention_cutoff())
+        unread = self.one(f"SELECT COUNT(*) AS n FROM articles a {USER_JOIN} WHERE {' AND '.join(where)}",
+                          (user_id, *params))["n"]
+        row = self.one("SELECT COALESCE(SUM(ua.later=1), 0) AS later, COALESCE(SUM(ua.starred=1), 0) AS starred "
+                       "FROM user_articles ua WHERE ua.user_id=?", (user_id,))
         return {"unread": unread, **dict(row)}
 
     def max_article_id(self) -> int:
         """Höchste vergebene Artikel-ID (Wasserstand für "alles gelesen"), 0 ohne Artikel."""
         return self.one("SELECT COALESCE(MAX(id), 0) AS n FROM articles")["n"]
 
-    def unread_free_by_source(self) -> dict[str, int]:
+    def unread_free_by_source(self, user_id: int) -> dict[str, int]:
         """Ungelesene Artikel ohne Paywall je Quelle."""
-        rows = self.q("SELECT source_id, COUNT(*) AS n FROM articles WHERE read=0 AND paywalled=0 "
-                      "GROUP BY source_id")
+        where, params = _article_filter(sources=None, unread=True, starred=False, free_only=True,
+                                        cutoff=self.retention_cutoff())
+        rows = self.q(f"SELECT a.source_id, COUNT(*) AS n FROM articles a {USER_JOIN} "
+                      f"WHERE {' AND '.join(where)} GROUP BY a.source_id", (user_id, *params))
         return {r["source_id"]: r["n"] for r in rows}
 
     def purge(self, retention_days: int) -> int:
-        """Löscht alte Artikel (Favoriten und „Später lesen“ bleiben).
+        """Löscht alte Artikel. Was irgendein Benutzer gemerkt hat (Favorit oder „Später lesen“),
+        bleibt; der Lesestand gelöschter Artikel verschwindet per Cascade.
         seen_guids bleiben doppelt so lange erhalten."""
         now = datetime.now(timezone.utc)
         cutoff = (now - timedelta(days=retention_days)).isoformat()
         seen_cutoff = _iso(now - timedelta(days=2 * retention_days))
         with self.tx() as c:
-            cur = c.execute("DELETE FROM articles WHERE starred=0 AND later=0 AND published_at < ?", (cutoff,))
+            cur = c.execute(
+                "DELETE FROM articles WHERE published_at < ? AND NOT EXISTS (SELECT 1 FROM user_articles ua "
+                "WHERE ua.article_id = articles.id AND (ua.starred=1 OR ua.later=1))", (cutoff,))
             c.execute("DELETE FROM seen_guids WHERE first_seen < ?", (seen_cutoff,))
             return cur.rowcount
 
-    def stats(self) -> dict[str, Any]:
+    def stats(self, user_id: int | None = None) -> dict[str, Any]:
+        """Kennzahlen der Datenbank; unread und starred gelten für `user_id`."""
         row = self.one(
-            "SELECT COUNT(*) AS total, SUM(read=0 AND paywalled=0) AS unread, SUM(starred=1) AS starred, "
-            "SUM(text_status='pending') AS pending, SUM(text_status='full') AS full, "
-            "SUM(text_status='partial') AS partial, SUM(text_status='failed') AS failed, "
-            "SUM(paywalled=1) AS paywalled, COALESCE(SUM(body_len),0) AS body_bytes, "
-            "MIN(published_at) AS oldest, MAX(published_at) AS newest FROM articles"
+            "SELECT COUNT(*) AS total, SUM(COALESCE(ua.read, 0)=0 AND a.paywalled=0) AS unread, "
+            "SUM(COALESCE(ua.starred, 0)=1) AS starred, "
+            "SUM(a.text_status='pending') AS pending, SUM(a.text_status='full') AS full, "
+            "SUM(a.text_status='partial') AS partial, SUM(a.text_status='failed') AS failed, "
+            "SUM(a.paywalled=1) AS paywalled, COALESCE(SUM(a.body_len),0) AS body_bytes, "
+            f"MIN(a.published_at) AS oldest, MAX(a.published_at) AS newest FROM articles a {USER_JOIN}",
+            (user_id,)
         )
         size = 0
         for suffix in ("", "-wal"):
@@ -544,8 +732,9 @@ class Database:
 
     # ---- Profile ---------------------------------------------------------
 
-    def seed_profiles(self, de_sources: list[str], business_sources: list[str] | None) -> bool:
-        """Legt die vier vorgegebenen Profile an, wenn es noch keine gibt. True, wenn gesät wurde.
+    def seed_profiles(self, user_id: int, de_sources: list[str], business_sources: list[str] | None) -> bool:
+        """Legt die vier vorgegebenen Profile des Benutzers an, wenn er noch keine hat.
+        True, wenn gesät wurde.
 
         `business_sources` None heißt: keine Wirtschaftsquelle aktiv, dann alle Quellen plus Begriffe.
         """
@@ -557,36 +746,40 @@ class Database:
             ("Militär", "military", None, MILITARY_TERMS, 0),
         )
         with self.tx() as c:
-            if c.execute("SELECT 1 FROM profiles LIMIT 1").fetchone():
+            if c.execute("SELECT 1 FROM profiles WHERE user_id=? LIMIT 1", (user_id,)).fetchone():
                 return False
             for pos, (name, builtin, sources, terms, in_bar) in enumerate(seeds):
                 c.execute(
-                    "INSERT INTO profiles (name, builtin, sources_json, terms_json, in_bar, position, created_at) "
-                    "VALUES (?,?,?,?,?,?,?)",
-                    (name, builtin, None if sources is None else json.dumps(sources),
+                    "INSERT INTO profiles (user_id, name, builtin, sources_json, terms_json, in_bar, position, "
+                    "created_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (user_id, name, builtin, None if sources is None else json.dumps(sources),
                      json.dumps(terms, ensure_ascii=False), in_bar, pos, now),
                 )
         return True
 
-    def list_profiles(self) -> list[dict[str, Any]]:
-        return [_profile(r) for r in self.q("SELECT * FROM profiles ORDER BY position, id")]
+    def list_profiles(self, user_id: int) -> list[dict[str, Any]]:
+        return [_profile(r) for r in self.q("SELECT * FROM profiles WHERE user_id=? ORDER BY position, id",
+                                            (user_id,))]
 
-    def get_profile(self, profile_id: int) -> dict[str, Any] | None:
-        r = self.one("SELECT * FROM profiles WHERE id=?", (profile_id,))
+    def get_profile(self, user_id: int, profile_id: int) -> dict[str, Any] | None:
+        """Profil des Benutzers; Profile anderer Benutzer gibt es für ihn nicht (None)."""
+        r = self.one("SELECT * FROM profiles WHERE id=? AND user_id=?", (profile_id, user_id))
         return _profile(r) if r else None
 
-    def create_profile(self, *, name: str, sources: list[str] | None, terms: list[str], in_bar: bool) -> int:
+    def create_profile(self, user_id: int, *, name: str, sources: list[str] | None, terms: list[str],
+                       in_bar: bool) -> int:
         with self.tx() as c:
-            pos = c.execute("SELECT COALESCE(MAX(position) + 1, 0) AS p FROM profiles").fetchone()["p"]
+            pos = c.execute("SELECT COALESCE(MAX(position) + 1, 0) AS p FROM profiles WHERE user_id=?",
+                            (user_id,)).fetchone()["p"]
             cur = c.execute(
-                "INSERT INTO profiles (name, sources_json, terms_json, in_bar, position, created_at) "
-                "VALUES (?,?,?,?,?,?)",
-                (name, None if sources is None else json.dumps(sources),
+                "INSERT INTO profiles (user_id, name, sources_json, terms_json, in_bar, position, created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (user_id, name, None if sources is None else json.dumps(sources),
                  json.dumps(terms, ensure_ascii=False), 1 if in_bar else 0, pos, utcnow()),
             )
             return cur.lastrowid
 
-    def update_profile(self, profile_id: int, fields: dict[str, Any]) -> None:
+    def update_profile(self, user_id: int, profile_id: int, fields: dict[str, Any]) -> None:
         """Ändert nur die übergebenen Felder (name, sources, terms, in_bar)."""
         cols = {"name": ("name", lambda v: v),
                 "sources": ("sources_json", lambda v: None if v is None else json.dumps(v)),
@@ -596,61 +789,65 @@ class Database:
         if not sets:
             return
         with self.tx() as c:
-            c.execute(f"UPDATE profiles SET {', '.join(f'{col}=?' for col, _ in sets)} WHERE id=?",
-                      (*[v for _, v in sets], profile_id))
+            c.execute(f"UPDATE profiles SET {', '.join(f'{col}=?' for col, _ in sets)} "
+                      "WHERE id=? AND user_id=?", (*[v for _, v in sets], profile_id, user_id))
 
-    def delete_profile(self, profile_id: int) -> None:
+    def delete_profile(self, user_id: int, profile_id: int) -> None:
         with self.tx() as c:
-            c.execute("DELETE FROM profiles WHERE id=?", (profile_id,))
+            c.execute("DELETE FROM profiles WHERE id=? AND user_id=?", (profile_id, user_id))
 
-    def reorder(self, table: str, key: str, ids: list) -> None:
-        """Setzt position nach der Reihenfolge in `ids`; nicht genannte Einträge folgen dahinter
-        in ihrer bisherigen Reihenfolge."""
+    def reorder(self, user_id: int, table: str, key: str, ids: list) -> None:
+        """Setzt position nach der Reihenfolge in `ids`; nicht genannte Einträge des Benutzers
+        folgen dahinter in ihrer bisherigen Reihenfolge."""
         assert (table, key) in (("profiles", "id"), ("favorite_sources", "source_id"))
         with self.tx() as c:
-            rest = [r[key] for r in c.execute(f"SELECT {key} FROM {table} ORDER BY position, {key}")
-                    if r[key] not in ids]
+            rest = [r[key] for r in c.execute(
+                f"SELECT {key} FROM {table} WHERE user_id=? ORDER BY position, {key}", (user_id,))
+                if r[key] not in ids]
             for pos, k in enumerate([*ids, *rest]):
-                c.execute(f"UPDATE {table} SET position=? WHERE {key}=?", (pos, k))
+                c.execute(f"UPDATE {table} SET position=? WHERE {key}=? AND user_id=?", (pos, k, user_id))
 
     # ---- Lieblingszeitungen ---------------------------------------------
 
-    def list_favorites(self) -> list[sqlite3.Row]:
-        return self.q("SELECT * FROM favorite_sources ORDER BY position, created_at, source_id")
+    def list_favorites(self, user_id: int) -> list[sqlite3.Row]:
+        return self.q("SELECT * FROM favorite_sources WHERE user_id=? ORDER BY position, created_at, source_id",
+                      (user_id,))
 
-    def put_favorite(self, source_id: str, in_bar: bool | None) -> None:
+    def put_favorite(self, user_id: int, source_id: str, in_bar: bool | None) -> None:
         """Legt eine Lieblingszeitung an (hinten, standardmäßig in der Leiste) oder ändert in_bar."""
         with self.tx() as c:
-            if c.execute("SELECT 1 FROM favorite_sources WHERE source_id=?", (source_id,)).fetchone():
+            if c.execute("SELECT 1 FROM favorite_sources WHERE user_id=? AND source_id=?",
+                         (user_id, source_id)).fetchone():
                 if in_bar is not None:
-                    c.execute("UPDATE favorite_sources SET in_bar=? WHERE source_id=?",
-                              (1 if in_bar else 0, source_id))
+                    c.execute("UPDATE favorite_sources SET in_bar=? WHERE user_id=? AND source_id=?",
+                              (1 if in_bar else 0, user_id, source_id))
                 return
-            pos = c.execute("SELECT COALESCE(MAX(position) + 1, 0) AS p FROM favorite_sources").fetchone()["p"]
-            c.execute("INSERT INTO favorite_sources (source_id, in_bar, position, created_at) VALUES (?,?,?,?)",
-                      (source_id, 0 if in_bar is False else 1, pos, utcnow()))
+            pos = c.execute("SELECT COALESCE(MAX(position) + 1, 0) AS p FROM favorite_sources WHERE user_id=?",
+                            (user_id,)).fetchone()["p"]
+            c.execute("INSERT INTO favorite_sources (user_id, source_id, in_bar, position, created_at) "
+                      "VALUES (?,?,?,?,?)", (user_id, source_id, 0 if in_bar is False else 1, pos, utcnow()))
 
-    def delete_favorite(self, source_id: str) -> None:
+    def delete_favorite(self, user_id: int, source_id: str) -> None:
         with self.tx() as c:
-            c.execute("DELETE FROM favorite_sources WHERE source_id=?", (source_id,))
+            c.execute("DELETE FROM favorite_sources WHERE user_id=? AND source_id=?", (user_id, source_id))
 
     # ---- Einstellungen --------------------------------------------------
 
-    def get_settings(self) -> dict[str, Any]:
-        """Gespeicherte Einstellungen (nur gesetzte Schlüssel), Werte aus JSON."""
+    def get_settings(self, user_id: int) -> dict[str, Any]:
+        """Gespeicherte Einstellungen des Benutzers (nur gesetzte Schlüssel), Werte aus JSON."""
         out = {}
-        for r in self.q("SELECT key, value FROM settings"):
+        for r in self.q("SELECT key, value FROM settings WHERE user_id=?", (user_id,)):
             try:
                 out[r["key"]] = json.loads(r["value"])
             except ValueError:
                 continue  # kaputter Wert: Standard gilt
         return out
 
-    def set_settings(self, values: dict[str, Any]) -> None:
+    def set_settings(self, user_id: int, values: dict[str, Any]) -> None:
         with self.tx() as c:
             for k, v in values.items():
-                c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-                          (k, json.dumps(v, ensure_ascii=False)))
+                c.execute("INSERT OR REPLACE INTO settings (user_id, key, value) VALUES (?, ?, ?)",
+                          (user_id, k, json.dumps(v, ensure_ascii=False)))
 
     def get_meta(self, key: str) -> str | None:
         r = self.one("SELECT value FROM meta WHERE key=?", (key,))
@@ -660,18 +857,59 @@ class Database:
         with self.tx() as c:
             c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
 
-    def session_epoch(self) -> int:
-        """Zähler für Sessions; steckt im signierten Cookie. Standard 1."""
-        raw = self.get_meta("session_epoch")
-        return int(raw) if raw and raw.isascii() and raw.isdigit() else 1
+    # ---- Benutzer --------------------------------------------------------
 
-    def bump_session_epoch(self) -> int:
-        """Erhöht den Zähler und macht damit alle bisher ausgegebenen Sessions ungültig."""
+    def get_user(self, user_id: int) -> dict[str, Any] | None:
+        r = self.one("SELECT * FROM users WHERE id=?", (user_id,))
+        return dict(r) if r else None
+
+    def get_user_by_name(self, username: str) -> dict[str, Any] | None:
+        r = self.one("SELECT * FROM users WHERE username=?", (username,))  # COLLATE NOCASE
+        return dict(r) if r else None
+
+    def list_users(self) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.q("SELECT * FROM users ORDER BY id")]
+
+    def user_count(self) -> int:
+        return self.one("SELECT COUNT(*) AS n FROM users")["n"]
+
+    def create_user(self, username: str, password_hash: str, *, display_name: str | None = None,
+                    is_admin: bool = False) -> int:
+        """Legt einen Benutzer an (Name schon geprüft und klein geschrieben); sqlite3.IntegrityError,
+        wenn es den Namen schon gibt."""
         with self.tx() as c:
-            row = c.execute("SELECT value FROM meta WHERE key='session_epoch'").fetchone()
-            current = int(row["value"]) if row and row["value"].isascii() and row["value"].isdigit() else 1
-            c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('session_epoch', ?)", (str(current + 1),))
-            return current + 1
+            cur = c.execute(
+                "INSERT INTO users (username, display_name, password_hash, is_admin, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (username, display_name or username, password_hash, 1 if is_admin else 0, utcnow()))
+            return cur.lastrowid
+
+    def update_user(self, user_id: int, *, end_sessions: bool = False, **fields: Any) -> None:
+        """Ändert password_hash, display_name, is_admin, disabled; `end_sessions` erhöht die
+        Session-Epoche und beendet damit alle Sitzungen des Benutzers."""
+        allowed = {"password_hash", "display_name", "is_admin", "disabled", "last_login_at"}
+        assert set(fields) <= allowed, fields
+        sets = [f"{k}=?" for k in fields] + (["session_epoch=session_epoch+1"] if end_sessions else [])
+        if not sets:
+            return
+        with self.tx() as c:
+            c.execute(f"UPDATE users SET {', '.join(sets)} WHERE id=?", (*fields.values(), user_id))
+
+    def end_sessions(self, user_id: int) -> None:
+        """Beendet alle Sitzungen des Benutzers (Abmelden)."""
+        self.update_user(user_id, end_sessions=True)
+
+    def delete_user(self, user_id: int) -> None:
+        """Löscht den Benutzer samt Lesestand, Profilen, Favoriten und Einstellungen (Cascade)."""
+        with self.tx() as c:
+            c.execute("DELETE FROM users WHERE id=?", (user_id,))
+
+    def active_admin_count(self) -> int:
+        return self.one("SELECT COUNT(*) AS n FROM users WHERE is_admin=1 AND disabled=0")["n"]
+
+    def users_without_profiles(self) -> list[int]:
+        return [r["id"] for r in self.q(
+            "SELECT id FROM users u WHERE NOT EXISTS (SELECT 1 FROM profiles p WHERE p.user_id = u.id)")]
 
     def ping(self) -> bool:
         """True, wenn die Datenbank antwortet."""
@@ -687,6 +925,13 @@ MILITARY_TERMS = ["Bundeswehr", "NATO", "Rüstung", "Militär", "Verteidigung",
                   "military", "defence", "defense", "army"]
 
 
+def _statements(script: str) -> list[str]:
+    """Zerlegt ein DDL-Skript (ohne Trigger) in einzelne Anweisungen für die Migration, die in
+    einer Transaktion läuft (executescript würde sie beenden)."""
+    lines = [line for line in script.splitlines() if not line.lstrip().startswith("--")]
+    return [stmt.strip() for stmt in "\n".join(lines).split(";") if stmt.strip()]
+
+
 def _profile(r: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": r["id"], "name": r["name"], "builtin": r["builtin"],
@@ -698,26 +943,32 @@ def _profile(r: sqlite3.Row) -> dict[str, Any]:
 
 def _article_filter(*, sources: list[str] | None, unread: bool, starred: bool, free_only: bool,
                     later: bool = False, terms: list[str] | None = None,
-                    since: str | None = None) -> tuple[list[str], list[Any]]:
-    """Gemeinsame WHERE-Bedingungen (Alias a) für Liste, Zählung und "alles gelesen".
+                    since: str | None = None, cutoff: str | None = None) -> tuple[list[str], list[Any]]:
+    """Gemeinsame WHERE-Bedingungen (Alias a, dazu ua aus USER_JOIN) für Liste, Zählung und
+    "alles gelesen".
 
     sources None = alle Quellen, leere Liste = keine. terms: Profil-Begriffe, ODER-verknüpft,
-    als Präfix über den Volltextindex.
+    als Präfix über den Volltextindex. cutoff: Aufbewahrungsgrenze; ältere Artikel (die purge nur
+    behält, weil jemand sie gemerkt hat) sieht nur, wer sie selbst als Favorit/„Später lesen“ hat.
     """
     where: list[str] = []
     params: list[Any] = []
+    if cutoff:
+        where.append("(a.published_at >= ? OR ua.starred=1 OR ua.later=1)")
+        params.append(cutoff)
     if sources is not None:
         if sources:
             where.append(f"a.source_id IN ({','.join('?' * len(sources))})")
             params += sources
         else:
             where.append("0")
+    # Flags aus user_articles (Alias ua, per LEFT JOIN des Aufrufers); keine Zeile heißt ungelesen.
     if unread:
-        where.append("a.read=0")
+        where.append("COALESCE(ua.read, 0)=0")
     if starred:
-        where.append("a.starred=1")
+        where.append("ua.starred=1")
     if later:
-        where.append("a.later=1")
+        where.append("ua.later=1")
     if free_only:
         where.append("a.paywalled=0")
     if since:

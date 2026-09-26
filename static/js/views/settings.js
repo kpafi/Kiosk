@@ -1,4 +1,4 @@
-// Einstellungen (E2Einstellungen): Erscheinungsbild, Textgröße, Lesen, Quellen, Abmelden.
+// Einstellungen (E2Einstellungen): Konto, Erscheinungsbild, Textgröße, Lesen, Quellen, Abmelden.
 import { h, replace, toast } from '../ui/dom.js';
 import { chevronRight } from '../ui/icons.js';
 import { subHeader } from '../ui/header.js';
@@ -6,7 +6,9 @@ import { chipGroup } from '../ui/chips.js';
 import { toggle } from '../ui/toggle.js';
 import { api } from '../api.js';
 import { formatCount, formatMB } from '../format.js';
-import { emit, loadSettings, loadStatus, saveSettings, state } from '../store.js';
+import {
+  emit, isAdmin, loadSettings, loadStatus, resetUserState, saveSettings, state,
+} from '../store.js';
 
 function section(title, extra = '') {
   return h('h2', { class: `sec ${extra} t-section`.trim(), text: title });
@@ -65,11 +67,25 @@ export function settingsView() {
       { value: 's', label: 'Klein' }, { value: 'm', label: 'Normal' }, { value: 'l', label: 'Groß' },
     ], s.text_size, (v) => { save({ text_size: v }).catch(() => {}); });
 
+    const admin = isAdmin();
+    const user = state.user;
     const build_ = st.build ? String(st.build).slice(0, 8) : 'lokal';
-    const footer = `Kiosk · Build ${build_} · ${formatCount(db.total)} Artikel · ${formatMB(db.db_bytes)}`;
+    // Artikelzahl und DB-Größe nur für den Admin (Nicht-Admins bekommen sie gar nicht).
+    const footer = admin
+      ? `Kiosk · Build ${build_} · ${formatCount(db.total)} Artikel · ${formatMB(db.db_bytes)}`
+      : `Kiosk · Build ${build_}`;
+    // Zähler aus /api/status (nur Admin), sonst aus der Zeitungsliste.
+    const sources = state.sources || [];
+    const total = conf.sources_total || sources.length;
+    const enabled = conf.sources_total ? conf.sources_enabled : sources.filter((x) => x.enabled).length;
 
     replace(page,
-      section('ERSCHEINUNGSBILD', 'sec--first'),
+      user ? [
+        section('KONTO', 'sec--first'),
+        row(`Angemeldet als ${user.display_name || user.username}`,
+          admin ? 'Admin · verwaltet Zeitungen und Server' : 'Nutzer · eigene Profile und Merklisten'),
+      ] : null,
+      section('ERSCHEINUNGSBILD', user ? '' : 'sec--first'),
       themeChips,
       section('TEXTGRÖSSE'),
       sizeChips,
@@ -79,13 +95,15 @@ export function settingsView() {
       row('Bilder in der Liste', 'Vorschaubild rechts vom Titel',
         toggle(s.show_images, 'Bilder in der Liste', (v) => save({ show_images: v }))),
       section('QUELLEN', 'sec--gap'),
-      // Nur Anzeige: beides legt der Server fest (kein Pfeil, nicht antippbar).
-      row('Abrufintervall', interval ? `Alle ${interval} Minuten · auf dem Server festgelegt` : 'Auf dem Server festgelegt'),
-      row('Aufbewahrung', conf.retention_days ? `${conf.retention_days} Tage · auf dem Server festgelegt` : 'Auf dem Server festgelegt'),
+      // Nur Anzeige und nur für den Admin: beides legt der Server fest (kein Pfeil, nicht antippbar).
+      admin ? [
+        row('Abrufintervall', interval ? `Alle ${interval} Minuten · auf dem Server festgelegt` : 'Auf dem Server festgelegt'),
+        row('Aufbewahrung', conf.retention_days ? `${conf.retention_days} Tage · auf dem Server festgelegt` : 'Auf dem Server festgelegt'),
+      ] : null,
       h('a', { class: 'set-row', href: '#/quellen' },
         h('span', { class: 'set-row-text' },
           h('span', { class: 't-ui', text: 'Alle Zeitungen' }),
-          h('span', { class: 't-caption', text: conf.sources_total ? `${conf.sources_enabled} von ${conf.sources_total} aktiv` : ' ' })),
+          h('span', { class: 't-caption', text: total ? `${enabled} von ${total} aktiv` : ' ' })),
         h('span', { class: 'chev' }, chevronRight(18))),
       h('div', { class: 'foot' },
         h('button', {
@@ -94,6 +112,7 @@ export function settingsView() {
             click: async () => {
               try { await api('logout', { method: 'POST' }); } catch { /* trotzdem abmelden */ }
               state.authed = false;
+              resetUserState();
               location.hash = '#/login';
             },
           },

@@ -9,14 +9,20 @@ Gleicher Server wie secure-chat und MailDigest (203.0.113.10, SSH-Alias `kiosk-s
   installieren, Image als `kiosk:candidate` bauen (mit Build-Zeitstempel, sichtbar in `/api/status` als
   `build`), Pre-Deploy-Backup der Datenbank (gibt auch die Zahl der Artikel aus), Container mit
   `kiosk:candidate` starten, bis zu 300 s auf `/healthz` warten
-  (überschreibbar: `KIOSK_HEALTH_WAIT=600 bash deploy/deploy.sh`), Caddy-Block aktualisieren, dann ein
-  echter Login über `https://kiosk.example.org/api/login` (erwartet 204).
+  (überschreibbar: `KIOSK_HEALTH_WAIT=600 bash deploy/deploy.sh`), Caddy-Block aktualisieren, dann eine
+  Prüfung über Caddy ohne Zugangsdaten: `GET https://kiosk.example.org/api/session` muss 200 mit
+  `{"authenticated": false, ...}` liefern, und `POST /api/login` mit richtigem `Origin`, einem zufälligen, nicht
+  existierenden Benutzernamen (`deploy-probe-<zufall>`) und falschem Passwort muss 401 liefern (beweist Caddy,
+  Origin-/CSRF-Prüfung, Login-Pfad und Datenbank; 403 = Origin abgelehnt, 429 = Login-Bremse). Kein echtes
+  Konto wird dabei belastet; der Fehlversuch zählt aber gegen die IP der Box (8 pro 15 Minuten), mehr als
+  acht Deploys in 15 Minuten scheitern also an dieser Prüfung mit 429. Bei 429 beim Login-Check:
+  15 Minuten warten, kein Rollback nötig.
 - Dauer der Schema-Migration beim Start: Der Umstieg von Schema 1 auf 2 (Volltext neu indizieren) braucht ca.
   2 ms pro Artikel, bei 100 000 Artikeln also gut 3 Minuten; in dieser Zeit antwortet `/healthz` nicht. Der
   Docker-HEALTHCHECK hat deshalb `--start-period=180s`; bei sehr großen Datenbanken `KIOSK_HEALTH_WAIT`
   erhöhen. Schema 2 auf 3 (`seen_guids`) ist ein einzelnes `INSERT ... SELECT` und dauert nur Sekunden.
 - Image-Markierungen: `docker-compose.yml` nutzt `image: ${KIOSK_IMAGE:-kiosk:latest}`. deploy.sh baut und
-  startet mit `KIOSK_IMAGE=kiosk:candidate`; erst nach dem Login-Test zeigen `kiosk:latest` und `kiosk:good`
+  startet mit `KIOSK_IMAGE=kiosk:candidate`; erst nach der Prüfung über Caddy zeigen `kiosk:latest` und `kiosk:good`
   auf dasselbe Image (der Container läuft einfach weiter, die Image-ID ist dieselbe). Ein gescheiterter
   Deploy lässt `kiosk:latest` also unverändert. Ein späteres `docker compose up -d` ohne Variable legt den
   Container einmal mit dem Namen `kiosk:latest` neu an (gleiches Image). `kiosk:good` ist immer das zuletzt
@@ -25,8 +31,8 @@ Gleicher Server wie secure-chat und MailDigest (203.0.113.10, SSH-Alias `kiosk-s
   gibt es noch kein `kiosk:good`, ein älteres `kiosk:previous` bleibt dann unverändert.
 - Scheitert das Bauen oder das Pre-Deploy-Backup, bricht das Skript mit `Alter Container läuft weiter,
   nichts zu tun` ab: Bis dahin ist am laufenden Container nichts verändert.
-- Scheitert ein Schritt ab dem Start des neuen Containers (`docker compose up`, `/healthz`, Caddy oder der
-  Login-Test), bricht das Skript ab und gibt die Befehle zum Zurückrollen aus (Ziel `kiosk:good`, ohne dieses
+- Scheitert ein Schritt ab dem Start des neuen Containers (`docker compose up`, `/healthz`, Caddy oder die
+  Prüfung über Caddy), bricht das Skript ab und gibt die Befehle zum Zurückrollen aus (Ziel `kiosk:good`, ohne dieses
   die ID des vorher laufenden Images, dazu der Name des Pre-Deploy-Backups); der neue Container läuft dann weiter.
 - Zurückrollen nach einem gescheiterten Deploy: `cd /opt/kiosk && docker compose down && docker tag kiosk:good kiosk:latest`
   (`kiosk:latest` ist dann ohnehin noch der alte Stand; das Umtaggen schadet nicht), dann ggf. die Datenbank
@@ -38,7 +44,22 @@ Gleicher Server wie secure-chat und MailDigest (203.0.113.10, SSH-Alias `kiosk-s
   entpacken: `gunzip -c <Datei> > /opt/kiosk/data/kiosk.db`, dann `data/kiosk.db-wal` und `data/kiosk.db-shm`
   löschen, `chown 1000:1000 /opt/kiosk/data/kiosk.db`. Dann `docker compose up -d --no-build`.
   (Ältere Sicherungen ohne `.gz` direkt kopieren.)
-- Passwort ändern: `.env` auf dem Server anpassen, dann `docker compose up -d` in `/opt/kiosk`.
+- Benutzer verwalten vom Laptop aus: `bash deploy/user.sh <befehl> ...` führt per SSH
+  `docker compose exec -T kiosk python -m app.users <befehl> ...` im laufenden Container aus
+  (Befehle siehe README, Abschnitt Benutzer), z. B. `bash deploy/user.sh add anna --name "Anna"`,
+  `bash deploy/user.sh passwd anna`, `bash deploy/user.sh list`. Bei `add` und `passwd` fragt das Skript das
+  Passwort lokal zweimal verdeckt ab und reicht es über stdin (`--password-stdin`) durch; es steht nie in
+  einer Kommandozeile oder Shell-History. `remove` fragt lokal nach und ruft dann mit `--yes` auf.
+  Anderer SSH-Alias: `BOX=... bash deploy/user.sh ...`.
+- Passwörter ändern: `bash deploy/user.sh passwd <name>`. `KIOSK_PASSWORD` in der `.env` legt nur beim
+  ersten Start (bzw. beim Umbau auf Schema 6) den Admin `KIOSK_ADMIN_USER` (Standard `admin`) an und wird
+  danach ignoriert. Die Prüfung von deploy.sh braucht kein Passwort; nach einem `passwd` muss die `.env`
+  nicht angepasst werden.
+- Umbau auf Mehrbenutzer (Schema 6): Beim ersten Start migriert die App in einer Transaktion; der bisherige
+  Lesestand, die Profile, Favoriten und Einstellungen gehen auf den Admin über, der sich mit
+  `KIOSK_ADMIN_USER` (Standard `admin`) und dem bisherigen `KIOSK_PASSWORD` anmeldet. Alle bisherigen
+  Cookies sind danach ungültig (neues Format), jeder meldet sich einmal neu an. Zurück geht es nur über das
+  Pre-Deploy-Backup (siehe unten).
 - Logs: `docker logs -f kiosk`.
 - Der Container läuft mit `init: true`: Ein kleiner init-Prozess ist PID 1, sammelt verwaiste Prozesse
   (z. B. beendete Extraktions-Worker) ein und leitet Signale weiter.

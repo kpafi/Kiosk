@@ -23,6 +23,7 @@ function lsSet(key, value) {
 
 export const state = {
   authed: null,                 // null = unbekannt, true/false nach /api/session
+  user: null,                   // {id, username, display_name, is_admin} aus /api/session
   settings: { ...DEFAULT_SETTINGS, ...(lsGet(LS_SETTINGS) || {}) },
   status: null,                 // /api/status
   sources: null,                // /api/sources
@@ -40,6 +41,34 @@ export const state = {
   prevHash: null,              // vorige Adresse (vor dem letzten Adresswechsel)
   openArticleId: null,
 };
+
+/** Darf der angemeldete Benutzer Zeitungen schalten und Sammelläufe starten? */
+export function isAdmin() {
+  return !!(state.user && state.user.is_admin);
+}
+
+/** Sitzung aus /api/session übernehmen. */
+export function setSession(session) {
+  state.authed = !!(session && session.authenticated);
+  state.user = state.authed ? session.user || null : null;
+}
+
+/** Beim Anmelden und Abmelden: Daten des vorigen Benutzers vergessen, auch die lokalen Kopien der
+ *  Einstellungen und des Filters „Ungelesen“ (sonst blieben Theme, Textgröße und Filter vom
+ *  vorigen Benutzer stehen) sowie den Listen-Kontext (Profil-IDs gehören dem vorigen Benutzer). */
+export function resetUserState() {
+  try {
+    localStorage.removeItem(LS_SETTINGS);
+    localStorage.removeItem(LS_UNREAD);
+  } catch { /* privat/gesperrt */ }
+  state.settings = { ...DEFAULT_SETTINGS };
+  Object.assign(state, {
+    user: null, status: null, sources: null, sourceMap: new Map(), profiles: null,
+    favorites: null, bar: null, counts: null, listItems: [], listIsCtx: false, listWatermark: null,
+    lastListHash: '#/', openArticleId: null, unread: true, ctx: { type: 'all' },
+  });
+  applySettings();
+}
 
 // ---- Ereignisse ------------------------------------------------------------
 
@@ -97,6 +126,12 @@ export async function loadBar() {
 export async function loadCounts() {
   state.counts = await api('counts');
   return state.counts;
+}
+
+export async function loadSession() {
+  const session = await api('session');
+  setSession(session);
+  return session;
 }
 
 /** Alles, was fast jede Ansicht braucht (nach dem Anmelden). */

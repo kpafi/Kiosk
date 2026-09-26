@@ -84,35 +84,71 @@ def test_refuses_ambiguous_files(tmp_path, live):
     assert not (tmp_path / "candidate").exists()
 
 
-# ---- Login-Test: Passwort aus der .env als JSON -------------------------------
+# ---- Prüfung über Caddy: ohne Zugangsdaten -------------------------------------
 
-def _login_snippet() -> str:
+def _probe_snippet() -> str:
     script = (ROOT / "deploy" / "deploy.sh").read_text(encoding="utf-8")
-    m = re.search(r"<<'PYLOGIN'\n(.*?)\nPYLOGIN\n", script, re.S)
-    assert m, "Login-Stück in deploy.sh nicht gefunden"
+    part = script.split('echo "== Prüfung: Login über Caddy"')[1]
+    m = re.search(r"<<'REMOTE'\n(.*?)\nREMOTE\n", part, re.S)
+    assert m, "Prüfung über Caddy in deploy.sh nicht gefunden"
     return m.group(1)
 
 
-@pytest.mark.parametrize("line,expected", [
-    ("KIOSK_PASSWORD=abc-DEF_123", "abc-DEF_123"),
-    ('KIOSK_PASSWORD="mit leer zeichen"', "mit leer zeichen"),
-    ('KIOSK_PASSWORD=mit"zitat{}\'', 'mit"zitat{}\''),
-    ("KIOSK_PASSWORD='a=b c'", "a=b c"),
-])
-def test_login_body_from_env(tmp_path, line, expected):
+def _run_probe(tmp_path, session_body='{"authenticated":false,"user":null}', session_code="200",
+               login_code="401"):
+    """Führt das Prüfstück mit einer curl-Attrappe aus, die Argumente und stdin mitschreibt."""
+    import os
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "curl").write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "{tmp_path}/calls"
+case "$*" in
+  *api/session*) printf '%s\\n%s' '{session_body}' '{session_code}' ;;
+  *api/login*) cat > "{tmp_path}/login_body"; printf '%s' '{login_code}' ;;
+esac
+""", encoding="utf-8")
+    (bin_dir / "curl").chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("KIOSK_")}
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    return subprocess.run(["bash", "-s", "--", HOST], input=_probe_snippet(), env=env, text=True,
+                          capture_output=True)
+
+
+def test_probe_needs_no_credentials(tmp_path):
     import json
-    env = tmp_path / ".env"
-    env.write_text(f"KIOSK_FETCH_INTERVAL=900\n{line}\n", encoding="utf-8")
-    r = subprocess.run([sys.executable, "-", str(env)], input=_login_snippet(), text=True, capture_output=True)
+    r = _run_probe(tmp_path)
     assert r.returncode == 0, r.stderr
-    assert json.loads(r.stdout) == {"password": expected}
+    assert "HTTP 401 wie erwartet" in r.stdout
+    calls = (tmp_path / "calls").read_text()
+    assert f"https://{HOST}/api/session" in calls and f"Origin: https://{HOST}" in calls
+    body = json.loads((tmp_path / "login_body").read_text())
+    # Zufälliger, gültiger, aber nicht existierender Name: belastet die Bremse keines echten Kontos.
+    assert re.fullmatch(r"deploy-probe-[0-9a-f]{12}", body["username"])
+    assert body["password"] and body["username"] != "admin"
+    second = tmp_path / "zwei"
+    second.mkdir()
+    _run_probe(second)
+    assert json.loads((second / "login_body").read_text())["username"] != body["username"]
 
 
-def test_login_body_requires_password(tmp_path):
-    env = tmp_path / ".env"
-    env.write_text("KIOSK_FETCH_INTERVAL=900\n", encoding="utf-8")
-    r = subprocess.run([sys.executable, "-", str(env)], input=_login_snippet(), text=True, capture_output=True)
-    assert r.returncode != 0 and "KIOSK_PASSWORD" in r.stderr
+@pytest.mark.parametrize("kwargs", [
+    {"session_code": "502"},
+    {"session_body": '{"authenticated":true,"user":{}}'},
+    {"login_code": "204"},
+    {"login_code": "403"},
+    {"login_code": "429"},
+])
+def test_probe_fails_on_unexpected_answers(tmp_path, kwargs):
+    r = _run_probe(tmp_path, **kwargs)
+    assert r.returncode != 0 and "FEHLER" in r.stderr
+
+
+def test_probe_does_not_read_env_credentials():
+    snippet = _probe_snippet()
+    assert "KIOSK_PASSWORD" not in snippet and "KIOSK_ADMIN_USER" not in snippet and ".env" not in snippet
+    script = (ROOT / "deploy" / "deploy.sh").read_text(encoding="utf-8")
+    # KIOSK_PASSWORD kommt nur noch beim ersten Anlegen der .env vor.
+    assert script.count("KIOSK_PASSWORD") == 1 and "PYLOGIN" not in script
 
 
 def test_deploy_does_not_print_password():

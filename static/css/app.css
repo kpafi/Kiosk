@@ -275,6 +275,7 @@ mark {
 .list-end { padding: 24px 0; text-align: center; color: var(--muted); }
 .hint { padding: 16px 0; color: var(--muted); }
 .hint--pad { padding: 16px var(--gutter); }
+.hint--admin { padding-top: 8px; }
 
 /* ---- Status-Pille (Laden) ------------------------------------------------ */
 .status-pill {
@@ -310,6 +311,15 @@ mark {
   text-align: center;
 }
 .empty p { color: var(--muted); max-width: 32ch; }
+/* Listen (Startliste, Zeitung): Die Ansicht füllt die Höhe über der Leiste, ein Leerzustand steht
+   mittig im freien Platz unter Kopfzeile und Filtern. */
+.view-list { display: flex; flex-direction: column; min-height: calc(100dvh - var(--bar) - 32px - env(safe-area-inset-bottom)); }
+.feed-holder { flex: 1 0 auto; display: flex; flex-direction: column; }
+.feed-holder > .list:has(> .empty) { flex: 1 0 auto; display: flex; flex-direction: column; justify-content: center; }
+.feed-holder > .list > .empty { padding: 24px 16px 40px; }
+@media (min-width: 900px) {
+  .view-list { min-height: calc(100dvh - var(--bar) - 40px); }
+}
 .empty .pill-row { justify-content: center; padding-top: 8px; }
 .matrix {
   display: grid;
@@ -475,6 +485,8 @@ mark {
 }
 .set-row-link { color: inherit; text-decoration: none; }
 .set-value { color: var(--muted); white-space: nowrap; }
+.set-value--on { color: var(--ink); }
+.set-value--off { color: var(--muted); }
 .set-row.is-off .t-ui { color: var(--muted); }
 .err-inline { display: inline-flex; align-items: center; gap: 6px; color: var(--signal-text); }
 .err-inline::before { content: ""; width: 6px; height: 6px; border-radius: var(--radius-pill); background: var(--signal); flex-shrink: 0; }
@@ -544,6 +556,8 @@ mark {
 .login form { display: flex; flex-direction: column; gap: var(--space-3); }
 .login .input { height: 48px; padding: 0 18px; }
 .login .pill { height: 48px; }
+.login .err-line { min-height: 16px; }
+.err-line--idle { visibility: hidden; }
 .login-foot { position: absolute; left: 24px; bottom: calc(24px + env(safe-area-inset-bottom)); color: var(--muted); }
 
 /* ---- Leseansicht ---------------------------------------------------------- */

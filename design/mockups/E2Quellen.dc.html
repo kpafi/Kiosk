@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>Zeitungen verwalten</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Doto:wght@700&family=Space+Grotesk:wght@400;500;600&family=Space+Mono&display=swap" rel="stylesheet">
+<style>
+body{margin:0;font-family:"Space Grotesk","Helvetica Neue",Arial,sans-serif;background:#000000}
+a{color:#ffffff}a:hover{color:#ffffff}
+</style>
+</helmet>
+<div style="position: relative; width: 390px; height: 844px; box-sizing: border-box; background: #000000; color: #ffffff; display: flex; flex-direction: column; overflow: hidden;">
+  <header style="display: flex; align-items: center; gap: 8px; padding: 12px 16px;">
+    <a href="E2Einstellungen.dc.html" aria-label="Zurück" style="width: 44px; height: 44px; border-radius: 999px; border: 1px solid #6b6b6b; color: #ffffff; display: flex; align-items: center; justify-content: center; text-decoration: none; flex-shrink: 0;"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></a>
+    <div style="flex-grow: 1; display: flex; flex-direction: column;"><span style="font-family: 'Doto', monospace; font-size: 20px; line-height: 24px; font-weight: 700; letter-spacing: 0.08em; color: #ffffff;">ZEITUNGEN</span><span style="font-family: 'Space Mono', monospace; font-size: 12px; line-height: 16px; text-transform: uppercase; color: #9c9c9c;">25 von 92 aktiv · 1 mit Fehler</span></div>
+    <button aria-label="Jetzt abrufen" style="width: 44px; height: 44px; border-radius: 999px; border: 1px solid #6b6b6b; background: transparent; color: #ffffff; display: flex; align-items: center; justify-content: center; padding: 0; flex-shrink: 0;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></button>
+  </header>
+  <div style="display: flex; gap: 8px; padding: 0 16px 8px 16px; overflow: hidden;"><button style="height: 36px; padding: 0 14px; border-radius: 999px; border: 1px solid #ffffff; background: #ffffff; color: #000000; font-family: inherit; font-size: 14px; font-weight: 500; white-space: nowrap;">Alle</button><button style="height: 36px; padding: 0 14px; border-radius: 999px; border: 1px solid #6b6b6b; background: transparent; color: #ffffff; font-family: inherit; font-size: 14px; font-weight: 500; white-space: nowrap;">Aktive</button><button style="height: 36px; padding: 0 14px; border-radius: 999px; border: 1px solid #6b6b6b; background: transparent; color: #ffffff; font-family: inherit; font-size: 14px; font-weight: 500; white-space: nowrap;">Mit Fehler</button><button style="height: 36px; padding: 0 14px; border-radius: 999px; border: 1px solid #6b6b6b; background: transparent; color: #ffffff; font-family: inherit; font-size: 14px; font-weight: 500; white-space: nowrap;">Deutsch</button><button style="height: 36px; padding: 0 14px; border-radius: 999px; border: 1px solid #6b6b6b; background: transparent; color: #ffffff; font-family: inherit; font-size: 14px; font-weight: 500; white-space: nowrap;">Englisch</button></div>
+  <main style="display: flex; flex-direction: column; padding: 0 16px;">
+    <div style="display: flex; align-items: center; padding: 8px 0 4px 0;"><span style="flex-grow: 1; font-family: 'Doto', monospace; font-size: 20px; line-height: 24px; font-weight: 700; letter-spacing: 0.08em; color: #ffffff;">DEUTSCHLAND</span><span style="font-family: 'Space Mono', monospace; font-size: 12px; text-transform: uppercase; color: #9c9c9c;">9 von 15</span></div>
+      <div style="display: flex; align-items: center; gap: 12px; height: 56px; border-top: 1px solid #2a2a2a;">
+        <div style="flex-grow: 1; display: flex; flex-direction: column; min-width: 0;"><span style="font-size: 16px; line-height: 22px; font-weight: 500; color: #ffffff;">Der Spiegel</span><span style="font-family: 'Space Mono', monospace; font-size: 12px; line-height: 16px; text-transform: uppercase; color: #9c9c9c;">DE · 412 Artikel · vor 12 Min</span></div>
+        <span style="width: 44px; height: 26px; border-radius: 999px; background: #ffffff; display: inline-flex; align-items: center; justify-content: flex-end; padding: 0 3px; box-sizing: border-box; flex-shrink: 0;"><span style="width: 20px; height: 20px; border-radius: 999px; background: #000000;"></span></span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px; height: 56px; border-top: 1px solid #2a2a2a;">
+        <div style="flex-grow: 1; display: flex; flex-direction: column; min-width: 0;"><span style="font-size: 16px; line-height: 22px; font-weight: 500; color: #ffffff;">Die Zeit</span><span style="font-family: 'Space Mono', monospace; font-size: 12px; line-height: 16px; text-transform: uppercase; color: #9c9c9c;">DE · 188 Artikel · vor 12 Min</span></div>
+        <span style="width: 44px; height: 26px; border-radius: 999px; background: #ffffff; display: inline-flex; align-items: center; justify-content: flex-end; padding: 0 3px; box-sizing: border-box; flex-shrink: 0;"><span style="width: 20px; height: 20px; border-radius: 999px; background: #000000;"></span></span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px; height: 56px; border-top: 1px solid #2a2a2a;">
+        <div style="flex-grow: 1; display: flex; flex-direction: column; min-width: 0;"><span style="font-size: 16px; line-height: 22px; font-weight: 500; color: #ffffff;">Die Welt</span><span style="font-family: 'Space Mono', monospace; font-size: 12px; line-height: 16px; text-transform: uppercase; color: #9c9c9c;">DE · 301 Artikel · vor 12 Min</span></div>
+        <span style="width: 44px; height: 26px; border-radius: 999px; background: #ffffff; display: inline-flex; align-items: center; justify-content: flex-end; padding: 0 3px; box-sizing: border-box; flex-shrink: 0;"><span style="width: 20px; height: 20px; border-radius: 999px; background: #000000;"></span></span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px; height: 56px; border-top: 1px solid #2a2a2a;">
+        <div style="flex-grow: 1; display: flex; flex-direction: column; min-width: 0;"><span style="font-size: 16px; line-height: 22px; font-weight: 500; color: #ffffff;">Handelsblatt</span><span style="font-family: 'Space Mono', monospace; font-size: 12px; line-height: 16px; text-transform: uppercase; color: #9c9c9c;">DE · Aus</span></div>
+        <span style="width: 44px; height: 26px; border-radius: 999px; border: 1px solid #6b6b6b; display: inline-flex; align-items: center; justify-content: flex-start; padding: 0 2px; box-sizing: border-box; flex-shrink: 0;"><span style="width: 20px; height: 20px; border-radius: 999px; background: #ffffff;"></span></span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px; height: 56px; border-top: 1px solid #2a2a2a;">
+        <div style="flex-grow: 1; display: flex; flex-direction: column; min-width: 0;"><span style="font-size: 16px; line-height: 22px; font-weight: 500; color: #ffffff;">Frankfurter Rundschau</span><span style="font-family: 'Space Mono', monospace; font-size: 12px; line-height: 16px; text-transform: uppercase; color: #9c9c9c;">DE · Aus</span></div>
+        <span style="width: 44px; height: 26px; border-radius: 999px; border: 1px solid #6b6b6b; display: inline-flex; align-items: center; justify-content: flex-start; padding: 0 2px; box-sizing: border-box; flex-shrink: 0;"><span style="width: 20px; height: 20px; border-radius: 999px; background: #ffffff;"></span></span>
+      </div>
+    <div style="display: flex; align-items: center; padding: 20px 0 4px 0;"><span style="flex-grow: 1; font-family: 'Doto', monospace; font-size: 20px; line-height: 24px; font-weight: 700; letter-spacing: 0.08em; color: #ffffff;">GROSSBRITANNIEN</span><span style="font-family: 'Space Mono', monospace; font-size: 12px; text-transform: uppercase; color: #9c9c9c;">2 von 5</span></div>
+      <div style="display: flex; align-items: center; gap: 12px; height: 56px; border-top: 1px solid #2a2a2a;">
+        <div style="flex-grow: 1; display: flex; flex-direction: column; min-width: 0;"><span style="font-size: 16px; line-height: 22px; font-weight: 500; color: #ffffff;">BBC News</span><span style="font-family: 'Space Mono', monospace; font-size: 12px; line-height: 16px; text-transform: uppercase; color: #9c9c9c;">GB · 356 Artikel · vor 12 Min</span></div>
+        <span style="width: 44px; height: 26px; border-radius: 999px; background: #ffffff; display: inline-flex; align-items: center; justify-content: flex-end; padding: 0 3px; box-sizing: border-box; flex-shrink: 0;"><span style="width: 20px; height: 20px; border-radius: 999px; background: #000000;"></span></span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px; height: 56px; border-top: 1px solid #2a2a2a;">
+        <div style="flex-grow: 1; display: flex; flex-direction: column; min-width: 0;"><span style="font-size: 16px; line-height: 22px; font-weight: 500; color: #ffffff;">The Guardian</span><span style="font-family: 'Space Mono', monospace; font-size: 12px; line-height: 16px; text-transform: uppercase; color: #9c9c9c;">GB · <span style="display: inline-flex; align-items: center; gap: 6px; color: #7db4ff;"><span style="width: 6px; height: 6px; border-radius: 999px; background: #3d8bfd;"></span>Fehler: HTTP 503 seit 41 Min</span></span></div>
+        <span style="width: 44px; height: 26px; border-radius: 999px; background: #ffffff; display: inline-flex; align-items: center; justify-content: flex-end; padding: 0 3px; box-sizing: border-box; flex-shrink: 0;"><span style="width: 20px; height: 20px; border-radius: 999px; background: #000000;"></span></span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 12px; height: 56px; border-top: 1px solid #2a2a2a;">
+        <div style="flex-grow: 1; display: flex; flex-direction: column; min-width: 0;"><span style="font-size: 16px; line-height: 22px; font-weight: 500; color: #ffffff;">The Independent</span><span style="font-family: 'Space Mono', monospace; font-size: 12px; line-height: 16px; text-transform: uppercase; color: #9c9c9c;">GB · Aus</span></div>
+        <span style="width: 44px; height: 26px; border-radius: 999px; border: 1px solid #6b6b6b; display: inline-flex; align-items: center; justify-content: flex-start; padding: 0 2px; box-sizing: border-box; flex-shrink: 0;"><span style="width: 20px; height: 20px; border-radius: 999px; background: #ffffff;"></span></span>
+      </div>
+  </main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":390,"height":844}}'>
+class Component extends DCLogic {
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>

@@ -85,13 +85,21 @@ def enabled_sources() -> list[str]:
     return [s.id for s in state.catalog.all() if s.id in enabled]
 
 
+def implicit_sources() -> list[str]:
+    """„Alle Quellen“, wo keine Quelle ausdrücklich genannt ist (ALLE, Profile ohne Quellenliste,
+    Suche ohne Quelle, auch mit Länderfilter): die aktivierten ohne die mit in_all: false in
+    sources.yaml. Wird eine Quelle ausdrücklich genannt (?source=, Profil-Liste), zählt sie trotzdem."""
+    enabled = set(state.db.enabled_source_ids())
+    return [s.id for s in state.catalog.all() if s.id in enabled and s.in_all]
+
+
 def effective_sources(profile: dict[str, Any]) -> list[str]:
-    """Wirksame Quellen eines Profils: seine Liste (oder alle) geschnitten mit den aktivierten."""
-    active = enabled_sources()
+    """Wirksame Quellen eines Profils: seine Liste geschnitten mit den aktivierten; ohne Liste
+    implicit_sources()."""
     if profile["sources"] is None:
-        return active
+        return implicit_sources()
     wanted = set(profile["sources"])
-    return [s for s in active if s in wanted]
+    return [s for s in enabled_sources() if s in wanted]
 
 
 def _intersect(scope: list[str] | None, other: list[str]) -> list[str]:
@@ -105,11 +113,11 @@ def article_scope(user_id: int, sources: list[str], countries: set[str], profile
                   *, only_enabled: bool = True) -> tuple[list[str] | None, list[str]]:
     """Filterkontext: (Quellen oder None = alle, Profil-Begriffe). Leere Liste = nichts passt.
 
-    Ohne ausdrückliche Quelle und ohne Profil gelten nur die aktivierten Quellen (ALLE);
-    only_enabled=False (Gemerkt) lässt dann alle Quellen zu."""
+    Ohne ausdrückliche Quelle und ohne Profil gelten nur implicit_sources() (ALLE, auch mit
+    Länderfilter oder Suche); only_enabled=False (Gemerkt) lässt dann alle Quellen zu."""
     scope: list[str] | None = list(sources) if sources else None
     if scope is None and profile_id is None and only_enabled:
-        scope = enabled_sources()
+        scope = implicit_sources()
     if countries:
         scope = _intersect(scope, [s.id for s in state.catalog.all() if s.country in countries])
     terms: list[str] = []
@@ -364,7 +372,7 @@ def _bar(user_id: int) -> dict[str, Any]:
                                              "label": p["name"].upper(),
                                              "unread": profile_unread(user_id, p, effective_sources(p), budget)}
     ordered = [entries.pop(k) for k in ui_settings(user_id)["bar_order"] if k in entries]
-    total = state.db.article_counts(user_id, enabled_sources())["unread"]
+    total = state.db.article_counts(user_id, implicit_sources())["unread"]
     return {"items": [{"type": "all", "key": "all", "label": "ALLE", "unread": total},
                       *ordered, *entries.values()]}
 
@@ -434,8 +442,8 @@ async def counts(user: User):
     catalog_ids = [s.id for s in state.catalog.all()]
     enabled = [sid for sid in catalog_ids if sid in states and states[sid]["enabled"]]
     return {
-        # unread: aktivierte Quellen ohne Paywall; later/starred: alle gemerkten (wie Gemerkt)
-        **state.db.article_counts(user["id"], enabled),
+        # unread: wie ALLE (implicit_sources), ohne Paywall; later/starred: alle gemerkten (wie Gemerkt)
+        **state.db.article_counts(user["id"], implicit_sources()),
         "profiles": len(state.db.list_profiles(user["id"])),
         "favorites": sum(1 for f in state.db.list_favorites(user["id"]) if f["source_id"] in state.catalog),
         "sources_enabled": len(enabled),

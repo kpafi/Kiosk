@@ -38,7 +38,8 @@ class UserError(Exception):
 def seed_builtin_profiles(db: Database, catalog: Catalog, user_id: int) -> bool:
     """Die vier vorgegebenen Profile eines Benutzers anlegen, falls er noch keine hat."""
     enabled = set(db.enabled_source_ids())
-    de = [s.id for s in catalog.all() if s.country == "DE"]
+    # Deutschland meint „alle deutschen Quellen“: ohne in_all: false (wie ALLE, api_ui.implicit_sources).
+    de = [s.id for s in catalog.all() if s.country == "DE" and s.in_all]
     business = [s.id for s in catalog.all() if s.category == "business"]
     # Keine Wirtschaftsquelle aktiv: alle Quellen, die Begriffe filtern.
     return db.seed_profiles(user_id, de, business if enabled & set(business) else None)

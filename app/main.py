@@ -385,6 +385,7 @@ def _source_view(s, st, counts, favorites: set[str]) -> dict[str, Any]:
         "id": s.id, "name": s.name, "short": s.short, "is_favorite": s.id in favorites,
         "country": s.country, "lang": s.lang,
         "category": s.category, "homepage": s.homepage, "note": s.note, "tags": list(s.tags),
+        "in_all": s.in_all,   # false: nicht in ALLE und Profilen ohne Quellenliste
         "enabled": bool(st["enabled"]) if st else s.default_enabled,
         "last_ok_at": st["last_ok_at"] if st else None,
         "last_fetch_at": st["last_fetch_at"] if st else None,

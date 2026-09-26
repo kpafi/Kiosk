@@ -107,7 +107,9 @@ Alle Artikel-Flags (`read`, `starred`, `later`), Listen, Zähler, Profile, Liebl
 und Einstellungen gelten für den angemeldeten Benutzer; Profile anderer Benutzer liefern 404.
 
 Artikelfelder: `text_status` ist `full`, `partial` (Paywall oder sehr kurz), `empty`, `failed` oder `pending`.
-`paywalled` kommt aus der Schema.org-Markierung der Verlage (`isAccessibleForFree: false`).
+`paywalled` kommt aus der Schema.org-Markierung der Verlage (`isAccessibleForFree: false`), bei GEA+
+aus dem unscharf dargestellten Ersatzabsatz (`nfy-text-wrapper-blur` bzw. `aria-label="Unkenntlich
+gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“) fallen aus dem Text.
 
 ### Blättern
 
@@ -124,8 +126,16 @@ Artikelfelder: `text_status` ist `full`, `partial` (Paywall oder sehr kurz), `em
 
 ### Filter
 
+- „Alle Quellen“ heißt überall, wo keine Quelle ausdrücklich genannt ist (ALLE-Liste, „nächster
+  Artikel“, `read-all` ohne Quelle, Suche ohne Quelle, `country` ohne Quelle, Profile mit
+  `sources: null`, der ALLE-Zähler in `/api/bar` und `unread` in `/api/counts`): die aktivierten Quellen
+  ohne die mit `in_all: false` in `sources.yaml` (heise Security, deren Meldungen auch bei heise online
+  stehen). Ausdrücklich genannt zählen sie: `source=heisesec`, Profile mit Quellenliste, die
+  Zähler in `/api/sources` (Feld `in_all`), Lieblingszeitungen und ihre Chips in der Leiste. Gemerkt
+  (`starred`/`later`) zeigt wie bisher alles Gemerkte. Das vorgegebene Profil Deutschland lässt solche
+  Quellen beim Anlegen weg.
 - `profile=<id>`: Quellen des Profils (geschnitten mit den aktivierten Quellen; `sources: null` heißt
-  alle aktivierten) und, falls vorhanden, Suchbegriffe: jeder Begriff als Präfix-Phrase über den
+  alle aktivierten außer `in_all: false`) und, falls vorhanden, Suchbegriffe: jeder Begriff als Präfix-Phrase über den
   Volltextindex, ODER-verknüpft. Die Sortierung bleibt chronologisch (Keyset-Cursor wie ohne Profil).
   Mit `source`/`country` kombiniert gilt die Schnittmenge; mit `q` Offset-Blättern wie bei jeder Suche.
   Unbekanntes Profil: 404.
@@ -198,6 +208,22 @@ Artikelfelder: `text_status` ist `full`, `partial` (Paywall oder sehr kurz), `em
   gelten als unkomprimiert; br, zstd, compress und gestapelte Kodierungen gelten als endgültig `failed`. Ein Abrufversuch dauert höchstens 45 s inklusive
   Umleitungen (maximal 5); bei 403/406/429 oder leerer Antwort folgt ein zweiter Versuch mit anderem
   User-Agent, beide zusammen höchstens 60 s.
+- `feed` in `sources.yaml` darf statt RSS/Atom auch eine Google-News-Sitemap (`urlset`) oder ein
+  Sitemap-Index sein, erkannt am Wurzelelement im sitemaps.org-Namensraum (GEA). Aus einem Index wird
+  die Sitemap mit dem jüngsten `lastmod` genommen (bei gleichem oder fehlendem Datum die mit der
+  lexikographisch größten URL, bei GEA also das neueste Quartal), nur auf dem Host des Index
+  und auf Port 80/443, höchstens eine je Lauf und über denselben geprüften Abruf wie jeder Feed; ein
+  Index, der wieder auf einen Index zeigt, gilt als Fehler. Titel und Datum kommen aus `news:title`
+  und `news:publication_date` (sonst `lastmod`), das Bild aus `image:loc`, eine Zusammenfassung gibt
+  es nicht. Geparst wird mit expat im Worker-Prozess (höchstens 30 s wie feedparser); DOCTYPE und
+  Entity-Deklarationen werden abgelehnt. Für Sitemaps werden nie ETag/Last-Modified gespeichert (ein
+  304 auf den Index sagte nichts über die eigentliche Liste), jeder Abruf geht ohne Bedingung.
+- `include_paths` (optional, je Quelle in `sources.yaml`): Liste regulärer Ausdrücke; nur Einträge,
+  deren URL-Pfad auf einen davon passt (`re.search`), werden angelegt. Gilt für Feeds und Sitemaps,
+  vor der Grenze von 300 Einträgen und vor dem Zählen neuer Artikel (GEA: nur Lokalressorts). Hat
+  der Filter alles verworfen, gilt der Abruf als erfolgreich (0 neue), ebenso eine leere Sitemap.
+- `guid_pattern` (optional): regulärer Ausdruck mit genau einer Gruppe, auf die Eintrags-URL angewandt;
+  die Gruppe ist die GUID (GEA: `_arid,(\d+)`, die Artikelnummer), passt er nicht, bleibt die übliche.
 - Private, lokale und Metadaten-Adressen werden bei jedem Hop abgelehnt, zusätzlich wird nach dem
   Verbindungsaufbau die tatsächliche Gegenstelle geprüft (DNS-Rebinding). Rest-Risiko: Die Anfrage
   ist dann bereits gesendet, verworfen wird nur die Antwort. Erlaubt sind nur die Standard-Ports

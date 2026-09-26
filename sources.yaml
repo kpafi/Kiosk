@@ -1,5 +1,13 @@
 # Quellenkatalog für Kiosk.
-# Alle Feeds wurden am 25.09.2026 vom Hetzner-Server aus getestet (Feed + Volltext-Extraktion).
+# Alle Feeds wurden am 25.09.2026 vom Hetzner-Server aus getestet (Feed + Volltext-Extraktion),
+# heise Security und GEA am 26.09.2026.
+# feed: RSS/Atom oder eine Google-News-Sitemap (urlset) bzw. ein Sitemap-Index, am Inhalt erkannt (GEA).
+# include_paths: optionale Liste regulärer Ausdrücke; nur Einträge, deren URL-Pfad (ohne Query) auf
+# einen davon passt (Python re.search), werden angelegt, z. B. nur die Lokalressorts einer Regionalzeitung.
+# in_all: false holt die Quelle weiter und zeigt sie in ihrer eigenen Ansicht und in Profilen, die sie
+# ausdrücklich nennen, aber nicht in ALLE, in Profilen ohne Quellenliste und in der Suche ohne Quelle.
+# guid_pattern: optionaler regulärer Ausdruck mit genau einer Gruppe, auf die URL angewandt; die Gruppe
+# ist die GUID (z. B. die Artikelnummer, damit ein geänderter Titel im URL-Slug kein Duplikat erzeugt).
 # default_enabled: false bedeutet nur, dass die Quelle beim ersten Start aus ist; sie lässt sich in der App einschalten.
 # Bewusst nicht aufgenommen: Boulevard (Bild, Sun, Daily Mail ...), reine Bezahlmedien ohne Gratisartikel (WSJ, FT, Economist, Nikkei),
 # und Seiten, die Server-Zugriffe blocken (Politico, Axios, The Hill, France 24, RFI, Sky News, Washington Post, AP).
@@ -19,7 +27,17 @@ sources:
   - {id: fr,           name: Frankfurter Rundschau,   short: "FR",            country: DE, lang: de, feed: "https://www.fr.de/rssfeed.rdf",                         homepage: "https://www.fr.de",            default_enabled: false}
   - {id: handelsblatt, name: Handelsblatt,            short: "HANDELSBLATT",    country: DE, lang: de, feed: "https://www.handelsblatt.com/contentexport/feed/schlagzeilen", homepage: "https://www.handelsblatt.com", category: business, default_enabled: false}
   - {id: heise,        name: heise online,            short: "HEISE",         country: DE, lang: de, feed: "https://www.heise.de/rss/heise-atom.xml",               homepage: "https://www.heise.de",         category: tech}
+  - {id: heisesec,     name: heise Security,          short: "HEISE SEC",     country: DE, lang: de, feed: "https://www.heise.de/security/rss/news-atom.xml",       homepage: "https://www.heise.de/security/", category: tech,
+     in_all: false, note: "Nicht in ALLE (Meldungen stehen auch bei heise online); eigene Ansicht oder Profil"}
   - {id: golem,        name: Golem.de,                short: "GOLEM",         country: DE, lang: de, feed: "https://rss.golem.de/rss.php?feed=RSS2.0",              homepage: "https://www.golem.de",         category: tech, default_enabled: false}
+  # GEA: Der RSS-Feed ist tot (Einträge von 2018), deshalb die News-Sitemap (Index, dessen Kind jedes
+  # Quartal den Namen wechselt). Nur Regionales: Reutlingen, Neckar-Alb, Blaulicht (Polizeimeldungen
+  # aus der Region), alle Ressorts auf „-in-der-region“ und der Sport außer „ueberregionaler-sport“
+  # (Vereinsressorts wie sport/vfl-pfullingen, sport/tigers-tuebingen); nicht land (Baden-Württemberg),
+  # welt* (Agenturmeldungen), Leserbriefe, weitere-nachrichten.
+  - {id: gea,          name: Reutlinger General-Anzeiger, short: "GEA",       country: DE, lang: de, feed: "https://www.gea.de/sitemap-index/4-gea_de_-_news-sitemap.xml", homepage: "https://www.gea.de", note: "GEA+ Artikel werden als Paywall markiert; Feed ist die News-Sitemap",
+     include_paths: ["^/reutlingen[^,]*_artikel,", "^/neckar-alb/[^,]*_artikel,", "^/blaulicht[^,]*_artikel,", "^/[^,]*-in-der-region_artikel,", "^/sport/(?!ueberregionaler)[^,]*_artikel,"],
+     guid_pattern: '_arid,(\d+)'}
   - {id: thelocalde,   name: The Local Germany,       short: "LOCAL DE",      country: DE, lang: en, feed: "https://feeds.thelocal.com/rss/de",                     homepage: "https://www.thelocal.de",      default_enabled: false, note: "Deutschland auf Englisch"}
 
   # ---------------- Österreich / Schweiz ----------------

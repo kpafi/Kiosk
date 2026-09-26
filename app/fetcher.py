@@ -27,6 +27,7 @@ from .config import Settings
 from .db import Database, QueryTimeout, request_time_limit, utcnow
 from .extract import drop_title_echo, extract, is_placeholder, is_small_image_url, safe_http_url, strip_html
 from .netguard import BlockedURL, ResolveError, check_url, server_addr_blocked, set_deny_networks
+from .sitemap import ParsedRows, parse_sitemap, pick_child, sitemap_kind, url_host
 from .sources import Catalog, Source
 
 log = logging.getLogger("kiosk.fetcher")
@@ -45,7 +46,8 @@ ARTICLE_MAX_BYTES = 5 * 1024 * 1024
 # und je Quelle und Lauf kommen höchstens FEED_MAX_NEW neue Artikel dazu (der Rest beim nächsten Lauf).
 FEED_MAX_ENTRIES = 300
 FEED_MAX_NEW = 150
-FEED_PARSE_TIMEOUT = 30     # Sekunden für feedparser im Worker-Prozess
+FEED_PARSE_TIMEOUT = 30     # Sekunden für feedparser bzw. das Sitemap-Parsing im Worker-Prozess
+FEED_ACCEPT = "application/rss+xml, application/atom+xml, application/xml;q=0.9, */*;q=0.8"
 TOTAL_TIMEOUT = 45          # Sekunden pro Abruf inkl. Umleitungen, unabhängig von httpx-Timeouts
 OVERALL_TIMEOUT = 60        # Sekunden für _get insgesamt, inkl. zweitem Versuch mit anderem User-Agent
 PRIORITY_CONCURRENCY = 2    # gleichzeitige Extraktionen auf Anforderung (API)
@@ -251,7 +253,7 @@ def _entry_author(entry: Any) -> str | None:
     return None if is_placeholder(author) else author
 
 
-def parse_feed(source: Source, raw: bytes) -> list[dict[str, Any]]:
+def parse_feed(source: Source, raw: bytes) -> ParsedRows:
     """Einträge eines Feeds als Zeilen für upsert_articles, höchstens die ersten FEED_MAX_ENTRIES.
     Läuft im Worker-Prozess (Fetcher._fetch_feed): feedparser braucht für einen feindlichen Feed
     viel Speicher und Zeit."""
@@ -259,12 +261,17 @@ def parse_feed(source: Source, raw: bytes) -> list[dict[str, Any]]:
     # Dateipfad oder URL zu öffnen (ein Body "/proc/self/environ" würde gelesen).
     parsed = feedparser.parse(io.BytesIO(raw))
     now = utcnow()
-    rows: list[dict[str, Any]] = []
+    rows = ParsedRows()
+    rows.total = len(parsed.entries)
+    # Nur gewünschte Bereiche (include_paths der Quelle), vor der Obergrenze: Sonst verdrängten
+    # ungewollte Einträge die gewollten.
+    entries = [e for e in parsed.entries if source.wants_url((e.get("link") or "").strip())]
+    rows.filtered_out = len(parsed.entries) - len(entries)
     # Neueste zuerst, bevor gekürzt wird: Manche Feeds führen die ältesten Einträge oben. Einträge
     # ohne Datum kommen ans Ende, sonst bleibt die Reihenfolge des Feeds (sort ist stabil).
-    stamps = [_entry_timestamp(e) for e in parsed.entries]
+    stamps = [_entry_timestamp(e) for e in entries]
     order = sorted(range(len(stamps)), key=lambda i: math.inf if stamps[i] is None else -stamps[i])
-    entries = [parsed.entries[i] for i in order]
+    entries = [entries[i] for i in order]
     # Einträge mit Datum in der Zukunft würden sonst dauerhaft oben kleben.
     for e in entries[:FEED_MAX_ENTRIES]:
         link = (e.get("link") or "").strip()
@@ -273,7 +280,7 @@ def parse_feed(source: Source, raw: bytes) -> list[dict[str, Any]]:
         title = strip_html(e.get("title") or "", limit=300) or "(ohne Titel)"
         rows.append({
             "source_id": source.id,
-            "guid": (e.get("id") or link).strip()[:500],
+            "guid": source.guid_for(link, (e.get("id") or link).strip())[:500],
             "url": link[:1000],
             "title": title,
             "summary": _entry_summary(e, title),
@@ -323,6 +330,8 @@ class Fetcher:
         # ist nicht bekannt (z. B. ein Feed, der den Speicher sprengte): Beim ersten Mal wird ohne
         # Zählung neu eingeplant, erst ein zweiter Absturz mit demselben Artikel zählt als Versuch.
         self._crash_suspects: set[int] = set()
+        # Zuletzt gewählte Sitemap je Quelle mit Sitemap-Index (nur fürs Protokoll bei einem Wechsel).
+        self._sitemap_child: dict[str, str] = {}
         # Zusätzlich gesperrte Ziele (KIOSK_FETCH_DENY_IPS) gelten für alle Abrufe dieses Prozesses.
         set_deny_networks(settings.fetch_deny_ips)
 
@@ -366,7 +375,8 @@ class Fetcher:
         diesem Zeitpunkt schon Threads (asyncio.to_thread, httpx), und fork() in einem Prozess
         mit Threads kann im Kind gehaltene Locks (Logging, malloc) einfrieren. Der Forkserver
         wird einmal sauber per exec gestartet, die Worker forken von ihm. Die Worker führen nur
-        die Modulfunktionen extract() und parse_feed() mit bytes, str und Source aus und fassen
+        die Modulfunktionen extract(), parse_feed() und für Sitemaps pick_child() und
+        parse_sitemap() mit bytes, str, Source und Hostnamen aus und fassen
         weder Datenbank noch Event-Loop an. Sie starten beim ersten Auftrag, laufen im selben
         Container (pids_limit, mem_limit) und brauchen /dev/shm für die Semaphoren von multiprocessing.
         max_tasks_per_child ersetzt jeden Worker nach EXTRACT_TASKS_PER_CHILD Aufträgen durch
@@ -562,7 +572,7 @@ class Fetcher:
 
     async def _fetch_feed(self, src: Source) -> int:
         state = self.db.source_states().get(src.id)
-        headers: dict[str, str] = {"Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, */*;q=0.8"}
+        headers: dict[str, str] = {"Accept": FEED_ACCEPT}
         if state is not None:
             # Gespeicherte Validatoren nur senden, wenn sie reines ASCII sind (ältere Datenbanken
             # können andere enthalten; httpx würde an ihnen bei jedem Abruf scheitern).
@@ -577,11 +587,61 @@ class Fetcher:
         if r.status_code != 200:
             self.db.record_fetch(src.id, ok=False, error=f"HTTP {r.status_code}")
             return 0
+        # Liest nur den Anfang bis zum Wurzelelement (höchstens sitemap.SNIFF_BYTES, ohne DOCTYPE).
+        kind = sitemap_kind(r.content)
+        if kind is not None:
+            return await self._fetch_sitemap(src, r, kind)
         # Im Worker-Prozess mit Zeitlimit: Ein feindlicher Feed kostet dort Speicher und Zeit, nicht
         # in der App (deren Speicher bliebe fragmentiert). Fehler landen in _fetch_all_feeds.
         rows = await self._run_in_pool(parse_feed, src, r.content, timeout=FEED_PARSE_TIMEOUT,
                                        what="Feed-Parsing")
-        if not rows:
+        # Hat nur include_paths alles verworfen, ist der Feed in Ordnung, nur ohne Gewolltes.
+        return self._store_rows(src, rows, (http_token(r.headers.get("etag")),
+                                            http_token(r.headers.get("last-modified"))),
+                                empty_ok=getattr(rows, "filtered_out", 0) > 0)
+
+    async def _fetch_sitemap(self, src: Source, r: Fetched, kind: str) -> int:
+        """Google-News-Sitemap statt Feed (am Inhalt erkannt, siehe app/sitemap.py).
+
+        Ein Sitemap-Index verweist auf die eigentliche URL-Liste (bei GEA wechselt deren Name jedes
+        Quartal): Genommen wird die mit dem jüngsten lastmod, nur auf dem Host des Index (wie
+        konfiguriert oder nach Umleitung; das Sitemap-Protokoll erlaubt nur Sitemaps derselben
+        Website), abgerufen über denselben geprüften Weg wie jeder Feed (_get: netguard je Hop,
+        Größen- und Zeitlimits), höchstens eine je Lauf; ein Index, der wieder auf einen Index
+        zeigt, gilt als Fehler. Validatoren (ETag, Last-Modified) speichern Sitemaps nie, also
+        schickt der nächste Abruf keine Bedingung: Ein 304 auf den Index sagte nichts darüber, ob
+        sich die URL-Liste geändert hat.
+        """
+        if kind == "sitemapindex":
+            hosts = frozenset(h for h in (url_host(src.feed), url_host(r.url)) if h)
+            child = await self._run_in_pool(pick_child, r.content, hosts, timeout=FEED_PARSE_TIMEOUT,
+                                            what="Sitemap-Parsing")
+            if child is None:
+                self.db.record_fetch(src.id, ok=False, error="Sitemap-Index nennt keine zulässige Sitemap")
+                return 0
+            if self._sitemap_child.get(src.id) != child:   # z. B. am Quartalswechsel
+                log.info("Sitemap %s: %s", src.id, child)
+                self._sitemap_child[src.id] = child
+            r = await self._get(child, headers={"Accept": FEED_ACCEPT}, max_bytes=FEED_MAX_BYTES)
+            if r.status_code != 200:
+                self.db.record_fetch(src.id, ok=False, error=f"Sitemap: HTTP {r.status_code}")
+                return 0
+            if sitemap_kind(r.content) != "urlset":
+                self.db.record_fetch(src.id, ok=False, error="Sitemap-Index verweist nicht auf eine URL-Liste")
+                return 0
+        rows = await self._run_in_pool(parse_sitemap, src, r.content, FEED_MAX_ENTRIES,
+                                       timeout=FEED_PARSE_TIMEOUT, what="Sitemap-Parsing")
+        # Leer ist nur dann kein Fehler, wenn die URL-Liste gar keine Einträge hat (neue Quartals-
+        # Sitemap kurz nach dem Wechsel) oder include_paths welche verworfen hat. Blieb aus anderen
+        # Gründen nichts übrig (z. B. lauter unbrauchbare URLs), ist es ein Fehler wie beim Feed.
+        return self._store_rows(src, rows, (None, None),
+                                empty_ok=getattr(rows, "total", 1) == 0 or getattr(rows, "filtered_out", 0) > 0)
+
+    def _store_rows(self, src: Source, rows: list[dict[str, Any]],
+                    validators: tuple[str | None, str | None], *, empty_ok: bool = False) -> int:
+        """Legt die Einträge eines Abrufs an und speichert das Ergebnis samt Validatoren. Ohne
+        Einträge ein Fehler, außer mit `empty_ok` (dann ein Abruf ohne neue Artikel)."""
+        if not rows and not empty_ok:
             self.db.record_fetch(src.id, ok=False, error="Feed enthält keine Einträge")
             return 0
         # Uralte Einträge (manche Feeds führen Evergreen-Artikel) gar nicht erst anlegen,
@@ -591,8 +651,8 @@ class Fetcher:
         new = self.db.upsert_articles(rows, max_new=FEED_MAX_NEW)
         # Grenze erreicht: Validatoren nicht speichern, sonst hielte ein 304 die übrigen Einträge
         # zurück; der nächste Abruf geht ohne Bedingung und holt sie.
-        validators = (None, None) if new >= FEED_MAX_NEW else (
-            http_token(r.headers.get("etag")), http_token(r.headers.get("last-modified")))
+        if new >= FEED_MAX_NEW:
+            validators = (None, None)
         self.db.record_fetch(src.id, ok=True, new_count=new, validators=validators)
         return new
 

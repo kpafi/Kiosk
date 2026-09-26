@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import time
+
 import pytest
 
+import app.extract as extract_mod
 from app.extract import extract, html_to_text, is_paywalled, safe_http_url, sanitize, strip_html
 
 BASE = "https://news.example/artikel/1"
@@ -109,6 +112,90 @@ def test_paywall_regex(page, expected):
 
 def test_paywall_regex_only_scans_prefix():
     assert not is_paywalled("x" * 200_001 + '"isAccessibleForFree":false')
+
+
+GEA_BLUR = ('<p class=nfy-text-wrapper-blur aria-label="Unkenntlich gemachter Text" role=paragraph>'
+            'Lorem ipsum dolor sit amet, consetetur sadipscing elitr, sed diam nonumy eirmod tempor invidunt ut '
+            'labore et dolore magna aliquyam erat, sed diam voluptua.</p>')
+
+
+@pytest.mark.parametrize("page,expected", [
+    (GEA_BLUR, True),
+    ('<p class="nfy-text nfy-text-wrapper-blur">x</p>', True),
+    ("<p class='nfy-text-wrapper-blur'>x</p>", True),
+    ('<p aria-label="Unkenntlich gemachter Text">x</p>', True),
+    ("<p ARIA-LABEL = 'unkenntlich gemachter text'>x</p>", True),
+    ("<style>.nfy-text-wrapper-blur{filter:blur(4px)}</style>", False),   # nur CSS, kein Absatz
+    ("<p>Der Unkenntlich gemachter Text war lesbar.</p>", False),
+    ('<p class="nfy-text-wrapper">x</p>', False),
+])
+def test_paywall_regex_gea(page, expected):
+    assert is_paywalled(page) is expected
+
+
+def test_paywall_regex_stays_fast_on_hostile_input():
+    for page in ("class=" * 33_000, "class=" + "x" * 199_000, 'class="' + "a " * 99_000,
+                 "aria-label=" * 18_000, "isaccessibleforfree:" + " " * 199_000):
+        t0 = time.monotonic()
+        assert not is_paywalled(page)
+        assert time.monotonic() - t0 < 1
+
+
+def test_gea_marker_lies_within_scan_window():
+    """Echte GEA-Seiten sind rund 50 KB groß, der unscharfe Absatz steht nach etwa 48 000 Zeichen."""
+    page = "<html>" + "x" * 48_000 + GEA_BLUR + "y" * 2_000 + "</html>"
+    assert page.index("nfy-text-wrapper-blur") < extract_mod.PAYWALL_SCAN_CHARS
+    assert is_paywalled(page)
+
+
+GEA_ARTICLE = """<!doctype html><html><head><meta charset="utf-8"><title>Poetic Pop im franz.K</title></head>
+<body><article class="nfy-ar-detail"><h1>Poetic Pop im franz.K</h1>
+<div class="nfy-ar-detail-inner-wrapper nfy-ar-detail-inner-wrapper-payment">
+<p class=nfy-teaser>Independent, Retro-Folk und wilder Rock: Beim ersten Poetic Pop Festival im franz.K begegneten
+sich Stile und Zeiten. Drei Bands spielten an einem Abend in Reutlingen vor vollem Haus.</p>
+""" + GEA_BLUR + """<div class=paywall-delimiter></div></div></article></body></html>"""
+
+
+def test_gea_paywall_article_is_marked_and_has_no_lorem_ipsum():
+    result = extract(GEA_ARTICLE.encode(), BASE)
+    assert result.paywalled is True and result.status == "partial"
+    assert "Poetic Pop Festival" in (result.body_text or "")
+    assert "lorem" not in (result.body_html or "").lower() and "lorem" not in (result.body_text or "").lower()
+
+
+def test_blurred_placeholder_elements_are_dropped_whole():
+    """Mehrere Absätze Platzhalter ohne „Lorem ipsum“ am Anfang: das ganze Element fällt weg."""
+    page = GEA_ARTICLE.replace(GEA_BLUR, '<div class="x nfy-text-wrapper-blur" role=paragraph>'
+                               "<p>Consetetur sadipscing elitr, sed diam nonumy eirmod tempor.</p>"
+                               "<p>At vero eos et accusam et justo duo dolores et ea rebum.</p></div>"
+                               "<p>Schluss nach dem Platzhalter bleibt stehen.</p>")
+    result = extract(page.encode(), BASE)
+    assert result.paywalled is True
+    assert "Poetic Pop Festival" in result.body_text and "Schluss nach dem Platzhalter" in result.body_text
+    assert "sadipscing" not in result.body_text and "accusam" not in result.body_text
+
+
+def test_placeholder_class_on_root_element_does_not_break_extraction():
+    page = GEA_ARTICLE.replace("<html>", '<html class="nfy-text-wrapper-blur">')
+    assert '<html class="nfy-text-wrapper-blur">' in page
+    result = extract(page.encode(), BASE)
+    assert result.paywalled is True and "Poetic Pop Festival" in (result.body_text or "")
+    nested = GEA_ARTICLE.replace(GEA_BLUR, '<div class="nfy-text-wrapper-blur"><p class="nfy-text-wrapper-blur">'
+                                 "Innen</p><p>Auch weg</p></div><p>Danach bleibt.</p>")
+    result = extract(nested.encode(), BASE)
+    assert "Innen" not in result.body_text and "Auch weg" not in result.body_text
+    assert "Danach bleibt." in result.body_text
+
+
+def test_lorem_ipsum_paragraphs_are_dropped():
+    html, text = sanitize(
+        "<p>Echter Text.</p><p>Lorem ipsum dolor sit amet, consetetur sadipscing elitr.</p>"
+        "<p> <em>lorem IPSUM dolor sit amet</em> at vero eos</p>"
+        "<p>Der Blindtext beginnt mit Lorem ipsum dolor sit amet und ist uralt.</p>"
+        "<p>Lorem ipsum ist ein Blindtext.</p>", BASE)
+    assert html == ("<p>Echter Text.</p><p>Der Blindtext beginnt mit Lorem ipsum dolor sit amet und ist uralt.</p>"
+                    "<p>Lorem ipsum ist ein Blindtext.</p>")
+    assert "consetetur" not in text and "vero" not in text
 
 
 def test_strip_html():

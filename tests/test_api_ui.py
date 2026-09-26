@@ -628,3 +628,87 @@ def test_profile_counts_share_one_time_budget(authed, monkeypatch):
     # Nicht Gezähltes wird nicht als „zu teuer“ gemerkt: Die nächste Anfrage zählt weiter.
     second = [p["unread"] for p in authed.get("/api/profiles").json()]
     assert second == [5, 5, None, None]
+
+
+# ---- in_all: false (Quelle nur ausdrücklich, nicht in ALLE) ------------------------
+
+@pytest.fixture
+def sec_client(app_env):
+    """Katalog mit zusätzlicher Quelle sec (DE, in_all: false) und je einem Artikel von alpha, beta, sec."""
+    from conftest import SOURCES_YAML
+    (app_env / "sources.yaml").write_text(
+        SOURCES_YAML + '  - {id: sec, name: Sec, country: DE, lang: de, feed: "https://sec.example/feed", '
+        'homepage: "https://sec.example", in_all: false}\n', encoding="utf-8")
+    with TestClient(app, base_url=ORIGIN) as c:
+        assert c.post("/api/login", json={"username": "admin", "password": "geheim-und-lang"}).status_code == 204
+        state.db.upsert_articles([make_row("alpha", 1, ago(hours=1), title="Patchday alpha"),
+                                  make_row("sec", 1, ago(hours=2), title="Patchday sec"),
+                                  make_row("beta", 1, ago(hours=3), title="Wetter beta")])
+        yield c
+
+
+def _sources_of(body) -> list[str]:
+    return [it["source_id"] for it in body["items"]]
+
+
+def test_in_all_false_source_is_not_in_all_list_counts_next_or_read_all(sec_client):
+    c = sec_client
+    ids = {r["guid"]: r["id"] for r in state.db.q("SELECT id, guid FROM articles")}
+    assert _sources_of(c.get("/api/articles").json()) == ["alpha", "beta"]
+    assert c.get("/api/counts").json()["unread"] == 2
+    assert c.get("/api/counts").json()["sources_enabled"] == 3          # geholt wird sec trotzdem
+    assert c.get("/api/bar").json()["items"][0]["unread"] == 2
+    assert c.get(f"/api/articles/{ids['alpha-1']}/next").json()["item"]["id"] == ids["beta-1"]
+    assert c.post("/api/articles/read-all", json={}).json()["marked"] == 2
+    assert _unread("a.source_id") == ["sec"]
+
+
+def test_in_all_false_source_is_visible_when_named(sec_client):
+    c = sec_client
+    assert _sources_of(c.get("/api/articles", params={"source": "sec"}).json()) == ["sec"]
+    assert _sources_of(c.get("/api/articles", params={"source": "sec,alpha"}).json()) == ["alpha", "sec"]
+    sec = next(s for s in c.get("/api/sources").json() if s["id"] == "sec")
+    assert sec["in_all"] is False and sec["unread"] == 1 and sec["enabled"] is True
+    assert next(s for s in c.get("/api/sources").json() if s["id"] == "alpha")["in_all"] is True
+    # Lieblingszeitung mit Chip in der Leiste: eigener Zähler
+    assert c.put("/api/favorites/sources/sec", json={"in_bar": True}).status_code == 200
+    chip = next(it for it in c.get("/api/bar").json()["items"] if it["key"] == "source:sec")
+    assert chip["unread"] == 1
+    assert c.post("/api/articles/read-all", json={"source": "sec"}).json()["marked"] == 1
+    assert _unread("a.source_id") == ["alpha", "beta"]
+
+
+def test_in_all_false_source_in_profiles(sec_client):
+    c = sec_client
+    de, world = _profile(c, "de"), _profile(c, "world")
+    assert de["sources"] == ["alpha"]                     # Deutschland lässt sec beim Anlegen weg
+    assert world["sources"] is None and world["source_count"] == 2
+    assert _sources_of(c.get("/api/articles", params={"profile": world["id"]}).json()) == ["alpha", "beta"]
+    assert world["unread"] == 2
+    own = c.post("/api/profiles", json={"name": "Sicherheit", "sources": ["sec", "alpha"]}).json()
+    assert own["source_count"] == 2 and own["unread"] == 2
+    assert _sources_of(c.get("/api/articles", params={"profile": own["id"]}).json()) == ["alpha", "sec"]
+    assert c.post("/api/articles/read-all", json={"profile": world["id"]}).json()["marked"] == 2
+    assert c.post("/api/articles/read-all", json={"profile": own["id"]}).json()["marked"] == 1
+
+
+def test_in_all_false_source_in_search_and_country_filter(sec_client):
+    c = sec_client
+    assert _sources_of(c.get("/api/articles", params={"q": "Patchday"}).json()) == ["alpha"]
+    assert _sources_of(c.get("/api/articles", params={"q": "Patchday", "source": "sec"}).json()) == ["sec"]
+    # Länderfilter ohne Quelle wie ALLE; mit ausdrücklicher Quelle oder Profil-Liste sichtbar.
+    assert _sources_of(c.get("/api/articles", params={"country": "DE"}).json()) == ["alpha"]
+    assert _sources_of(c.get("/api/articles", params={"country": "DE", "source": "sec"}).json()) == ["sec"]
+    own = c.post("/api/profiles", json={"name": "Sicherheit", "sources": ["sec"]}).json()
+    assert _sources_of(c.get("/api/articles", params={"country": "DE", "profile": own["id"]}).json()) == ["sec"]
+
+
+def test_in_all_false_source_stays_in_saved_lists(sec_client):
+    c = sec_client
+    sec_id = state.db.q("SELECT id FROM articles WHERE source_id='sec'")[0][0]
+    state.db.set_flag(UID, sec_id, "starred", True)
+    state.db.set_flag(UID, sec_id, "later", True)
+    assert _ids(c.get("/api/articles", params={"starred": "true"}).json()) == [sec_id]
+    assert _ids(c.get("/api/articles", params={"later": "true"}).json()) == [sec_id]
+    counts = c.get("/api/counts").json()
+    assert counts["starred"] == 1 and counts["later"] == 1

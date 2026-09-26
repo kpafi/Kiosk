@@ -1,6 +1,7 @@
 """Volltext-Extraktion aus Artikelseiten und Bereinigung des HTML."""
 from __future__ import annotations
 
+import copy
 import html
 import re
 from collections import Counter
@@ -9,10 +10,20 @@ from html.parser import HTMLParser
 from urllib.parse import unquote, urljoin, urlparse
 
 import trafilatura
+from trafilatura.utils import load_html
 
 # Schema.org-Markierung, die viele Verlage (Spiegel, NYT, Zeit ...) für Bezahlartikel setzen,
-# als JSON-LD ("isAccessibleForFree": false) oder als Attribut/Microdata.
-PAYWALL_RE = re.compile(r"""isaccessibleforfree["']?\s*[:=]\s*["']?false""", re.I)
+# als JSON-LD ("isAccessibleForFree": false) oder als Attribut/Microdata. Dazu Markierungen einzelner
+# Verlage ohne Schema.org-Angabe: GEA+ (Reutlinger General-Anzeiger) ersetzt den Bezahltext durch
+# einen unscharf dargestellten Absatz <p class=nfy-text-wrapper-blur aria-label="Unkenntlich gemachter
+# Text">Lorem ipsum …</p>, am Ende des Artikels (bei rund 50 KB großen Seiten nach etwa 48 000 Zeichen,
+# also weit innerhalb von PAYWALL_SCAN_CHARS).
+PAYWALL_RE = re.compile(
+    r"""isaccessibleforfree["']?\s*[:=]\s*["']?false"""
+    # Nur als Klasse, nicht z. B. in CSS. Der Abstand ist begrenzt: Ohne Grenze wäre die Suche bei
+    # vielen "class=" ohne Anführungszeichen quadratisch.
+    r"""|class\s*=\s*["']?[^"'>]{0,200}?\bnfy-text-wrapper-blur\b"""
+    r"""|aria-label\s*=\s*["']?Unkenntlich gemachter Text""", re.I)
 PAYWALL_SCAN_CHARS = 200_000
 MIN_FULL_CHARS = 600
 # Obergrenzen für den gespeicherten Text: So viele Zeichen bereinigtes HTML (danach endet der
@@ -387,12 +398,14 @@ def _drop_duplicate_images(body: str) -> str:
 # Absätze ohne Artikelinhalt, die trafilatura bei manchen Verlagen mitnimmt (z. B. Al Jazeera):
 # kurze Datumszeile „Published On 12 Sep 2026“ und ein Absatz, der nur aus dem Link „NewsFeed“ besteht;
 # außerdem Absätze, die nur aus einem Bedienelement- oder Werbe-Etikett bestehen (NPR „hide caption“),
-# und Absätze ohne Text und ohne Bild (<p><strong></strong></p>).
+# Absätze ohne Text und ohne Bild (<p><strong></strong></p>) und Blindtext („Lorem ipsum dolor sit
+# amet …“), den Verlage wie GEA an Stelle des Bezahltextes (unscharf) anzeigen.
 _PARA_RE = re.compile(r"<p>(.*?)</p>\s*", re.S)
 _PUBLISHED_RE = re.compile(r"^\s*Published On\s+\d{1,2}\s+\w+\s+\d{4}")
 _PUBLISHED_MAX_LEN = 60     # längere Absätze mit „Published On …“ sind Artikeltext
 _NEWSFEED_RE = re.compile(r"^\s*<a\b[^>]*>\s*NewsFeed\s*</a>\s*$")
 _JUNK_LABELS = {"hide caption", "toggle caption", "advertisement", "werbung", "anzeige"}
+_LOREM_RE = re.compile(r"^\s*Lorem ipsum dolor sit amet\b", re.I)
 
 
 def _drop_junk_paragraphs(body: str) -> str:
@@ -401,7 +414,7 @@ def _drop_junk_paragraphs(body: str) -> str:
         if _NEWSFEED_RE.match(inner):
             return ""
         text = html_to_text(inner)
-        if text.casefold() in _JUNK_LABELS or (not text and "<img" not in inner):
+        if text.casefold() in _JUNK_LABELS or (not text and "<img" not in inner) or _LOREM_RE.match(text):
             return ""
         if len(text) < _PUBLISHED_MAX_LEN and _PUBLISHED_RE.match(text):
             return ""
@@ -441,12 +454,39 @@ def html_to_text(fragment: str | None) -> str:
     return _normalize_ws("".join(s.text))
 
 
+# Klasse der unscharf dargestellten Platzhalter-Elemente (GEA+), die an Stelle des Bezahltextes
+# stehen; sie fallen vor der Extraktion samt Inhalt weg (die Lorem-Regel in _drop_junk_paragraphs
+# greift nur für Absätze, die mit dem Blindtext beginnen).
+PLACEHOLDER_CLASS = "nfy-text-wrapper-blur"
+_PLACEHOLDER_XPATH = f"//*[contains(concat(' ', normalize-space(@class), ' '), ' {PLACEHOLDER_CLASS} ')]"
+
+
+def _without_placeholders(page: bytes):
+    """Die Seite als lxml-Baum ohne Platzhalter-Elemente, wenn sie welche enthält; sonst die Bytes
+    unverändert (trafilatura parst dann wie bisher selbst)."""
+    if PLACEHOLDER_CLASS.encode() not in page:
+        return page
+    try:
+        tree = load_html(page)
+        # Ohne Elternelement (die Wurzel selbst, <html class=…>) lässt sich nichts entfernen.
+        found = [el for el in tree.xpath(_PLACEHOLDER_XPATH) if el.getparent() is not None] if tree is not None else []
+        if not found:
+            return page
+        for el in found:
+            el.drop_tree()   # behält den Text nach dem Element (tail)
+    except Exception:  # noqa: BLE001
+        return page
+    return tree
+
+
 def extract(page: bytes, url: str) -> Extraction:
     """Extrahiert den Artikel aus den rohen Bytes; trafilatura erkennt die Kodierung selbst."""
     paywalled = is_paywalled(page[:PAYWALL_SCAN_CHARS].decode("utf-8", errors="ignore"))
+    doc = _without_placeholders(page)
 
     body = trafilatura.extract(
-        page,
+        # Eine Kopie des Baums: trafilatura soll den für die Metadaten nicht verändern.
+        copy.deepcopy(doc) if not isinstance(doc, bytes) else doc,
         url=url,
         output_format="html",
         include_images=True,
@@ -458,7 +498,7 @@ def extract(page: bytes, url: str) -> Extraction:
     )
     image_url = author = None
     try:
-        meta = trafilatura.extract_metadata(page, default_url=url)
+        meta = trafilatura.extract_metadata(doc, default_url=url)
         if meta:
             image_url = safe_http_url(meta.image)
             author = None if is_placeholder(meta.author) else meta.author[:200]

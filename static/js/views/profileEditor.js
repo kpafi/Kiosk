@@ -171,25 +171,28 @@ export function profileEditorView(route) {
       h('div', { class: 'inline-row' },
         h('span', { class: 't-ui', text: 'Alle aktiven Zeitungen' }),
         toggle(all, 'Alle aktiven Zeitungen', (v) => {
-          draft.sources = v ? null : enabled.filter((s) => s.enabled).map((s) => s.id);
+          // Wie „alle“: ohne Quellen mit in_all: false (z. B. heise Security); einzeln wählbar.
+          draft.sources = v ? null : enabled.filter((s) => s.enabled && s.in_all !== false).map((s) => s.id);
           build();
         })),
     ];
     if (all) {
-      out.push(h('p', { class: 't-caption muted', text: 'Auch Zeitungen, die du später einschaltest.' }));
+      out.push(h('p', { class: 't-caption muted', text: 'Auch Zeitungen, die du später einschaltest. Ohne Quellen, die nicht in ALLE stehen (heise Security).' }));
       return out;
     }
     const chosen = new Set(draft.sources);
     for (const [cc, list] of groupByCountry(enabled)) {
       const active = list.filter((s) => s.enabled);
-      const allOn = () => active.length > 0 && active.every((s) => chosen.has(s.id));
+      // „Alle wählen“ nimmt Quellen mit in_all: false nicht mit; sie lassen sich einzeln einschalten.
+      const bulk = active.filter((s) => s.in_all !== false);
+      const allOn = () => bulk.length > 0 && bulk.every((s) => chosen.has(s.id));
       // Beschriftung folgt dem Zustand, auch nach einzelnen Schaltern.
-      const countryBtn = active.length ? h('button', {
+      const countryBtn = bulk.length ? h('button', {
         type: 'button', class: 'btn-sm', text: allOn() ? 'Keine' : 'Alle wählen',
         on: {
           click: () => {
             const on = allOn();
-            for (const s of active) { if (on) chosen.delete(s.id); else chosen.add(s.id); }
+            for (const s of bulk) { if (on) chosen.delete(s.id); else chosen.add(s.id); }
             draft.sources = [...chosen];
             build();
           },

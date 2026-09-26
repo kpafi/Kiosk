@@ -10,7 +10,8 @@ import {
 
 /** Untertitel eines Profils: „15 Zeitungen · 3 Begriffe“, „Alle 92 Zeitungen“, „Eigenes · 6 Zeitungen“. */
 export function profileSub(p) {
-  const total = state.sources ? state.sources.filter((s) => s.enabled).length : null;
+  // Quellen mit in_all: false (z. B. heise Security) gehören nicht zu „alle Zeitungen“.
+  const total = state.sources ? state.sources.filter((s) => s.enabled && s.in_all !== false).length : null;
   const terms = (p.terms || []).length;
   const termText = terms ? `${terms} ${terms === 1 ? 'Begriff' : 'Begriffe'}` : null;
   let src;

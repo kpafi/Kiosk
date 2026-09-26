@@ -3,7 +3,7 @@
 
 import { api, setUnauthorizedHandler } from './api.js';
 import {
-  applySettings, loadBar, loadBasics, loadSession, loadSources, on, replaceHash, resetUserState,
+  applySettings, emit, loadBar, loadBasics, loadSession, loadSources, on, replaceHash, resetUserState,
   setSession, state,
 } from './store.js';
 import { isDesktop } from './ui/dom.js';
@@ -184,8 +184,20 @@ function refreshCounters() {
   clearTimeout(unreadTimer);
   unreadTimer = setTimeout(() => {
     loadBar().catch(() => {});
-    loadSources().catch(() => {});
+    // Danach Leiste und Zeitungskopf nachziehen: Beide lesen auch Zahlen aus /api/sources.
+    loadSources().then(() => emit('bar')).catch(() => {});
   }, 800);
+}
+
+/** Einmal kurz nach der nächsten lokalen Mitternacht die Zähler neu holen, dann für den Tag darauf.
+ *  Ein einzelner Zeitgeber pro Tag, kein Abfragen; im Hintergrund übernimmt visibilitychange. */
+function scheduleMidnightRefresh() {
+  const now = new Date();
+  const next = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 5);
+  setTimeout(() => {
+    if (state.authed) refreshCounters();
+    scheduleMidnightRefresh();
+  }, next - now);
 }
 
 /** Service Worker einmal beim Start registrieren, auch ohne Anmeldung (Version aus /api/build). */
@@ -247,6 +259,12 @@ async function boot() {
   on('reroute', route);
   on('unread-changed', refreshCounters);
   on('flags', (patch) => { if ('read' in patch) refreshCounters(); });
+  // Die Zähler zählen nur heute (ab 00:00): Kommt die App wieder in den Vordergrund, etwa am
+  // nächsten Morgen, Leiste und Zeitungen neu holen; bleibt sie offen, kurz nach Mitternacht.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && state.authed) refreshCounters();
+  });
+  scheduleMidnightRefresh();
   window.matchMedia('(min-width: 900px)').addEventListener('change', () => {
     const list = current.view && current.view.layout === 'list';
     const article = shell.dataset.layout === 'article';

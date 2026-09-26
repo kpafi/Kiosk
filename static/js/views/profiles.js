@@ -89,7 +89,7 @@ export function openProfiles(route) {
         on: { click: () => closeSheet({ silent: true }) },
       },
       h('span', { class: 't-ui', text: f.name }),
-      h('span', { class: 't-caption', text: f.unread ? `${cc} · ${f.unread} ungelesen` : cc })),
+      h('span', { class: 't-caption', text: f.unread ? `${cc} · ${f.unread} ungelesen heute` : cc })),
       toggle(!!f.in_bar, `${f.name} in der Leiste`, async (v) => {
         try {
           await api(`favorites/sources/${encodeURIComponent(f.source_id)}`, { method: 'PUT', body: { in_bar: v } });

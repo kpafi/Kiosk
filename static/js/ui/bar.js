@@ -45,8 +45,8 @@ function barChip(item) {
     class: `bar-chip${item.type === 'all' ? ' bar-chip--all' : ''}${active ? ' is-on' : ''}`,
     href: hrefFor(item),
     'aria-current': active ? 'page' : null,
-    // Vorleser: voller Name samt Zahl („DEUTSCHLAND, 622 ungelesen“), der Zähler selbst ist stumm.
-    'aria-label': showCount ? `${item.label}, ${item.unread} ungelesen` : null,
+    // Vorleser: voller Name samt Zahl („DEUTSCHLAND, 62 ungelesen heute“), der Zähler selbst ist stumm.
+    'aria-label': showCount ? `${item.label}, ${item.unread} ungelesen heute` : null,
     title: item.label,
     draggable: 'false',
   }, h('span', { class: 'bar-label', text: item.label }),

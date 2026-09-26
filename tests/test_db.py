@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
-from app.db import SCHEMA_VERSION, Database, MigrationError, _fts_query
+from app.db import SCHEMA_VERSION, Database, MigrationError, _fts_query, day_start
 from conftest import UID, ago, make_row
 
 OLD_SCHEMA = """
@@ -486,3 +487,85 @@ def test_settings_roundtrip(db):
     assert db.get_settings(UID) == {}
     db.set_settings(UID, {"theme": "dark", "bar_order": ["source:alpha"]})
     assert db.get_settings(UID) == {"theme": "dark", "bar_order": ["source:alpha"]}
+
+
+# ---- Tagesbeginn der Ungelesen-Zähler ------------------------------------------
+
+BERLIN = ZoneInfo("Europe/Berlin")
+
+
+def utc(*args) -> datetime:
+    return datetime(*args, tzinfo=timezone.utc)
+
+
+def test_day_start_berlin_winter_and_summer_time():
+    # Winterzeit (MEZ, UTC+1): der Tag beginnt um 23:00 UTC des Vortags; Sommerzeit (MESZ): 22:00
+    assert day_start(BERLIN, utc(2026, 1, 15, 12, 0)) == "2026-01-14T23:00:00+00:00"
+    assert day_start(BERLIN, utc(2026, 7, 15, 12, 0)) == "2026-07-14T22:00:00+00:00"
+    # Format wie published_at (ohne Mikrosekunden), auch bei einem Jetzt mit Mikrosekunden
+    assert day_start(BERLIN, utc(2026, 7, 15, 12, 0, 0, 123456)) == "2026-07-14T22:00:00+00:00"
+    assert day_start(ZoneInfo("UTC"), utc(2026, 7, 15, 0, 0)) == "2026-07-15T00:00:00+00:00"
+
+
+def test_day_start_around_midnight():
+    # 23:59:59 Ortszeit gehört noch zum alten Tag, um 00:00 Ortszeit beginnt der neue
+    assert day_start(BERLIN, utc(2026, 9, 25, 21, 59, 59)) == "2026-09-24T22:00:00+00:00"
+    assert day_start(BERLIN, utc(2026, 9, 25, 22, 0, 0)) == "2026-09-25T22:00:00+00:00"
+    # Mitternacht UTC ist in Berlin schon 02:00: derselbe Tag wie zwei Stunden vorher
+    assert day_start(BERLIN, utc(2026, 9, 26, 0, 0)) == "2026-09-25T22:00:00+00:00"
+    # Ein Jetzt in Ortszeit ergibt dasselbe wie in UTC
+    assert day_start(BERLIN, datetime(2026, 9, 26, 0, 30, tzinfo=BERLIN)) == "2026-09-25T22:00:00+00:00"
+
+
+def test_day_start_on_dst_switch_days():
+    # 29.3.2026: um 02:00 auf Sommerzeit, ein Tag mit 23 Stunden; er beginnt noch in MEZ
+    assert day_start(BERLIN, utc(2026, 3, 29, 21, 59)) == "2026-03-28T23:00:00+00:00"
+    assert day_start(BERLIN, utc(2026, 3, 29, 22, 0)) == "2026-03-29T22:00:00+00:00"
+    # 25.10.2026: um 03:00 zurück auf Winterzeit, ein Tag mit 25 Stunden. 23:30 Ortszeit (MEZ) ist
+    # 22:30 UTC; „jetzt minus 24 Stunden“ läge hier schon im Vortag.
+    assert day_start(BERLIN, utc(2026, 10, 25, 22, 30)) == "2026-10-24T22:00:00+00:00"
+    assert day_start(BERLIN, utc(2026, 10, 25, 23, 0)) == "2026-10-25T23:00:00+00:00"
+
+
+@pytest.mark.real_day
+def test_database_today_start_uses_its_time_zone(db):
+    assert str(db.tz) == "Europe/Berlin"
+    assert db.today_start(now=utc(2026, 7, 15, 12, 0)) == "2026-07-14T22:00:00+00:00"
+    db.tz = ZoneInfo("America/New_York")
+    assert db.today_start(now=utc(2026, 7, 15, 12, 0)) == "2026-07-15T04:00:00+00:00"
+    # Ohne now: der echte heutige Tag (Aufruf zwischen zwei Messungen, falls genau Mitternacht ist)
+    before = day_start(db.tz)
+    got = db.today_start()
+    assert got in (before, day_start(db.tz))
+
+
+@pytest.mark.real_day
+def test_unread_counters_count_only_today(db, monkeypatch):
+    """Zähler (Leiste, Zeitungen, Menü) zählen ab 00:00 Ortszeit; Liste, Zählung der Liste,
+    „alles gelesen“ und die Status-Kennzahl nehmen weiter alle ungelesenen Artikel."""
+    now = utc(2026, 9, 26, 10, 0)            # 12:00 in Berlin
+    monkeypatch.setattr(db, "today_start", lambda: Database.today_start(db, now=now))
+    db.upsert_articles([
+        make_row("alpha", 1, "2026-09-25T21:59:00+00:00"),   # gestern 23:59 in Berlin
+        make_row("alpha", 2, "2026-09-25T22:00:00+00:00"),   # heute 00:00 in Berlin
+        make_row("beta", 3, "2026-09-26T09:00:00+00:00"),
+        make_row("beta", 4, "2026-09-26T09:30:00+00:00"),    # Paywall: zählt nie
+        make_row("beta", 5, "2026-09-20T09:00:00+00:00"),
+    ])
+    db.q("UPDATE articles SET paywalled=1 WHERE guid='beta-4'")
+    assert db.unread_free_by_source(UID) == {"alpha": 1, "beta": 1}
+    assert db.article_counts(UID)["unread"] == 2
+    assert db.article_counts(UID, ["alpha"])["unread"] == 1
+    assert db.source_counts(UID) == {"alpha": {"total": 2, "unread": 1, "unread_all": 2},
+                                     "beta": {"total": 2, "unread": 1, "unread_all": 2}}
+    # Unverändert: Ungelesen-Liste, ihre Zählung und die Status-Kennzahl
+    assert len(list_all(db, unread=True, free_only=True)) == 4
+    assert db.count_articles(UID, cap=100, unread=True, free_only=True) == 4
+    assert db.stats(UID)["unread"] == 4
+    # Heutiger Artikel gelesen: Zähler sinkt, der gestrige zählt weiter nur in unread_all
+    db.set_flag(UID, db.one("SELECT id FROM articles WHERE guid='alpha-2'")["id"], "read", True)
+    assert db.unread_free_by_source(UID) == {"beta": 1}
+    assert db.source_counts(UID)["alpha"] == {"total": 2, "unread": 0, "unread_all": 1}
+    # „alles gelesen“ markiert auch die älteren
+    assert db.mark_all_read(UID, ["alpha"]) == 1
+    assert db.source_counts(UID)["alpha"] == {"total": 2, "unread": 0, "unread_all": 0}

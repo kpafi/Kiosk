@@ -29,11 +29,18 @@ export function sourceView(route) {
   let feed = null;
 
   const src = () => state.sourceMap.get(id);
-  // Paywall-freie Zahl aus der Leiste bevorzugen (wie der Chip unten), sonst aus /api/sources.
+  // Ungelesen von heute (ab 00:00): Paywall-freie Zahl aus der Leiste bevorzugen (wie der Chip
+  // unten), sonst aus /api/sources.
   const unreadCount = () => {
     const barItem = (state.bar || []).find((i) => i.type === 'source' && i.id === id);
     const s = src();
     return barItem ? barItem.unread : s ? s.unread : null;
+  };
+  // Alle ungelesenen, auch von früheren Tagen (so viele zeigt „Ungelesen“, so viele markiert
+  // „Alle gelesen“); null, solange /api/sources fehlt.
+  const unreadAllCount = () => {
+    const s = src();
+    return s && typeof s.unread_all === 'number' ? s.unread_all : null;
   };
 
   function paintHeader() {
@@ -41,7 +48,7 @@ export function sourceView(route) {
     const name = s ? s.name : id;
     const parts = [s ? s.country : null];
     const unread = unreadCount();
-    if (unread !== null) parts.push(`${unread} ungelesen`);
+    if (unread !== null) parts.push(`${unread} ungelesen heute`);
     if (s && s.last_ok_at) parts.push(`${ago(s.last_ok_at)} geholt`);
     replace(titles,
       h('h1', { class: 't-section', text: name.toUpperCase() }),
@@ -51,8 +58,10 @@ export function sourceView(route) {
     favBtn.setAttribute('aria-pressed', String(fav));
     favBtn.setAttribute('aria-label', fav ? 'Aus Lieblingszeitungen entfernen' : 'Zu Lieblingszeitungen');
     favBtn.replaceChildren(star(20, fav));
-    // Ausgeschaltet oder nichts ungelesen: keine Filter und kein „Alle gelesen“.
-    const idle = (!!s && !s.enabled) || unread === 0;
+    // Ausgeschaltet oder gar nichts ungelesen (auch nicht von früheren Tagen): keine Filter und
+    // kein „Alle gelesen“. Der Zähler oben zählt nur heute, belegt aber, wenn positiv, dass etwas
+    // ungelesen ist (die Leiste ist nach einem Sammellauf oft frischer als unread_all).
+    const idle = (!!s && !s.enabled) || (unreadAllCount() === 0 && !(unread > 0));
     chipsEl.hidden = idle;
     readBtn.hidden = idle;
     if (idle && confirming) { confirming = false; paintConfirm(); }
@@ -80,7 +89,9 @@ export function sourceView(route) {
   function paintConfirm() {
     readBtn.classList.toggle('is-on', confirming);
     if (!confirming) { confirmSlot.replaceChildren(); return; }
-    const n = unreadCount();
+    // unread_all kann nach einem Sammellauf veraltet sein; heute ist nie mehr als insgesamt.
+    const all = unreadAllCount();
+    const n = all === null ? null : Math.max(all, unreadCount() ?? 0);
     replace(confirmSlot, h('div', { class: 'confirm', style: { margin: '0 var(--gutter) 8px' } },
       h('span', { class: 'confirm-text t-caption', text: n !== null ? `Wirklich? ${n} Artikel` : 'Wirklich alle?' }),
       h('button', { type: 'button', class: 'pill', text: 'Abbrechen', on: { click: () => { confirming = false; paintConfirm(); } } }),
@@ -200,7 +211,7 @@ export function sourceView(route) {
   paintHeader();
   buildChips();
   rebuild();
-  if (!src()) refreshSource();
+  refreshSource(); // unread_all frisch holen (die Leiste wird nach Sammelläufen öfter neu geladen)
 
   return {
     el, layout: 'list', bar: true, title: src() ? src().name : 'Zeitung',

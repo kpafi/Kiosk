@@ -4,9 +4,12 @@ import json
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Iterator
+from zoneinfo import ZoneInfo
+
+from .config import DEFAULT_TZ
 
 SCHEMA_VERSION = 6
 
@@ -208,6 +211,16 @@ def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def day_start(tz: tzinfo, now: datetime | None = None) -> str:
+    """Beginn des Kalendertags von `now` (Standard: jetzt): 00:00 Ortszeit in `tz`, als UTC-Zeitpunkt
+    im Format von published_at (_iso), damit der Textvergleich a.published_at >= ? stimmt.
+
+    Über die Zone gerechnet, nicht als „jetzt minus Stunden“: Tage mit Zeitumstellung haben 23
+    oder 25 Stunden. `now` muss eine Zeitzone haben."""
+    local = (now or datetime.now(timezone.utc)).astimezone(tz)
+    return _iso(datetime.combine(local.date(), time(0), tzinfo=tz))
+
+
 class MigrationError(RuntimeError):
     """Die Datenbank lässt sich ohne weitere Angaben nicht migrieren (z. B. fehlt der Admin)."""
 
@@ -225,6 +238,8 @@ class Database:
         # Aufbewahrung in Tagen (settings.retention_days, setzt die App): Ältere Artikel, die nur
         # noch wegen eines Favoriten/„Später lesen“ existieren, sieht nur, wer sie gemerkt hat.
         self.retention_days: int | None = None
+        # Zeitzone für den Tagesbeginn der Ungelesen-Zähler (settings.tz, setzt die App).
+        self.tz: tzinfo = ZoneInfo(DEFAULT_TZ)
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
@@ -421,16 +436,20 @@ class Database:
                 )
 
     def source_counts(self, user_id: int) -> dict[str, dict[str, int]]:
+        """Je Quelle ohne Paywall-Artikel: total, unread (nur heute, der Zähler) und unread_all
+        (alle ungelesenen, wie die Ungelesen-Liste und „alles gelesen“)."""
         # Aufbewahrungsgrenze wie in der Liste: Alte Artikel zählen nur für den, der sie gemerkt hat.
         where, params = _article_filter(sources=None, unread=False, starred=False, free_only=False,
                                         cutoff=self.retention_cutoff())
         cond = f"WHERE {' AND '.join(where)} " if where else ""
         rows = self.q(
             "SELECT a.source_id, SUM(a.paywalled=0) AS total, "
-            "SUM(COALESCE(ua.read, 0)=0 AND a.paywalled=0) AS unread "
-            f"FROM articles a {USER_JOIN} {cond}GROUP BY a.source_id", (user_id, *params)
+            "SUM(COALESCE(ua.read, 0)=0 AND a.paywalled=0 AND a.published_at >= ?) AS unread, "
+            "SUM(COALESCE(ua.read, 0)=0 AND a.paywalled=0) AS unread_all "
+            f"FROM articles a {USER_JOIN} {cond}GROUP BY a.source_id", (self.today_start(), user_id, *params)
         )
-        return {r["source_id"]: {"total": r["total"], "unread": r["unread"]} for r in rows}
+        return {r["source_id"]: {"total": r["total"], "unread": r["unread"], "unread_all": r["unread_all"]}
+                for r in rows}
 
     # ---- articles ------------------------------------------------------
 
@@ -576,6 +595,12 @@ class Database:
             return None
         return (datetime.now(timezone.utc) - timedelta(days=self.retention_days)).isoformat()
 
+    def today_start(self, now: datetime | None = None) -> str:
+        """Beginn des heutigen Tages (00:00 in self.tz) wie published_at gespeichert: Ab hier zählen
+        die Ungelesen-Zähler (Leiste, Zeitungen, Profile, Menü). Liste, „Nächster ungelesener“ und
+        „alles gelesen“ nehmen weiter alle ungelesenen Artikel. `now` nur für Tests."""
+        return day_start(self.tz, now)
+
     def list_articles(self, user_id: int, *, sources: list[str] | None,
                       query: str | None, unread: bool, starred: bool, free_only: bool,
                       before: tuple[str, int] | None, limit: int, offset: int = 0,
@@ -680,11 +705,11 @@ class Database:
             return visible
 
     def article_counts(self, user_id: int, unread_sources: list[str] | None = None) -> dict[str, int]:
-        """Zähler für Menü und Kopfzeilen. `unread` ohne Paywall-Artikel und nur aus
+        """Zähler für Menü und Kopfzeilen. `unread` ohne Paywall-Artikel, nur von heute und nur aus
         `unread_sources` (None = alle Quellen); `later` und `starred` zählen alle gemerkten
         Artikel (Gemerkt zeigt auch Bezahlartikel und ausgeschaltete Quellen)."""
         where, params = _article_filter(sources=unread_sources, unread=True, starred=False,
-                                        free_only=True, cutoff=self.retention_cutoff())
+                                        free_only=True, since=self.today_start(), cutoff=self.retention_cutoff())
         unread = self.one(f"SELECT COUNT(*) AS n FROM articles a {USER_JOIN} WHERE {' AND '.join(where)}",
                           (user_id, *params))["n"]
         row = self.one("SELECT COALESCE(SUM(ua.later=1), 0) AS later, COALESCE(SUM(ua.starred=1), 0) AS starred "
@@ -696,9 +721,9 @@ class Database:
         return self.one("SELECT COALESCE(MAX(id), 0) AS n FROM articles")["n"]
 
     def unread_free_by_source(self, user_id: int) -> dict[str, int]:
-        """Ungelesene Artikel ohne Paywall je Quelle."""
+        """Ungelesene Artikel ohne Paywall je Quelle, nur von heute (Zähler der Leiste)."""
         where, params = _article_filter(sources=None, unread=True, starred=False, free_only=True,
-                                        cutoff=self.retention_cutoff())
+                                        since=self.today_start(), cutoff=self.retention_cutoff())
         rows = self.q(f"SELECT a.source_id, COUNT(*) AS n FROM articles a {USER_JOIN} "
                       f"WHERE {' AND '.join(where)} GROUP BY a.source_id", (user_id, *params))
         return {r["source_id"]: r["n"] for r in rows}
@@ -718,7 +743,8 @@ class Database:
             return cur.rowcount
 
     def stats(self, user_id: int | None = None) -> dict[str, Any]:
-        """Kennzahlen der Datenbank; unread und starred gelten für `user_id`."""
+        """Kennzahlen der Datenbank; unread und starred gelten für `user_id`. unread zählt hier alle
+        ungelesenen Artikel, nicht nur die von heute wie die Zähler der Oberfläche."""
         row = self.one(
             "SELECT COUNT(*) AS total, SUM(COALESCE(ua.read, 0)=0 AND a.paywalled=0) AS unread, "
             "SUM(COALESCE(ua.starred, 0)=1) AS starred, "

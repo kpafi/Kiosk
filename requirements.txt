@@ -5,3 +5,4 @@ trafilatura>=2.0,<3
 httpx>=0.27,<0.28
 pyyaml>=6.0,<7
 itsdangerous>=2.2,<3
+tzdata>=2025.1,<2030

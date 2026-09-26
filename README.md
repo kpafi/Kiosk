@@ -143,10 +143,17 @@ Artikelfelder: `text_status` ist `full`, `partial` (Paywall oder sehr kurz), `em
   Militär (alle, mit Begriffen). Sie sind änderbar, aber nicht löschbar.
 - Profil-Validierung: `name` 1 bis 40 Zeichen; `sources` `null` oder bekannte Quellen-IDs (höchstens 200);
   `terms` 0 bis 20 Begriffe à 1 bis 40 Zeichen ohne `"`; `in_bar` boolesch. Fehler: 422.
+- Alle Ungelesen-Zähler (`unread` in Leiste, Profilen, Lieblingszeitungen, `/api/counts` und
+  `/api/sources`) zählen nur Artikel des laufenden Tages ab 00:00 Ortszeit (`KIOSK_TZ`), um Mitternacht
+  beginnen sie neu. Die Ungelesen-Liste, „Nächster ungelesener“ und „alles gelesen“ nehmen weiter alle
+  ungelesenen Artikel; `/api/sources` liefert dafür zusätzlich `unread_all`. `unread` in `/api/status`
+  zählt ebenfalls alle. Maßgeblich ist die Erscheinungszeit (`published_at`), nicht die Abrufzeit: Artikel
+  von gestern, die erst heute geholt werden (neu eingeschaltete Quelle, Feed nach Störung), stehen in
+  der Ungelesen-Liste, aber nicht im Zähler.
 - `unread` eines Profils zählt ungelesene Artikel ohne Paywall (höchstens 5000) und wird höchstens alle
   60 s neu berechnet; Änderungen an Profilen oder Quellen, „alles gelesen“, das Setzen des
-  Gelesen-Status eines Artikels und ein beendeter Sammellauf verwerfen den Zwischenspeicher sofort.
-  Auch `unread` in `/api/sources` zählt nur Artikel ohne Paywall.
+  Gelesen-Status eines Artikels, ein beendeter Sammellauf und ein neuer Tag verwerfen den
+  Zwischenspeicher sofort. Auch `unread` in `/api/sources` zählt nur Artikel ohne Paywall.
 - Leiste: `ALLE` zuerst, danach Lieblingszeitungen und Profile mit `in_bar` in der Reihenfolge aus
   `bar_order`; nicht dort genannte hängen hinten an (erst Zeitungen, dann Profile). `label` ist für
   Zeitungen `short` aus `sources.yaml` (höchstens 12 Zeichen, Versalien), für Profile der Name in Versalien.
@@ -229,9 +236,10 @@ Suche, Zähler, Artikel per ID).
 | `KIOSK_RETENTION_DAYS` | `90` | 1 bis 3650 |
 | `KIOSK_EXTRACT_CONCURRENCY` | `6` | Gleichzeitige Hintergrund-Extraktionen, 1 bis 32 |
 | `KIOSK_SESSION_DAYS` | `30` | Gültigkeit der Session, 1 bis 365 |
+| `KIOSK_TZ` | `Europe/Berlin` | Zeitzone (IANA-Name), in der der Tag für die Ungelesen-Zähler um 00:00 beginnt |
 | `KIOSK_DOCS` | `0` | `1` schaltet die API-Doku unter `/docs` und `/openapi.json` ein (nach Login); in Produktion aus |
 
-Werte außerhalb der Grenzen brechen den Start mit einer klaren Fehlermeldung ab.
+Werte außerhalb der Grenzen und unbekannte Zeitzonen brechen den Start mit einer klaren Fehlermeldung ab.
 
 Sessions gehören einem Benutzer (signiertes Cookie mit Benutzer-ID, `users.session_epoch` und einem
 Fingerabdruck des Passwort-Hashes). Abmelden und `passwd` erhöhen die Epoche und beenden damit alle

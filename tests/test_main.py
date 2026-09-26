@@ -382,6 +382,23 @@ def test_config_accepts_bounds(app_env, monkeypatch):
     assert (s.fetch_interval, s.extract_concurrency, s.retention_days, s.session_max_age) == (60, 32, 3650, 365 * 86400)
 
 
+@pytest.mark.parametrize("value", ["Mars/Olympus", "Europe", "../etc/passwd", "/etc/localtime", "Europe/Berlin x"])
+def test_config_rejects_unknown_time_zone(app_env, monkeypatch, value):
+    from app.config import load_settings
+    monkeypatch.setenv("KIOSK_TZ", value)
+    with pytest.raises(RuntimeError, match="KIOSK_TZ"):
+        load_settings()
+
+
+def test_config_time_zone_default_and_app(app_env, monkeypatch):
+    from app.config import load_settings
+    assert load_settings().tz == "Europe/Berlin"
+    monkeypatch.setenv("KIOSK_TZ", " America/New_York ")
+    assert load_settings().tz == "America/New_York"
+    with TestClient(app, base_url=ORIGIN):
+        assert str(state.db.tz) == "America/New_York"
+
+
 def test_kiosk_password_only_bootstraps_the_admin(app_env, monkeypatch, caplog):
     """Gibt es schon Benutzer, hat KIOSK_PASSWORD keine Wirkung mehr (mit Hinweis im Log)."""
     with TestClient(app, base_url=ORIGIN) as c:

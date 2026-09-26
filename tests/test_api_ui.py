@@ -270,6 +270,40 @@ def test_profile_unread_is_cached_and_invalidated(authed, monkeypatch):
     assert _profile(authed, "business")["unread"] == 0            # read-all leert den Speicher
 
 
+def test_profile_unread_cache_ends_with_the_day(authed, monkeypatch):
+    """Nach Mitternacht kein Wert von gestern aus dem Zwischenspeicher, auch innerhalb der 60 s."""
+    _seed_terms()                                                  # Artikel von vor 2 bis 9 Stunden
+    assert _profile(authed, "business")["unread"] == 4
+    monkeypatch.setattr(state.db, "today_start", lambda: ago(minutes=1))   # neuer Tag
+    assert _profile(authed, "business")["unread"] == 0
+    monkeypatch.setattr(state.db, "today_start", lambda: ago(hours=5))
+    assert _profile(authed, "business")["unread"] == 2           # Inflation 0 und 3; 6 und 9 sind älter
+
+
+def test_counters_count_today_lists_keep_all_unread(authed, monkeypatch):
+    """Zähler nur ab Tagesbeginn; Ungelesen-Liste, „Nächster ungelesener“ und „alles gelesen“
+    sowie unread_all in /api/sources weiter mit allen ungelesenen Artikeln."""
+    state.db.upsert_articles([make_row("alpha", 1, ago(hours=1)), make_row("alpha", 2, ago(hours=5)),
+                              make_row("beta", 3, ago(hours=6))])
+    monkeypatch.setattr(state.db, "today_start", lambda: ago(hours=3))
+    authed.put("/api/favorites/sources/alpha", json={})
+    sources = {s["id"]: s for s in authed.get("/api/sources").json()}
+    assert (sources["alpha"]["total"], sources["alpha"]["unread"], sources["alpha"]["unread_all"]) == (2, 1, 2)
+    assert (sources["beta"]["unread"], sources["beta"]["unread_all"]) == (0, 1)
+    assert (sources["gamma"]["unread"], sources["gamma"]["unread_all"]) == (0, 0)   # ohne Artikel
+    bar = {i["key"]: i["unread"] for i in authed.get("/api/bar").json()["items"]}
+    assert bar["all"] == 1 and bar["source:alpha"] == 1
+    assert authed.get("/api/counts").json()["unread"] == 1
+    assert authed.get("/api/favorites/sources").json()[0]["unread"] == 1
+    assert _profile(authed, "de")["unread"] == 1 and _profile(authed, "world")["unread"] == 1
+    assert authed.get("/api/status").json()["db"]["unread"] == 3
+    assert len(authed.get("/api/articles", params={"unread": "true"}).json()["items"]) == 3
+    newest = authed.get("/api/articles").json()["items"][0]["id"]
+    assert authed.get(f"/api/articles/{newest}/next").json()["item"]["title"] == "Titel 2"   # von „gestern“
+    assert authed.post("/api/articles/read-all", json={"source": "alpha"}).json() == {"marked": 2}
+    assert authed.patch("/api/sources/alpha", json={"enabled": True}).json()["unread_all"] == 0
+
+
 def test_profile_unread_cap(authed, monkeypatch):
     _seed_terms()
     monkeypatch.setattr(api_ui, "UNREAD_CAP", 3)

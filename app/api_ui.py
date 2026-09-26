@@ -109,8 +109,8 @@ def article_scope(user_id: int, sources: list[str], countries: set[str], profile
     return scope, terms
 
 
-# (Benutzer-ID, Profil-ID) -> (Zeitpunkt, Ende des letzten Sammellaufs, Zahl)
-_unread_cache: dict[tuple[int, int], tuple[float, Any, int]] = {}
+# (Benutzer-ID, Profil-ID) -> (Zeitpunkt, Ende des letzten Sammellaufs, Tagesbeginn, Zahl)
+_unread_cache: dict[tuple[int, int], tuple[float, Any, str, int]] = {}
 
 
 def invalidate_unread(user_id: int | None = None) -> None:
@@ -124,17 +124,18 @@ def invalidate_unread(user_id: int | None = None) -> None:
 
 
 def profile_unread(user_id: int, profile: dict[str, Any], sources: list[str]) -> int:
-    """Ungelesene, Paywall-freie Artikel im Profil (höchstens UNREAD_CAP), höchstens alle 60 s neu
-    berechnet; ein beendeter Sammellauf macht den Wert sofort ungültig."""
+    """Ungelesene, Paywall-freie Artikel von heute im Profil (höchstens UNREAD_CAP), höchstens alle
+    60 s neu berechnet; ein beendeter Sammellauf oder ein neuer Tag macht den Wert sofort ungültig."""
     run = state.fetcher.state.get("last_finished")
+    day = state.db.today_start()
     key = (user_id, profile["id"])
     hit = _unread_cache.get(key)
     now = time.monotonic()
-    if hit and now - hit[0] < UNREAD_TTL and hit[1] == run:
-        return hit[2]
+    if hit and now - hit[0] < UNREAD_TTL and hit[1] == run and hit[2] == day:
+        return hit[3]
     n = state.db.count_articles(user_id, cap=UNREAD_CAP, sources=sources, terms=profile["terms"] or None,
-                                unread=True, free_only=True)
-    _unread_cache[key] = (now, run, n)
+                                unread=True, free_only=True, since=day)
+    _unread_cache[key] = (now, run, day, n)
     return n
 
 

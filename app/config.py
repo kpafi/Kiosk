@@ -5,6 +5,7 @@ import re
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -16,6 +17,8 @@ EXAMPLE_PASSWORD = "bitte-aendern"
 MIN_PASSWORD_LEN = 12
 # Benutzernamen: 2 bis 32 Zeichen, klein geschrieben gespeichert.
 USERNAME_RE = re.compile(r"[a-z0-9._-]{2,32}")
+# Zeitzone, in der ein Tag für die Ungelesen-Zähler um 00:00 beginnt (KIOSK_TZ).
+DEFAULT_TZ = "Europe/Berlin"
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,7 @@ class Settings:
     cookie_secure: bool
     disable_fetcher: bool
     admin_user: str = "admin"   # KIOSK_ADMIN_USER: Name des Admins beim Bootstrap
+    tz: str = DEFAULT_TZ        # KIOSK_TZ: Zeitzone für den Tagesbeginn der Zähler
 
 
 def _int(name: str, default: int, lo: int | None = None, hi: int | None = None) -> int:
@@ -54,6 +58,16 @@ def _bool(name: str, default: bool) -> bool:
     if not raw:
         return default
     return raw in ("1", "true", "yes", "on")
+
+
+def _tz(name: str, default: str) -> str:
+    """Name einer Zeitzone (IANA, z. B. Europe/Berlin) aus der Umgebung; unbekannt: RuntimeError."""
+    raw = os.environ.get(name, "").strip() or default
+    try:
+        ZoneInfo(raw)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        raise RuntimeError(f"{name} ist keine bekannte Zeitzone: {raw!r} (z. B. Europe/Berlin)") from None
+    return raw
 
 
 def docs_enabled() -> bool:
@@ -125,4 +139,5 @@ def load_settings() -> Settings:
         # Für Tests: kein Sammler, keine Netzwerkzugriffe.
         disable_fetcher=_bool("KIOSK_DISABLE_FETCHER", False),
         admin_user=admin_user,
+        tz=_tz("KIOSK_TZ", DEFAULT_TZ),
     )

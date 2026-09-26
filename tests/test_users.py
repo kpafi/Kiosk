@@ -738,13 +738,14 @@ def test_cli_add_on_fresh_db_seeds_sources_first(tmp_path, monkeypatch):
 
 
 def test_source_counts_respect_retention(db):
-    """Alte, nur von einem Benutzer gemerkte Artikel zählen in den Quellen-Zählern nur für ihn."""
+    """Alte, nur von einem Benutzer gemerkte Artikel zählen in den Quellen-Zählern nur für ihn
+    (total und unread_all; unread zählt ohnehin nur heute)."""
     other = db.create_user("anna", "x")
     db.upsert_articles([make_row("alpha", 1, ago(hours=1)), make_row("alpha", 2, ago(days=200))])
     new, old = [r["id"] for r in db.q("SELECT id FROM articles ORDER BY id")]
     db.set_flag(UID, old, "starred", True)
     db.retention_days = 90
-    assert db.source_counts(UID)["alpha"] == {"total": 2, "unread": 2}
-    assert db.source_counts(other)["alpha"] == {"total": 1, "unread": 1}
+    assert db.source_counts(UID)["alpha"] == {"total": 2, "unread": 1, "unread_all": 2}
+    assert db.source_counts(other)["alpha"] == {"total": 1, "unread": 1, "unread_all": 1}
     db.retention_days = None   # ohne Grenze zählt alles
-    assert db.source_counts(other)["alpha"] == {"total": 2, "unread": 2}
+    assert db.source_counts(other)["alpha"] == {"total": 2, "unread": 1, "unread_all": 2}

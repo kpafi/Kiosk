@@ -5,7 +5,7 @@ import { closeSheet, openSheet, rebuildSheet, sheetGrip } from '../ui/sheet.js';
 import { toast } from '../ui/dom.js';
 import { api } from '../api.js';
 import {
-  emit, loadBar, loadCounts, loadFavorites, loadProfiles, profileById, readAllWatermark, state,
+  emit, loadBar, loadCounts, loadFavorites, loadProfiles, loadSources, profileById, readAllWatermark, state,
 } from '../store.js';
 
 const THEME_LABEL = { system: 'System', dark: 'Dunkel', light: 'Hell' };
@@ -19,18 +19,15 @@ function menuItem(href, iconEl, title, sub) {
     h('span', { class: 'chev' }, chevronRight(18)));
 }
 
-/** Ungelesene im aktuellen Kontext (für die Rückfrage). */
-function contextUnread() {
+/** Alle Ungelesenen im aktuellen Kontext (für die Rückfrage), auch von früheren Tagen. Die Zähler
+ *  zählen nur heute; eine Gesamtzahl gibt es nur für Zeitungen (unread_all), sonst null. */
+function contextUnreadAll() {
   const ctx = state.ctx;
-  if (ctx.type === 'profile') {
-    const p = profileById(ctx.id);
-    return p ? p.unread : null;
-  }
   if (ctx.type === 'source') {
     const s = state.sourceMap.get(ctx.id);
-    return s ? s.unread : null;
+    return s && typeof s.unread_all === 'number' ? s.unread_all : null;
   }
-  return state.counts ? state.counts.unread : null;
+  return null;
 }
 
 function contextName() {
@@ -81,7 +78,7 @@ export function openMenu() {
     const settingsSub = [THEME_LABEL[state.settings.theme] || 'System', interval ? `alle ${interval} Min` : null]
       .filter(Boolean).join(' · ');
 
-    const unread = contextUnread();
+    const unread = contextUnreadAll();
     const name = contextName();
 
     let bottom;
@@ -133,6 +130,8 @@ export function openMenu() {
 
   openSheet(build, { label: 'Menü' });
   // Zähler frisch holen und Blatt nachziehen.
-  Promise.allSettled([loadCounts(), loadProfiles(), loadBar(), state.counts ? null : loadFavorites()])
+  // Zeitungen nur im Zeitungskontext (unread_all für die Rückfrage), sonst unnötig.
+  Promise.allSettled([loadCounts(), loadProfiles(), loadBar(), state.ctx.type === 'source' ? loadSources() : null,
+    state.counts ? null : loadFavorites()])
     .then(() => rebuildSheet(build));
 }

@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi import Path as PathParam
@@ -51,6 +52,7 @@ async def lifespan(app: FastAPI):
     # Umbau auf Schema 6); danach hat es keine Wirkung mehr.
     state.db = Database(s.db_path, admin=(s.admin_user, s.password) if s.password else None)
     state.db.retention_days = s.retention_days
+    state.db.tz = ZoneInfo(s.tz)
     if state.db.user_count() == 0:
         state.db.close()
         raise RuntimeError(
@@ -337,7 +339,7 @@ async def healthz():
 # ---- sources -------------------------------------------------------------
 
 def _source_view(s, st, counts, favorites: set[str]) -> dict[str, Any]:
-    c = counts.get(s.id, {"total": 0, "unread": 0})
+    c = counts.get(s.id, {"total": 0, "unread": 0, "unread_all": 0})
     return {
         "id": s.id, "name": s.name, "short": s.short, "is_favorite": s.id in favorites,
         "country": s.country, "lang": s.lang,
@@ -347,7 +349,8 @@ def _source_view(s, st, counts, favorites: set[str]) -> dict[str, Any]:
         "last_fetch_at": st["last_fetch_at"] if st else None,
         "last_error": st["last_error"] if st else None,
         "last_new": st["last_new"] if st else 0,
-        "total": c["total"], "unread": c["unread"],
+        # unread: ungelesen von heute (Zähler); unread_all: alle ungelesenen (Liste, „alles gelesen“)
+        "total": c["total"], "unread": c["unread"], "unread_all": c["unread_all"],
     }
 
 

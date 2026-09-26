@@ -39,6 +39,15 @@ def make_row(source_id: str, n: int, published_at: str, **extra) -> dict:
     return row
 
 
+@pytest.fixture(autouse=True)
+def day_began_yesterday(request, monkeypatch):
+    """Die Ungelesen-Zähler zählen nur Artikel ab 00:00 Ortszeit. Damit Tests mit Artikeln von
+    „vor ein paar Stunden“ nicht von der Uhrzeit des Testlaufs abhängen, beginnt der Tag hier vor
+    24 Stunden. Tests der echten Tagesgrenze markieren sich mit @pytest.mark.real_day."""
+    if request.node.get_closest_marker("real_day") is None:
+        monkeypatch.setattr(Database, "today_start", lambda self, now=None: ago(days=1))
+
+
 # Benutzer der db-Fixture (Admin "tester", angelegt beim Öffnen der frischen Datenbank).
 UID = 1
 ADMIN_PASSWORD = "geheim-und-lang"
@@ -73,4 +82,5 @@ def app_env(tmp_path, monkeypatch):
     monkeypatch.setenv("KIOSK_SECRET", "x" * 48)
     monkeypatch.setenv("KIOSK_DISABLE_FETCHER", "1")
     monkeypatch.delenv("KIOSK_COOKIE_SECURE", raising=False)
+    monkeypatch.delenv("KIOSK_TZ", raising=False)
     return tmp_path

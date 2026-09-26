@@ -406,6 +406,23 @@ _PUBLISHED_MAX_LEN = 60     # längere Absätze mit „Published On …“ sind 
 _NEWSFEED_RE = re.compile(r"^\s*<a\b[^>]*>\s*NewsFeed\s*</a>\s*$")
 _JUNK_LABELS = {"hide caption", "toggle caption", "advertisement", "werbung", "anzeige"}
 _LOREM_RE = re.compile(r"^\s*Lorem ipsum dolor sit amet\b", re.I)
+# Lesezeit- und Vorlese-Etiketten aus Bedienleisten und „Mehr zum Thema“-Kästen (SPIEGEL: „3 Min“,
+# auch doppelt „3 Min 3 Min“ für schmale und breite Anzeige, „Artikel anhören (3 Minuten)“). Nur wenn
+# der ganze Listenpunkt daraus besteht; „Nach 3 Min war alles vorbei“ oder „3 Min Anfahrt“ bleiben.
+# Ein Absatz fällt nur mit „Artikel anhören …“ weg: „90 Min“ allein kann in einem Liveticker stehen.
+_MINUTES = r"\d{1,3}\s*(?:min\.?|minuten)"
+_LISTEN = r"artikel anhören(?:\s*\(\d{1,3}\s*minuten?\))?"
+_READING_TIME_RE = re.compile(rf"^(?=\S)(?:{_LISTEN})?(?:\s*{_MINUTES})*$", re.I)
+_LISTEN_LABEL_RE = re.compile(rf"^{_LISTEN}(?:\s*{_MINUTES})*$", re.I)
+_MINUTES_ONLY_RE = re.compile(rf"^{_MINUTES}(?:\s*{_MINUTES})*$", re.I)
+_READING_TIME_HINT_RE = re.compile(r"\d\s*min|anhören", re.I)
+# Teaser-Rest: genau ein Link (die Überschrift), danach nur Lesezeit(en).
+_LINK_THEN_REST_RE = re.compile(r"^\s*<a\b[^>]*>(?:(?!</?a\b).)*</a>(.*)$", re.S)
+# Innerster Listenpunkt (enthält keinen weiteren): Entfernen lässt das HTML wohlgeformt.
+_LI_RE = re.compile(r"<li>((?:(?!<li\b|</li>).)*)</li>\s*", re.S)
+_EMPTY_LIST_RE = re.compile(r"<(ul|ol)>\s*</\1>\s*")
+_LI_MAX = 2000              # längere Listenpunkte sind Inhalt (Teaser-Links mit langer URL passen)
+_LIST_PASSES = 5            # verschachtelte Listen: je Ebene ein Durchgang
 
 
 def _drop_junk_paragraphs(body: str) -> str:
@@ -419,7 +436,54 @@ def _drop_junk_paragraphs(body: str) -> str:
         if len(text) < _PUBLISHED_MAX_LEN and _PUBLISHED_RE.match(text):
             return ""
         return m.group(0)
-    return _PARA_RE.sub(repl, body)
+    return _drop_reading_times(_PARA_RE.sub(repl, body))
+
+
+def _drop_reading_times(body: str) -> str:
+    """Absätze mit „Artikel anhören …“ und Listenpunkte, die nur eine Lesezeit („3 Min“) oder den
+    Rest eines Teasers (ein Link, danach nur Lesezeiten) enthalten, samt dadurch leer gewordener
+    Listenpunkte und Listen. Auch für schon gespeicherte Artikel (strip_reading_times)."""
+
+    def para(m: re.Match) -> str:
+        inner = m.group(1)
+        if len(inner) > 500 or "<img" in inner or "anhören" not in inner.lower():
+            return m.group(0)
+        return "" if _LISTEN_LABEL_RE.match(html_to_text(inner)) else m.group(0)
+
+    def item(m: re.Match) -> str:
+        inner = m.group(1)
+        # Kurz-Prüfungen vor html_to_text (eigener Parser je Element): Etiketten sind kurz, enthalten
+        # nie ein Bild und immer „<Zahl> Min“ bzw. „anhören“. Ein leerer Listenpunkt (etwa
+        # <li><p>3 Min</p></li> nach dem Absatz, oder eine geleerte innere Liste) fällt mit weg.
+        if len(inner) > _LI_MAX or "<img" in inner:
+            return m.group(0)
+        if not _TAG_RE.sub("", inner).strip():
+            return ""
+        if not _READING_TIME_HINT_RE.search(inner):
+            return m.group(0)
+        if _READING_TIME_RE.match(html_to_text(inner)):
+            return ""
+        teaser = _LINK_THEN_REST_RE.match(inner)
+        if teaser and _MINUTES_ONLY_RE.match(html_to_text(teaser.group(1))):
+            return ""   # reine Linkliste (ohne Lesezeit) bleibt
+        return m.group(0)
+
+    out = _PARA_RE.sub(para, body)
+    for _ in range(_LIST_PASSES):
+        step = _LI_RE.sub(item, out)
+        if step == out:
+            break
+        out = _EMPTY_LIST_RE.sub("", step)
+    return out
+
+
+def strip_reading_times(body_html: str | None) -> str | None:
+    """Wie _drop_reading_times, für die Auslieferung schon gespeicherter Artikel (vor der Bereinigung
+    extrahiert, z. B. SPIEGEL mit Liste „3 Min / 6 Min“). Ohne „<Zahl> Min“ bzw. „anhören“ im Text
+    nur eine Suche im String."""
+    if not body_html or not _READING_TIME_HINT_RE.search(body_html):
+        return body_html
+    return _drop_reading_times(body_html)
 
 
 _LEAD_RE = re.compile(r"^\s*<(figcaption|h2|p)>(.*?)</\1>\s*", re.S)
@@ -459,21 +523,45 @@ def html_to_text(fragment: str | None) -> str:
 # greift nur für Absätze, die mit dem Blindtext beginnen).
 PLACEHOLDER_CLASS = "nfy-text-wrapper-blur"
 _PLACEHOLDER_XPATH = f"//*[contains(concat(' ', normalize-space(@class), ' '), ' {PLACEHOLDER_CLASS} ')]"
+# Bedienelemente, die nie Artikeltext sind, deren Beschriftung trafilatura aber teils stehen lässt:
+# Knöpfe (SPIEGEL „Artikel anhören (3 Minuten)“ mit „3 Min“, „Zur Merkliste hinzufügen“) und die
+# Lesezeit neben einem Symbol in „Mehr zum Thema“-Kästen mitten im Artikel (data-icon-auxiliary,
+# „1 Min“; die Überschrift des Teasers verwirft trafilatura, die Lesezeit blieb als Liste stehen).
+# Knöpfe mit Bild bleiben (Bildvergrößerung um ein Artikelbild). aria-hidden="true" bewusst nicht:
+# El País versteckt so echte Bildunterschriften, DW Datumsangaben.
+# SPIEGEL kennzeichnet den ganzen „Mehr zum Thema“-Kasten mit data-area="related_articles"; ohne ihn
+# rutschen auch keine Teaser-Überschriften mehr in den Text.
+_CHROME_XPATH = (
+    "//button[not(.//img or .//picture)]"
+    " | //*[@data-contains-auxiliary-icons or @data-icon-auxiliary]"
+    " | //*[@data-area='play_button' or @data-area='bookmark_button' or @data-area='related_articles']"
+)
+_CHROME_MARKERS_RE = re.compile(
+    rb"<button|data-contains-auxiliary-icons|data-icon-auxiliary|play_button|bookmark_button|related_articles",
+    re.I)
 
 
-def _without_placeholders(page: bytes):
-    """Die Seite als lxml-Baum ohne Platzhalter-Elemente, wenn sie welche enthält; sonst die Bytes
-    unverändert (trafilatura parst dann wie bisher selbst)."""
-    if PLACEHOLDER_CLASS.encode() not in page:
+def _precleaned(page: bytes):
+    """Die Seite als lxml-Baum ohne Platzhalter-Elemente und Bedienelemente, wenn sie welche enthält;
+    sonst (oder wenn das Parsen scheitert) die Bytes unverändert, trafilatura parst dann wie bisher
+    selbst. Ein Baum wird nur einmal gebaut und dient auch den Metadaten (kein zweites Parsen)."""
+    xpaths = []
+    if PLACEHOLDER_CLASS.encode() in page:
+        xpaths.append(_PLACEHOLDER_XPATH)
+    if _CHROME_MARKERS_RE.search(page):
+        xpaths.append(_CHROME_XPATH)
+    if not xpaths:
         return page
     try:
         tree = load_html(page)
+        if tree is None:
+            return page
         # Ohne Elternelement (die Wurzel selbst, <html class=…>) lässt sich nichts entfernen.
-        found = [el for el in tree.xpath(_PLACEHOLDER_XPATH) if el.getparent() is not None] if tree is not None else []
+        found = [el for el in tree.xpath(" | ".join(xpaths)) if el.getparent() is not None]
         if not found:
             return page
         for el in found:
-            el.drop_tree()   # behält den Text nach dem Element (tail)
+            el.drop_tree()   # behält den Text nach dem Element (tail); verschachtelte gehen mit
     except Exception:  # noqa: BLE001
         return page
     return tree
@@ -482,7 +570,7 @@ def _without_placeholders(page: bytes):
 def extract(page: bytes, url: str) -> Extraction:
     """Extrahiert den Artikel aus den rohen Bytes; trafilatura erkennt die Kodierung selbst."""
     paywalled = is_paywalled(page[:PAYWALL_SCAN_CHARS].decode("utf-8", errors="ignore"))
-    doc = _without_placeholders(page)
+    doc = _precleaned(page)
 
     body = trafilatura.extract(
         # Eine Kopie des Baums: trafilatura soll den für die Metadaten nicht verändern.

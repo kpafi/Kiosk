@@ -8,6 +8,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.db as db_mod
+from app.extract import html_to_text
+import app.main as main_mod
 from app.main import app, state
 from conftest import ago, make_row
 
@@ -536,6 +538,43 @@ def test_get_article_and_flags(authed):
     assert authed.post(f"/api/articles/{aid}/star", json={"value": True}).json()["starred"] is True
     assert authed.get("/api/articles", params={"starred": True}).json()["items"][0]["id"] == aid
     assert authed.get("/api/articles/999999").status_code == 404
+
+
+def test_get_article_strips_stored_reading_time_lists(authed, monkeypatch):
+    """Vor der Bereinigung gespeicherte SPIEGEL-Artikel: Die Liste „3 Min / 6 Min“ fällt beim
+    Ausliefern weg, gespeichert (und in der Suche) bleibt der Text unverändert. Nur für die
+    betroffenen Quellen, nicht für Bezahlartikel und nicht für sehr lange Texte."""
+    _seed(1)
+    aid = state.db.one("SELECT id FROM articles")["id"]
+    stored = ("<p>Die Airlines sollen die Verfahren zu unterlassen.</p><ul><li>\n\n\n3 Min</li><li>\n\n\n6 Min</li>"
+              "<li>\n\n\n3 Min</li></ul><p>»Dass sich solche Fehler wiederholen, ist nicht hinnehmbar«.</p>")
+    cleaned = ("<p>Die Airlines sollen die Verfahren zu unterlassen.</p>"
+               "<p>»Dass sich solche Fehler wiederholen, ist nicht hinnehmbar«.</p>")
+    stored_text = html_to_text(stored)
+
+    def store(body_html, paywalled=False):
+        state.db.store_extraction(aid, status="full", body_html=body_html, body_text=html_to_text(body_html),
+                                  body_len=len(html_to_text(body_html)), paywalled=paywalled)
+
+    store(stored)
+    assert authed.get(f"/api/articles/{aid}").json()["body_html"] == stored   # Quelle alpha: nicht betroffen
+    monkeypatch.setattr(main_mod, "STORED_CLEANUP_SOURCES", frozenset({"alpha"}))
+    item = authed.get(f"/api/articles/{aid}").json()
+    assert item["body_html"] == cleaned
+    assert state.db.one("SELECT body_html, body_text FROM articles WHERE id=?", (aid,))["body_text"] == stored_text
+    assert state.db.one("SELECT body_html FROM articles WHERE id=?", (aid,))["body_html"] == stored
+    assert [i["id"] for i in authed.get("/api/articles", params={"q": "hinnehmbar"}).json()["items"]] == [aid]
+    # Echter Text mit „Min“ bleibt unverändert.
+    kept = "<p>Nach 3 Min war alles vorbei.</p><ul><li>3 Min Anfahrt</li><li>5 Min Fußweg</li></ul>"
+    store(kept)
+    assert authed.get(f"/api/articles/{aid}").json()["body_html"] == kept
+    # Über der Längengrenze: unbereinigt ausgeliefert.
+    monkeypatch.setattr(main_mod, "STORED_CLEANUP_MAX", len(stored) - 1)
+    store(stored)
+    assert authed.get(f"/api/articles/{aid}").json()["body_html"] == stored
+    # Bezahlartikel: gar kein Text.
+    store(stored, paywalled=True)
+    assert authed.get(f"/api/articles/{aid}").json()["body_html"] is None
 
 
 def test_cursor_with_unencoded_plus_and_canonical_form(authed):

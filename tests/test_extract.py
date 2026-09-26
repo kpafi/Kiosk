@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 
 import pytest
@@ -548,3 +549,208 @@ def test_single_huge_text_node_is_cut(filler):
     assert "danach" not in out and len(text) > MAX_BODY_HTML // 10
     import re
     assert not re.search(r"&[a-z]*</p>$", out)   # keine angeschnittene Entität
+
+
+# ---- Lesezeit-Etiketten und Bedienelemente (SPIEGEL „3 Min“) ------------------------
+
+def _spiegel_reading_time(minutes: int) -> str:
+    """Lesezeit mit Symbol und Merken-Knopf unter einem Teaser, wie auf spiegel.de."""
+    return ('<div class="mt-12 flex items-center sm:hidden justify-between">'
+            '<span class="flex flex-wrap items-center font-sansUI" data-contains-auxiliary-icons="Text">\n'
+            '<span data-icon-auxiliary="Text" class="flex items-center leading-none h-20">\n'
+            '<span class="mr-6"><svg width="16" height="16" aria-hidden="true"><use href="#spon-text-m"/></svg>\n'
+            f'</span>\n<span>{minutes} Min</span>\n</span>\n</span>\n'
+            '<button class="flex" data-component="BookmarkButton" data-area="bookmark_button"'
+            ' title="Zur Merkliste hinzufügen"><span class="sr-only">Zur Merkliste hinzufügen</span></button></div>')
+
+
+def _spiegel_teaser(n: int, minutes: int) -> str:
+    """„Mehr zum Thema“-Teaser mitten im Artikel: Überschrift als Link, Lesezeit (zweimal, für schmale
+    und breite Anzeige), Bild. trafilatura verwarf Überschrift und Bild, die Lesezeit blieb als
+    Listenpunkt stehen."""
+    href = f"https://www.spiegel.de/wirtschaft/teaser-{n}-a-0000{n}"
+    return (f'<li class="border-separator-secondary-b py-16" data-pos-inner="{n}"><div class="flex items-start">'
+            f'<div class="flex-1 min-w-0"><a href="{href}" title="Teaser {n}"><span class="block font-bold">'
+            f'<span class="align-middle">Verwandter Artikel {n}: Überschrift des Teasers</span></span></a>'
+            + _spiegel_reading_time(minutes) + f'</div><a href="{href}"><div><picture><img data-src="'
+            f'https://cdn.prod.www.spiegel.de/images/teaser-{n}_w240_r1.333.jpg" src="data:image/svg+xml,%3Csvg%3E'
+            '%3C/svg%3E" width="240" height="180" alt></picture></div></a></div>'
+            + _spiegel_reading_time(minutes) + '</li>')
+
+
+def _spiegel_text(pos: int, html: str) -> str:
+    return f'<div data-area="text" data-pos="{pos}"><div class="RichText">{html}</div></div>'
+
+
+SPIEGEL_TOOLBAR = (
+    '<ul class="flex items-center"><li><span x-data="{isLoading: false}">\n'
+    '<button type="button" class="font-sansUI leading-normal text-s" data-area="play_button"'
+    ' data-sara-click-el="button" title="Artikel anhören (3 Minuten)">\n'
+    '<span class="flex"><svg width="28" height="28" aria-hidden="true"><use href="#spon-rounded-audio-play-xl"/></svg>\n'
+    '</span>\n<span class="sr-only">Artikel anhören (3 Minuten)</span>\n'
+    '<span class="ml-6 leading-none" aria-hidden="true">3 Min</span>\n</button>\n</span>\n</li>\n'
+    '<li><button class="flex" data-component="BookmarkButton" data-area="bookmark_button" title="Zur Merkliste hinzufügen">'
+    '<span class="sr-only">Zur Merkliste hinzufügen</span></button></li></ul>')
+
+SPIEGEL_URL = "https://www.spiegel.de/wirtschaft/boeing-a-1"
+SPIEGEL_ARTICLE = (
+    '<!doctype html><html><head><meta charset="utf-8"><title>Boeing meldet Softwarefehler</title></head>'
+    '<body><main id="Inhalt"><article><header><h1>Boeing meldet Softwarefehler bei Pannen-Flugzeug</h1></header>'
+    '<div data-area="body">'
+    + _spiegel_text(2, "<p>Der Flugzeugbauer Boeing hat einen Fehler in der Software für die automatische "
+                       "Landenavigation gemeldet. Betroffen sind nach Angaben des Unternehmens mehrere Hundert "
+                       "Maschinen.</p>")
+    + _spiegel_text(4, "<p>Die Airlines wurden aufgefordert, bestimmte Anflugverfahren bis auf Weiteres zu "
+                       "unterlassen. Ingenieure arbeiteten an einer dauerhaften Lösung, teilte das Unternehmen "
+                       "mit.</p>")
+    + '<section data-area="related_articles" data-pos="8"><div><ul class="flex flex-col">'
+    + _spiegel_teaser(1, 3) + _spiegel_teaser(2, 6) + _spiegel_teaser(3, 3) + "</ul></div></section>"
+    + _spiegel_text(10, "<p>»Dass sich solche Fehler wiederholen, ist nicht hinnehmbar«, sagte ein Sprecher der "
+                        "Aufsichtsbehörde FAA. Boeing steht seit Jahren unter strenger Beobachtung.</p><p>Wie viele "
+                        "Flugzeuge derzeit mit dem fehlerhaften Programm im Einsatz sind, blieb zunächst unklar. Das "
+                        "Unternehmen kündigte ein Update innerhalb weniger Wochen an.</p>")
+    + "</div></article></main></body></html>")
+
+_MIN_LABEL_RE = re.compile(r"(?:^|\s)\d{1,3} Min(?:\s|$)")
+
+
+def test_spiegel_reading_times_and_buttons_are_not_extracted():
+    result = extract(SPIEGEL_ARTICLE.encode(), SPIEGEL_URL)
+    assert result.status == "full"
+    assert "Landenavigation" in result.body_text and "nicht hinnehmbar" in result.body_text
+    assert "Update innerhalb weniger Wochen" in result.body_text
+    assert not _MIN_LABEL_RE.search(result.body_text), result.body_text
+    assert "anhören" not in result.body_text and "Merkliste" not in result.body_text
+    assert "<li>" not in result.body_html and "<ul>" not in result.body_html
+
+
+def test_reading_time_backstop_works_without_precleaning(monkeypatch):
+    """Zweite Sicherung: Auch ohne Vorab-Bereinigung (etwa bei anderem Markup) bleibt keine Liste
+    „3 Min / 6 Min / 3 Min“ stehen."""
+    monkeypatch.setattr(extract_mod, "_precleaned", lambda page: page)
+    result = extract(SPIEGEL_ARTICLE.encode(), SPIEGEL_URL)
+    assert "Landenavigation" in result.body_text and "Update innerhalb weniger Wochen" in result.body_text
+    assert not _MIN_LABEL_RE.search(result.body_text) and "<li>" not in result.body_html
+
+
+def test_toolbar_list_inside_text_leaves_no_labels():
+    """Die Leiste mit „Artikel anhören (3 Minuten)“ und „3 Min“ direkt im Artikeltext."""
+    page = SPIEGEL_ARTICLE.replace('<div class="RichText"><p>Der', '<div class="RichText">' + SPIEGEL_TOOLBAR
+                                   + '<p>Der', 1)
+    assert page != SPIEGEL_ARTICLE
+    result = extract(page.encode(), SPIEGEL_URL)
+    assert "Landenavigation" in result.body_text
+    assert not _MIN_LABEL_RE.search(result.body_text) and "anhören" not in result.body_text
+
+
+def test_preclean_keeps_buttons_with_images_and_aria_hidden_content():
+    from app.extract import _precleaned
+    page = (b'<html><body><article><p>Text</p><button class="zoom"><img src="https://a.example/b.jpg"></button>'
+            b'<figure><img src="https://a.example/c.jpg"><figcaption aria-hidden="true">Echte Unterschrift'
+            b'</figcaption></figure><BUTTON>Teilen</BUTTON><span data-icon-auxiliary="Text">1 Min</span>'
+            b'<section data-area="related_articles"><a href="/x">Teaser</a></section></article></body></html>')
+    import lxml.html
+    out = lxml.html.tostring(_precleaned(page), encoding="unicode")
+    assert "b.jpg" in out and "Echte Unterschrift" in out
+    assert "Teilen" not in out and "1 Min" not in out and "Teaser" not in out
+    assert _precleaned(b"<html><body><p>Nichts zu tun</p></body></html>") == b"<html><body><p>Nichts zu tun</p></body></html>"
+
+
+def test_gea_placeholders_and_buttons_are_removed_together():
+    page = GEA_ARTICLE.replace("<p class=nfy-teaser>", "<button>Vorlesen</button><p class=nfy-teaser>")
+    result = extract(page.encode(), BASE)
+    assert result.paywalled is True and "Poetic Pop Festival" in result.body_text
+    assert "lorem" not in result.body_text.lower() and "Vorlesen" not in result.body_text
+
+
+@pytest.mark.parametrize("label", ["3 Min", " 12  Min. ", "3 Minuten", "45 min", "3 Min 3 Min",
+                                   "\n\n\n6 Min\n\n6 Min", "Artikel anhören", "Artikel anhören (3 Minuten)",
+                                   "<span>6</span> Min",
+                                   "<span>Artikel anhören (3 Minuten)</span>\n<span>3 Min</span>"])
+def test_reading_time_items_are_dropped(label):
+    html, text = sanitize(f"<p>Vorher.</p><ul><li>{label}</li><li>\n\n\n{label}</li></ul><p>Nachher.</p>", BASE)
+    assert html == "<p>Vorher.</p><p>Nachher.</p>"
+    assert text == "Vorher. Nachher."
+
+
+@pytest.mark.parametrize("label", ["Artikel anhören", "Artikel anhören (3 Minuten)",
+                                   "<span>Artikel anhören (3 Minuten)</span>\n<span>3 Min</span>"])
+def test_listen_label_paragraphs_are_dropped(label):
+    html, _ = sanitize(f"<p>Vorher.</p><p>{label}</p><p>Nachher.</p>", BASE)
+    assert html == "<p>Vorher.</p><p>Nachher.</p>"
+
+
+@pytest.mark.parametrize("para", ["90 Min", "3 Min", "45 min", "12 Minuten"])
+def test_bare_minutes_paragraph_is_kept(para):
+    """Ein Absatz „90 Min“ allein kann Inhalt sein (Liveticker); nur Listenpunkte fallen weg."""
+    html, _ = sanitize(f"<p>Vorher.</p><p>{para}</p>", BASE)
+    assert html == f"<p>Vorher.</p><p>{para}</p>"
+
+
+@pytest.mark.parametrize("keep", [
+    "<p>Nach 3 Min war alles vorbei.</p>",
+    "<ul><li>3 Min Anfahrt</li><li>5 Min Fußweg</li></ul>",
+    "<ul><li>Min</li><li>3 Minister</li><li>1000 Min</li></ul>",
+    "<p>Artikel anhören? Lieber lesen.</p>",
+    # Reine Linkliste ohne Lesezeit, Link mit weiterem Text, zwei Links mit Lesezeit
+    '<ul><li><a href="https://a.example/1">Erster Link</a></li><li><a href="https://a.example/2">Zweiter</a></li></ul>',
+    '<ul><li><a href="https://a.example/1">Fahrplan</a> 3 Min Fußweg</li></ul>',
+    '<ul><li><a href="https://a.example/1">Eins</a> <a href="https://a.example/2">Zwei</a> 3 Min</li></ul>',
+    '<ul><li>Vorwort <a href="https://a.example/1">Link</a> 3 Min</li></ul>',
+])
+def test_reading_time_rule_keeps_real_content(keep):
+    html, _ = sanitize(f"<p>Vorher.</p>{keep}", BASE)
+    expected = re.sub(r'(<a href="[^"]*")', r'\1 target="_blank" rel="noopener noreferrer"', keep)
+    assert html == f"<p>Vorher.</p>{expected}"
+
+
+def test_reading_time_items_leave_other_items_and_nested_lists_intact():
+    html, _ = sanitize("<ul><li>Echter Punkt</li><li>3 Min</li><li>Außen<ul><li>2 Min</li></ul></li></ul>", BASE)
+    assert html == "<ul><li>Echter Punkt</li><li>Außen</li></ul>"
+    html, _ = sanitize("<ol><li><p>3 Min</p></li></ol><p>Text.</p>", BASE)
+    assert html == "<p>Text.</p>"
+
+
+@pytest.mark.parametrize("nested", [
+    "<ul><li><ul><li>3 Min</li></ul></li></ul>",
+    "<ul><li><ol><li><ul><li>3 Min</li><li>6 Min</li></ul></li></ol></li></ul>",
+])
+def test_nested_reading_time_lists_vanish_in_one_call(nested):
+    from app.extract import strip_reading_times
+    html, _ = sanitize(f"<p>Text.</p>{nested}", BASE)
+    assert html == "<p>Text.</p>"
+    assert strip_reading_times(f"<p>Text.</p>{nested}") == "<p>Text.</p>"
+
+
+STORED_SPIEGEL = ("<p>Die Airlines sollen die Verfahren zu unterlassen.</p><ul><li>\n\n\n3 Min</li><li>\n\n\n6 Min</li>"
+                  "<li>\n\n\n3 Min</li></ul><p>»Dass sich solche Fehler wiederholen, ist nicht hinnehmbar«.</p>")
+
+
+def test_strip_reading_times_cleans_stored_bodies():
+    from app.extract import strip_reading_times
+    assert strip_reading_times(STORED_SPIEGEL) == (
+        "<p>Die Airlines sollen die Verfahren zu unterlassen.</p>"
+        "<p>»Dass sich solche Fehler wiederholen, ist nicht hinnehmbar«.</p>")
+    for unchanged in (None, "", "<p>Ohne Etikett.</p><ul><li></li></ul>", "<p>Nach 3 Min war alles vorbei.</p>",
+                      "<p>90 Min</p>"):
+        assert strip_reading_times(unchanged) == unchanged
+    assert strip_reading_times("<p>Text.</p><ul><li>3 MIN</li></ul>") == "<p>Text.</p>"
+
+
+# So speicherte die alte Extraktion Teaser aus „Mehr zum Thema“: Überschrift als Link, danach die
+# Lesezeit doppelt (schmale und breite Anzeige); daneben ein zweiter Teaser.
+STORED_SPIEGEL_TEASERS = (
+    '<p>Die Gewerkschaften lehnen die Pläne ab.</p><ul><li>\n<a href="https://www.spiegel.de/wirtschaft/service/'
+    'rente-krankenkasse-pflege-was-die-reformen-der-bundesregierung-fuer-sie-bedeuten-a-3d9698a3-583f-4046-8599-'
+    '4956fd936ed2" target="_blank" rel="noopener noreferrer">\nRente, Krankenkasse, Pflege: Was die Reformen der '
+    'Regierung für Sie bedeuten\nEine Kolumne von Hermann-Josef Tenhagen\n\n</a>\n\n\n6 Min\n\n6 Min</li><li>\n'
+    '<a href="https://www.spiegel.de/wirtschaft/aufschwung-a-1" target="_blank" rel="noopener noreferrer">\n'
+    '<strong>Wirtschaft in Deutschland:</strong> Ist der Aufschwung endlich da?</a>\n13 Min\n\n13 Min</li></ul>'
+    '<p>Deutschlands Arbeitgeber warfen dem DGB »rituelle Reformverweigerung« vor.</p>')
+
+
+def test_strip_reading_times_drops_stored_teaser_items():
+    from app.extract import strip_reading_times
+    assert strip_reading_times(STORED_SPIEGEL_TEASERS) == (
+        "<p>Die Gewerkschaften lehnen die Pläne ab.</p>"
+        "<p>Deutschlands Arbeitgeber warfen dem DGB »rituelle Reformverweigerung« vor.</p>")

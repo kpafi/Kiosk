@@ -23,6 +23,7 @@ from .auth import (COOKIE_NAMES, INVALID_NAME_KEY, LOGIN_ERROR, Auth, burn_time,
                    verify_password)
 from .config import docs_enabled, load_settings
 from .db import Database, QueryTimeout, _iso, utcnow
+from .extract import strip_reading_times
 from .fetcher import Fetcher
 from .sources import Catalog
 from .state import State, state  # noqa: F401  (State für Importe von außen)
@@ -38,6 +39,10 @@ OPEN_PATHS = {"/healthz", "/api/login", "/api/session", "/api/build", "/", "/ind
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 MAX_SOURCE_IDS = 200        # höchstens so viele Quellen-IDs pro Anfrage (Query oder Body)
 STALL_GRACE = timedelta(minutes=10)
+# Quellen, deren gespeicherte Texte get_article beim Ausliefern von Lesezeit-Listen bereinigt (nur
+# SPIEGEL war betroffen), und die Länge, bis zu der es das tut (längere gehen unbereinigt raus).
+STORED_CLEANUP_SOURCES = frozenset({"spiegel"})
+STORED_CLEANUP_MAX = 100_000
 RUN_MAX = timedelta(hours=3)            # so lange darf ein einzelner Sammellauf höchstens dauern
 WATCHDOG_INTERVAL = 60                  # Sekunden zwischen zwei Prüfungen des Wachhunds
 WATCHDOG_EXIT_CODE = 3
@@ -609,6 +614,11 @@ async def get_article(article_id: int = PathParam(ge=1, le=MAX_ID), retry: bool 
     if item["paywalled"]:
         # Bezahlartikel: keinen Text ausliefern, die Oberfläche zeigt nur Hinweis und Original.
         item.update(body_html=None, body_text=None, summary="", paywalled=1, read_minutes=0)
+    elif item["source_id"] in STORED_CLEANUP_SOURCES and len(item.get("body_html") or "") <= STORED_CLEANUP_MAX:
+        # Vor der Bereinigung gespeicherte SPIEGEL-Artikel (Liste „3 Min / 6 Min“ aus „Mehr zum Thema“-
+        # Kästen) beim Ausliefern bereinigen statt die Datenbank umzuschreiben. Nur body_html: body_text
+        # liest die Oberfläche nicht; Suche (FTS) und Lesezeit bleiben beim gespeicherten Stand.
+        item["body_html"] = strip_reading_times(item["body_html"])
     return item
 
 

@@ -132,3 +132,146 @@ export function cleanText(text, title) {
   if (title && low === String(title).trim().toLowerCase()) return '';
   return t;
 }
+
+// ---- Bild-Schlüssel: dasselbe Bild in anderer Größe erkennen -------------------------------
+// Gleiche Regeln wie image_key() in app/extract.py (beide Stellen gemeinsam ändern!):
+//  1. Fragment (#…) und Schema (http:// bzw. https://, //) weg; nur der Host wird klein geschrieben,
+//     Pfad und Query bleiben, wie sie sind (Bild-IDs können Groß-/Kleinschreibung unterscheiden).
+//  2. Query (?…): bleibt, nur ohne Größen- und Signatur-Parameter (w, width, h, height, q, quality,
+//     dpr, fit, resize, func, org_if_sml, auto, format, fm, s, sig, itok, smart; Name ohne Beachtung
+//     der Schreibung). Zuschnitt-Parameter (crop, rect, im) entfernt nur der Browser (Standard,
+//     strict = false: für die Anzeige ist ein anderer Ausschnitt dasselbe Bild); mit strict = true
+//     bleiben sie wie beim Server (image_key, Standard strict=True), der dadurch kein Bild verliert.
+//     Steht bei einem Pfad ohne Bild-Endung in url= oder src= eine URL (absolut oder mit / beginnend,
+//     dann auf dem Host der äußeren URL), ist deren Schlüssel der Schlüssel (Bild-Proxys wie
+//     /_next/image?url=…&w=640), höchstens 5 Ebenen tief; die übrigen Parameter der äußeren URL
+//     (ohne Größen-Parameter) werden angehängt, außer die innere URL hat eine Bild-Endung
+//     (/thumb?src=/v.mp4&t=10 und &t=50 sind verschiedene Bilder).
+//  3. Pfadsegmente, die nur eine Größe angeben, weg: /w960/, /h540/ (mind. zwei Ziffern), /1024x683/.
+//  4. Im Dateinamen die Endung(en) weg (.jpg, .JPG, .jpg.webp …), dann Größen-Token weg:
+//     _w960 bzw. -w960, _1024x683 bzw. -1024x683, @2x, -scaled; die Spiegel-Zuschnitte _r1.5,
+//     _fpx43.2, _fpy41 nur, wenn der Dateiname auch ein _w960-Token hat (Token enden an _ - . @
+//     oder am Namensende).
+//  Schlüssel = { full: Host+Pfad[+?Query], base: bereinigter Dateiname falls ≥ 8 Zeichen, sonst '' }.
+//  Der Server wertet nur gleiche Schlüssel als gleiches Bild; die unscharfe Erkennung unten
+//  (sameImage) gibt es nur hier im Browser.
+const SIZE_DIR_RE = /\/(?:[wh]\d{2,}|\d+x\d+)(?=\/)/g;
+const SIZE_TOKEN_RE = /(?:[_-]w\d+|[_-]\d+x\d+|@\d+x|-scaled)(?=[_.@-]|$)/g;
+const WIDTH_TOKEN_RE = /_w\d+(?=[_.@-]|$)/;
+const CROP_TOKEN_RE = /(?:_r\d+(?:\.\d+)?|_fp[xy]\d+(?:\.\d+)?)(?=[_.@-]|$)/g;
+const IMAGE_EXT_RE = /\.(?:jpe?g|png|webp|gif|avif)$/i;
+const EXT_RE = /(?:\.(?:jpe?g|png|webp|gif|avif))+$|\.[a-z][a-z0-9]{1,4}$/i;
+const SIZE_PARAMS = new Set(['w', 'width', 'h', 'height', 'q', 'quality', 'dpr', 'fit', 'resize',
+  'func', 'org_if_sml', 'auto', 'format', 'fm', 's', 'sig', 'itok', 'smart']);
+const CROP_PARAMS = new Set(['crop', 'rect', 'im']);   // nur ohne strict entfernt (siehe oben)
+const URL_PARAM_RE = /^(?:(?:https?:)?\/\/|\/)/i;
+const IMAGE_BASE_MIN = 8;
+const URL_PARAM_DEPTH = 5;
+
+/** Nur ASCII-Leerraum abschneiden (JS trim() und Python strip() unterscheiden sich). */
+const trimSpace = (v) => v.replace(/^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g, '');
+
+/** %XX-Folgen dekodieren wie Pythons unquote(); kaputte Folgen bleiben stehen. */
+function unquote(v) {
+  return v.replace(/(?:%[0-9a-f]{2})+/gi, (m) => { try { return decodeURIComponent(m); } catch { return m; } });
+}
+
+/** Schlüssel einer Bild-URL: { full: Host+Pfad[+?Query] bereinigt, base: bereinigter Dateiname oder '' }.
+ *  strict = true behält Zuschnitt-Parameter (wie der Server). */
+export function imageKey(url, strict = false, depth = 0) {
+  const raw = trimSpace(String(url || ''))
+    .replace(/#[^]*$/, '').replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').replace(/^\/\//, '');
+  const q = raw.indexOf('?');
+  let path = q === -1 ? raw : raw.slice(0, q);
+  const query = q === -1 ? '' : raw.slice(q + 1);
+  const slash = path.indexOf('/');
+  const host = (slash === -1 ? path : path.slice(0, slash)).toLowerCase();
+  path = host + (slash === -1 ? '' : path.slice(slash));
+  const drop = (name) => SIZE_PARAMS.has(name) || (!strict && CROP_PARAMS.has(name));
+  const kept = [];
+  let inner = null;
+  for (const part of query ? query.split('&') : []) {
+    const eq = part.indexOf('=');
+    const name = (eq === -1 ? part : part.slice(0, eq)).toLowerCase();
+    if (inner === null && (name === 'url' || name === 'src') && !IMAGE_EXT_RE.test(path) && depth < URL_PARAM_DEPTH) {
+      let candidate = trimSpace(unquote(eq === -1 ? '' : part.slice(eq + 1)));
+      if (URL_PARAM_RE.test(candidate)) {
+        if (candidate.startsWith('/') && !candidate.startsWith('//')) candidate = host + candidate;   // relativ: Host der äußeren URL
+        inner = candidate;
+        continue;
+      }
+    }
+    if (part && !drop(name)) kept.push(part);
+  }
+  if (inner !== null) {
+    const key = imageKey(inner, strict, depth + 1);
+    if (kept.length && !IMAGE_EXT_RE.test(inner.replace(/[?#][^]*$/, ''))) {
+      key.full += (key.full.includes('?') ? '&' : '?') + kept.join('&');
+    }
+    return key;
+  }
+  const cut = path.lastIndexOf('/');
+  const dir = path.slice(0, cut + 1).replace(SIZE_DIR_RE, '');
+  let stem = path.slice(cut + 1).replace(EXT_RE, '');
+  if (WIDTH_TOKEN_RE.test(stem)) stem = stem.replace(CROP_TOKEN_RE, '');
+  stem = stem.replace(SIZE_TOKEN_RE, '');
+  const full = dir + stem + (kept.length ? `?${kept.join('&')}` : '');
+  return { full, base: stem.length >= IMAGE_BASE_MIN ? stem : '' };
+}
+
+// Unscharf (nur im Browser): gleiche Website (registrierbare Domain), gleich viele Pfadsegmente,
+// gleiche Query, gleicher bereinigter Dateiname (≥ 8 Zeichen, Varianten-Endungen wie
+// -superJumbo/-articleLarge abgeschnitten) und jedes abweichende Segment ist ein Größen-/
+// Zuschnitt-Token (/1024/ statt /480/, /Img_16_9/ statt /Img_4_3/, /master/ …).
+const SIZE_SEG_RE = /^(?:\d+x\d+(?:-\w+)?|[wh]\d+|\d{1,4}|img_\d+_\d+|master|thumb|small|medium|large|xlarge|articlelarge|superjumbo)$/i;
+const VARIANT_RE = /-(?:master|thumb|small|medium|large|xlarge|articlelarge|superjumbo|jumbo)(?:\d+)?$/i;
+const NUM_SEG_RE = /^\d{1,4}$/;
+const SECOND_LEVEL_RE = /^(?:co|com|org|net|gov|ac)$/;
+
+/** Registrierbare Domain: letzte zwei Labels, drei bei co.uk, com.au, org.uk … */
+function siteOf(host) {
+  const labels = host.split('.');
+  const n = labels.length >= 3 && SECOND_LEVEL_RE.test(labels[labels.length - 2]) ? 3 : 2;
+  return labels.slice(-n).join('.');
+}
+
+function fuzzySame(a, b) {
+  const [pathA, queryA = ''] = a.full.split('?');
+  const [pathB, queryB = ''] = b.full.split('?');
+  if (queryA !== queryB) return false;
+  const sa = pathA.split('/'), sb = pathB.split('/');
+  if (sa.length !== sb.length || sa.length < 2 || siteOf(sa[0]) !== siteOf(sb[0])) return false;   // [0] = Host
+  const stemA = sa.pop().replace(VARIANT_RE, ''), stemB = sb.pop().replace(VARIANT_RE, '');
+  if (stemA !== stemB || stemA.length < IMAGE_BASE_MIN) return false;
+  let differs = false, onlyNumbers = true;
+  for (let i = 1; i < sa.length; i++) {
+    if (sa[i] === sb[i]) continue;
+    if (!SIZE_SEG_RE.test(sa[i]) || !SIZE_SEG_RE.test(sb[i])) return false;
+    differs = true;
+    if (!NUM_SEG_RE.test(sa[i]) || !NUM_SEG_RE.test(sb[i])) onlyNumbers = false;
+  }
+  // Nur Zahlen-Ordner verschieden (2025/10 statt 2026/09), Dateiname ohne Ziffern („screenshot“) und
+  // kein gemeinsames Pfadsegment mit Ziffern (Bild-ID wie taz /picture/8763231/948/): eher ein
+  // anderes Bild gleichen Namens als eine andere Größe.
+  if (differs && onlyNumbers && !/\d/.test(stemA)) return sa.some((seg, i) => i > 0 && seg === sb[i] && /\d/.test(seg));
+  return true;
+}
+
+/** true, wenn beide URLs dasselbe Bild (ggf. in anderer Größe) zeigen: gleicher Schlüssel oder unscharf gleich. */
+export function sameImage(a, b) {
+  const ka = imageKey(a), kb = imageKey(b);
+  if (!ka.full || !kb.full) return false;
+  return ka.full === kb.full || fuzzySame(ka, kb);
+}
+
+// Kleines Bild laut URL (Breite < 200 px; _w120, w_64 in Bild-Diensten, /80x80/, width=, dimensions=): Autorenfoto, Wappen, Symbol. Wird nie als Duplikat
+// entfernt und nie zum Titelbild. Gleiche Regel wie is_small_image_url() in app/extract.py.
+const SMALL_URL_RE = /_w(\d+)(?=[_.@-]|$)|(?:,|%2c|\/)w_(\d+)|\/(\d{2,3})x\d{2,3}\/|[?&](?:width|dimensions)=(\d+)/g;
+const SMALL_MAX = 200;
+
+export function isSmallImageUrl(url) {
+  for (const m of String(url || '').toLowerCase().matchAll(SMALL_URL_RE)) {
+    if (Number(m[1] || m[2] || m[3] || m[4]) < SMALL_MAX) return true;
+  }
+  return false;
+}

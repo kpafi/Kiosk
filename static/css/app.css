@@ -352,6 +352,8 @@ mark {
   /* Nach der Grundregel, sonst gewinnt diese: 24px seitlich in der 520px-Spalte, 20px unten (Mockup). */
   #bar { left: 24px; right: auto; width: calc(520px - 48px); bottom: 20px; }
 }
+/* Harte Kante statt Blende (Markenbuch: keine Verläufe/Transparenz); Einrasten, damit kein Chip
+   mitten im Buchstaben liegen bleibt. */
 .bar-scroll {
   flex: 1 1 auto;
   min-width: 0;
@@ -360,13 +362,10 @@ mark {
   overflow-x: auto;
   scrollbar-width: none;
   align-items: center;
+  scroll-snap-type: x proximity;
+  scroll-padding-inline: 12px;
 }
 .bar-scroll::-webkit-scrollbar { display: none; }
-/* Rechts versteckte Chips: Rand weich ausblenden, damit kein Name mitten im Buchstaben vor dem + endet. */
-.bar-scroll.fade-end {
-  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
-  mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
-}
 .bar-chip {
   display: inline-flex;
   align-items: center;
@@ -388,6 +387,7 @@ mark {
   -webkit-user-select: none;
   user-select: none;
   -webkit-touch-callout: none;
+  scroll-snap-align: start;
 }
 .bar-chip--all { padding: 0 16px; }
 .bar-chip.is-on { background: var(--ink); border-color: var(--ink); color: var(--on-ink); }
@@ -562,9 +562,10 @@ mark {
 
 /* ---- Leseansicht ---------------------------------------------------------- */
 .art {
+  --art-gap: var(--space-4);
   display: flex;
   flex-direction: column;
-  gap: var(--space-4);
+  gap: var(--art-gap);
   padding: 12px var(--gutter) 48px;
   max-width: var(--measure);
   margin: 0 auto;
@@ -628,8 +629,12 @@ mark {
 .article-body blockquote { padding-left: var(--space-4); border-left: 2px solid var(--rule); }
 .article-body img, .article-body video { max-width: 100%; height: auto; border-radius: var(--radius-md); display: block; }
 .article-body figure { margin-left: 0; margin-right: 0; }
+.art > .art-caption,
 .article-body .art-caption,
-.article-body figcaption { font-family: var(--font-mono); font-size: 12px; line-height: 16px; color: var(--muted); margin-top: var(--space-2); text-transform: uppercase; }
+.article-body figcaption { font-family: var(--font-mono); font-size: 12px; line-height: 16px; letter-spacing: 0.02em; color: var(--muted); margin-top: var(--space-2); text-transform: uppercase; }
+/* Bildzeile unter dem Titelbild: 8px Abstand statt der Spalten-Lücke (gap) von .art. */
+.art > .art-caption { margin: calc(var(--space-2) - var(--art-gap)) 0 0; }
+.article-body figure + *, .article-body figcaption + * { margin-top: 8px; }
 .article-body a { color: var(--ink); text-decoration: underline; text-underline-offset: 2px; }
 .article-body table { border-collapse: collapse; display: block; overflow-x: auto; }
 .article-body td, .article-body th { border-top: 1px solid var(--hairline); padding: 6px 8px; text-align: left; }
@@ -638,7 +643,7 @@ mark {
 
 @media (min-width: 900px) {
   .art-hdr { padding: 20px 40px 10px; }
-  .art { gap: 18px; padding: 12px 40px 64px; margin: 0; }
+  .art { --art-gap: 18px; padding: 12px 40px 64px; margin: 0; }
   .art-title { font-size: calc(32px * var(--scale)); line-height: calc(38px * var(--scale)); }
 }
 

@@ -3,7 +3,9 @@ import { h, hint, isDesktop, replace } from '../ui/dom.js';
 import { arrowRight, back, bookmark, checkCheck, external, star } from '../ui/icons.js';
 import { iconButton } from '../ui/header.js';
 import { markOpenRow } from '../ui/row.js';
-import { articleTime, cleanText, listTime, readMinutes } from '../format.js';
+import {
+  articleTime, cleanText, isSmallImageUrl, listTime, readMinutes, sameImage,
+} from '../format.js';
 import { api } from '../api.js';
 import {
   emit, goBack, on, replaceHash, setFlag, sourceLabel, state,
@@ -65,13 +67,208 @@ function dropPaywalledRow(id) {
   emit('unread-changed');
 }
 
-const CAPTION_RE = /^\s*(Foto|Bild|Fotos|Bilder|Photo|Image)\s*:/i;
+// Gleiche Regel wie CAPTION_RE in app/extract.py.
+const CAPTION_RE = /^\s*(?:Fotos?|Bilder?|Quelle|Photo|Image)\s*:/i;
+// Bildunterschrift, die mit der Bildquelle endet („… Foto: dpa“, „… Bild: AP“).
+const CREDIT_END_RE = /(?:Fotos?|Bilder?)\s*:\s*[^:]{1,80}$/i;
+const CREDIT_START_RE = /^\s*(?:Fotos?|Bilder?)\s*:/i;
+const CAPTION_MAX = 160;   // längere Absätze sind Artikeltext
+const CREDIT_MAX = 80;     // Absatz, der nach einem losen „Foto:“ nur die Quelle nennt
+const SHORT_P_MAX = 40;    // Rubrik-/Leerabsatz („War“, „Prefer“): kürzer als 40 Zeichen
+// Bildzeile direkt unter dem Titelbild auch ohne „Foto:“, wenn sie kurz ist und eine Bildquelle nennt
+// („… Teresa Suarez/AP POOL“). Nur ganze Wörter, damit z. B. „Kapitel“ nicht als „AP“ zählt.
+const HERO_CREDIT_RE = /\b(?:AP|dpa|Reuters|Getty|AFP|EPA|Bloomberg|imago|POOL|Photo|Foto|Bild)\b/i;
+const HERO_CAPTION_MAX = 200;
+const HERO_MIN_WIDTH = 300;   // kleineres Feed-Bild (Vorschau) wird nicht hochskaliert, sondern weggelassen
+
+/** Leerer oder kurzer Rubrik-Absatz ohne Bild. */
+function isFiller(node) {
+  return node.tagName === 'P' && !node.querySelector('img') && (node.textContent || '').trim().length < SHORT_P_MAX;
+}
+
+/** Absatz direkt nach einem Bild (auch nach dem Absatz/Link, der nur das Bild umschließt). */
+function paragraphAfter(node) {
+  let next = node.nextElementSibling;
+  if (!next && node.parentElement && node.parentElement.tagName !== 'DIV') next = node.parentElement.nextElementSibling;
+  return next && next.tagName === 'P' ? next : null;
+}
+
+/** Kurzer Absatz ohne Bild, der eine Bildquelle nennt (Bildzeile unter dem Titelbild). */
+function isCreditCaption(p) {
+  const text = (p.textContent || '').replace(/\s+/g, ' ').trim();
+  return !p.querySelector('img') && text.length < HERO_CAPTION_MAX && HERO_CREDIT_RE.test(text);
+}
 
 /** Absatz direkt nach einem Bild, der nur die Bildquelle nennt („Foto: …“). */
 function captionAfter(node) {
-  let next = node.nextElementSibling;
-  if (!next && node.parentElement && node.parentElement.tagName !== 'DIV') next = node.parentElement.nextElementSibling;
-  return next && next.tagName === 'P' && CAPTION_RE.test(next.textContent || '') ? next : null;
+  const next = paragraphAfter(node);
+  return next && CAPTION_RE.test(next.textContent || '') ? next : null;
+}
+
+/** Kurzer Absatz nach einem Bild, der mit der Bildquelle endet oder dem sie lose folgt (Spiegel:
+ *  „<p>Bildtext</p>Foto: dpa“ bzw. „<p>Bildtext</p>Foto:<p>dpa</p>“), wird als Bildzeile gesetzt;
+ *  die lose Quelle kommt mit hinein. */
+function markCaption(img) {
+  const p = paragraphAfter(img);
+  if (!p || p.querySelector('img')) return;
+  const text = (p.textContent || '').trim();
+  if (!text || text.length >= CAPTION_MAX) return;
+  const loose = p.nextSibling && p.nextSibling.nodeType === Node.TEXT_NODE && CREDIT_START_RE.test(p.nextSibling.textContent)
+    ? p.nextSibling : null;
+  if (!loose && !CAPTION_RE.test(text) && !CREDIT_END_RE.test(text)) return;
+  p.classList.add('art-caption');
+  if (!loose) return;
+  let credit = loose.textContent.trim();
+  const source = p.nextElementSibling;
+  if (/:$/.test(credit) && loose.nextSibling === source && source && source.tagName === 'P'
+      && !source.querySelector('img') && (source.textContent || '').trim().length < CREDIT_MAX) {
+    credit += ` ${source.textContent.trim()}`;
+    source.remove();
+  }
+  p.append(` ${credit}`);
+  loose.remove();
+}
+
+/** Bild samt Bildquellen-Absatz entfernen; dabei leer gewordene <figure>, <p>, <a> mitnehmen. */
+function removeImage(img) {
+  captionAfter(img)?.remove();
+  let node = img.parentElement;
+  img.remove();
+  while (node && ['FIGURE', 'P', 'A'].includes(node.tagName)) {
+    const empty = !node.querySelector('img') && (node.tagName === 'FIGURE' || !node.textContent.trim());
+    if (!empty) break;
+    const up = node.parentElement;
+    node.remove();
+    node = up;
+  }
+}
+
+/** Bild direkt davor im selben Elternelement (nur Überschriften dazwischen, Spiegel: Autorenfoto,
+ *  Überschrift, Autorenfoto) bzw. letztes Bild im direkt vorangehenden Element; ein Absatz/Link, der
+ *  nur das Bild umschließt, zählt wie das Bild. */
+function previousImage(img) {
+  let node = img;
+  while (!node.previousElementSibling && node.parentElement && ['P', 'A', 'FIGURE'].includes(node.parentElement.tagName)
+    && !node.parentElement.textContent.trim()) node = node.parentElement;
+  let prev = node.previousElementSibling;
+  while (prev && /^H[1-6]$/.test(prev.tagName)) prev = prev.previousElementSibling;
+  if (!prev) return null;
+  if (prev.tagName === 'IMG') return prev;
+  const inner = prev.querySelectorAll('img');
+  return inner.length ? inner[inner.length - 1] : null;
+}
+
+/** Dasselbe Bild in anderer Größe (Regeln bei imageKey in format.js) nur beim ersten Vorkommen zeigen.
+ *  Kleine Bilder (Wappen, Autorenfotos) wiederholen sich absichtlich und bleiben, außer dasselbe Bild
+ *  steht direkt davor in anderer Größe (Spiegel: Autorenfoto in 96 und 72 px). */
+function dropDuplicateImages(frag) {
+  const seen = [];
+  for (const img of [...frag.querySelectorAll('img')]) {
+    const src = img.getAttribute('src');
+    if (isSmallImageUrl(src)) {
+      const prev = previousImage(img);
+      const prevSrc = prev && prev.getAttribute('src');
+      if (prevSrc && prevSrc !== src && sameImage(prevSrc, src)) removeImage(img);
+      continue;
+    }
+    if (seen.some((s) => sameImage(s, src))) removeImage(img);
+    else seen.push(src);
+  }
+}
+
+/** Kleines Bild (Autorenfoto, Symbol): laut URL oder width/height unter 200 px oder Alt-Text = Autor. */
+function isSmallImage(img, author) {
+  const dim = (name) => Number(img.getAttribute(name)) || 0;
+  if (isSmallImageUrl(img.getAttribute('src'))) return true;
+  if ((dim('width') && dim('width') < 200) || (dim('height') && dim('height') < 200)) return true;
+  const alt = (img.getAttribute('alt') || '').trim().toLowerCase();
+  return !!author && alt === author.trim().toLowerCase();
+}
+
+// Feed-Bild als Vorschau (Guardian ?width=140, BBC /240/, n-tv /250/): Breite unter 400 px.
+const LOW_RES_RE = /\/(\d{3})\/|[?&]width=(\d+)/g;   // dreistellig: keine Monats-/Tagesordner
+const LOW_RES_MAX = 400;
+function isLowResUrl(url) {
+  if (isSmallImageUrl(url)) return true;
+  for (const m of String(url || '').toLowerCase().matchAll(LOW_RES_RE)) {
+    if (Number(m[1] || m[2]) < LOW_RES_MAX) return true;
+  }
+  return false;
+}
+
+/** Bild, mit dem der Text beginnt: erstes Element nach leeren und kurzen Rubrik-Absätzen ist <img>
+ *  oder <figure> (auch ein <p>/<a> ohne Text, das nur das Bild umschließt). */
+function leadingImage(bodyEl) {
+  let node = bodyEl.firstElementChild;
+  while (node && isFiller(node)) node = node.nextElementSibling;
+  while (node && ['P', 'A'].includes(node.tagName) && !node.textContent.trim() && node.children.length === 1) {
+    node = node.firstElementChild;
+  }
+  if (!node) return null;
+  if (node.tagName === 'IMG') return node;
+  return node.tagName === 'FIGURE' ? node.querySelector('img') : null;
+}
+
+const TITLE_ECHO_WITHIN = 4;   // nur unter den ersten vier Elementen
+const TITLE_ECHO_EXTRA = 20;   // „Rubrik • Titel“: höchstens 20 Zeichen mehr als der Titel
+const TITLE_ECHO_MIN = 12;     // „enthält den Titel“ nur bei Titeln ab 12 Zeichen
+const TITLE_ECHO_PART = 0.6;   // Teil des Titels (Überschrift bzw. Kern nach „: “): mind. 60 % der Länge
+const normTitle = (t) => (t || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+
+/** Überschriften (H1–H3) und Absätze am Textanfang, die nur den Titel wiederholen, entfallen samt
+ *  direkt davor stehender kurzer Rubrik- oder Leerabsätze. Als Wiederholung zählt eine Überschrift,
+ *  die dem Titel gleicht, ihn (mit höchstens 20 Zeichen Rubrik) enthält, ein großer Teil von ihm ist
+ *  oder seinen Kern nach dem letzten „: “ enthält (Feed „Österreich: Wie die FPÖ …“, Überschrift
+ *  „meinung • Die Lage: Inside Austria Wie die FPÖ …“); ein Absatz nur, wenn er genau dem Titel oder
+ *  dem Kern gleicht. */
+function dropTitleEcho(bodyEl, title) {
+  const t = normTitle(title);
+  if (!t) return;
+  const cut = (title || '').lastIndexOf(': ');
+  const core = cut === -1 ? '' : normTitle(title.slice(cut + 2));
+  const hasCore = core.length >= TITLE_ECHO_MIN && core.length >= t.length * TITLE_ECHO_PART;
+  const isEcho = (el) => {
+    const n = normTitle(el.textContent);
+    if (!n) return false;
+    if (el.tagName === 'P') return !el.querySelector('img') && (n === t || (hasCore && n === core));
+    if (!/^H[1-3]$/.test(el.tagName)) return false;
+    if (n === t || (hasCore && n.includes(core))) return true;
+    if (t.length < TITLE_ECHO_MIN) return false;
+    return (n.includes(t) && n.length - t.length <= TITLE_ECHO_EXTRA)
+      || (t.includes(n) && n.length >= t.length * TITLE_ECHO_PART);
+  };
+  for (const echo of [...bodyEl.children].slice(0, TITLE_ECHO_WITHIN).filter(isEcho)) {
+    while (echo.previousElementSibling && isFiller(echo.previousElementSibling)) echo.previousElementSibling.remove();
+    echo.remove();
+  }
+}
+
+/** Ein Bild am Textanfang wird Titelbild: davor übersprungene Rubrik-/Leerabsätze entfallen, und ein
+ *  kurzer Absatz direkt danach, der eine Bildquelle nennt, wird als Bildzeile gesetzt. */
+function adoptLeadImage(bodyEl, lead) {
+  while (bodyEl.firstElementChild && isFiller(bodyEl.firstElementChild)) bodyEl.firstElementChild.remove();
+  const p = paragraphAfter(lead);
+  if (p && isCreditCaption(p)) p.classList.add('art-caption');
+}
+
+/**
+ * Titelbild oben: { src, copies } oder null (kein Feed-Bild, oder der Text beginnt mit einem großen
+ * Bild; das ist dann das Titelbild und trägt ggf. die Bildunterschrift, siehe adoptLeadImage). Sonst steht das Feed-Bild
+ * oben; dasselbe Bild im Text (copies) wird entfernt, sobald das Titelbild geladen ist. Ist das
+ * Feed-Bild nur eine Vorschau und steht dasselbe Bild groß im Text, wird oben die große Fassung
+ * gezeigt. Kleine Bilder (Autorenfoto) werden nie Titelbild.
+ */
+export function planHero(bodyEl, imageUrl, author) {
+  const big = (img) => !isSmallImage(img, author);
+  const lead = bodyEl ? leadingImage(bodyEl) : null;
+  if (lead && big(lead)) {
+    adoptLeadImage(bodyEl, lead);
+    return null;
+  }
+  if (!imageUrl) return null;
+  const copies = bodyEl ? [...bodyEl.querySelectorAll('img')].filter((i) => sameImage(i.getAttribute('src'), imageUrl)) : [];
+  const large = isLowResUrl(imageUrl) ? copies.find(big) : null;
+  return { src: large ? large.getAttribute('src') : imageUrl, copies };
 }
 
 /**
@@ -79,15 +276,17 @@ function captionAfter(node) {
  * dann einfügen: Links in neuem Tab, Bilder faul und ohne Referrer oder (show_images aus) entfernt.
  * Einzige HTML-Stelle: body_html ist serverseitig auf eine Whitelist bereinigt.
  */
-function buildBody(html) {
+export function buildBody(html, title) {
   const tpl = document.createElement('template');
   tpl.innerHTML = html;
   const frag = tpl.content;
+  dropDuplicateImages(frag);
   for (const a of frag.querySelectorAll('a')) {
     a.target = '_blank';
     a.rel = 'noopener noreferrer';
   }
   for (const img of frag.querySelectorAll('img')) {
+    markCaption(img);
     const caption = captionAfter(img);
     if (!state.settings.show_images) {
       if (caption) caption.classList.add('art-caption');   // Bildquelle ohne Bild: als Bildzeile
@@ -104,6 +303,7 @@ function buildBody(html) {
   }
   const bodyEl = h('div', { class: 'article-body t-article' });
   bodyEl.append(frag);
+  dropTitleEcho(bodyEl, title);
   return bodyEl;
 }
 
@@ -178,24 +378,40 @@ export function articleView(id) {
     if (item.paywalled) {
       parts.push(h('div', { class: 'art-note t-caption', text: 'Bezahlartikel werden nicht angezeigt' }));
     } else if (item.body_html) {
-      bodyEl = buildBody(item.body_html);
+      bodyEl = buildBody(item.body_html, item.title);
     }
 
-    // Überschrift am Textanfang, die nur den Titel wiederholt, entfällt.
-    const norm = (t) => (t || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
-    const firstEl = bodyEl && bodyEl.firstElementChild;
-    if (firstEl && /^H[1-3]$/.test(firstEl.tagName) && norm(firstEl.textContent) === norm(item.title)) firstEl.remove();
-
-    // Titelbild nur, wenn der Text nicht selbst mit einem Bild beginnt oder es enthält.
-    const base = (u) => { try { return new URL(u).pathname.split('/').pop(); } catch { return u; } };
-    const bodyImgs = bodyEl ? [...bodyEl.querySelectorAll('img')] : [];
-    const leadImg = bodyEl && [...bodyEl.children].slice(0, 3).some((c) => c.tagName === 'IMG' || c.querySelector('img'));
-    const inBody = leadImg || bodyImgs.some((i) => i.src === item.image_url || base(i.src) === base(item.image_url));
-    if (item.image_url && state.settings.show_images && !inBody && !item.paywalled) {
+    const plan = state.settings.show_images && !item.paywalled ? planHero(bodyEl, item.image_url, author) : null;
+    if (plan) {
+      const { copies } = plan;
       const hero = h('img', {
-        class: 'art-hero', src: item.image_url, alt: '', decoding: 'async', referrerpolicy: 'no-referrer',
+        class: 'art-hero', src: plan.src, alt: '', decoding: 'async', referrerpolicy: 'no-referrer',
       });
-      hero.addEventListener('error', () => hero.remove(), { once: true });
+      const fromFeed = () => hero.getAttribute('src') === item.image_url;
+      // Wiederholung im Text erst entfernen, wenn das Titelbild wirklich geladen ist; sonst bleibt sie.
+      // Alt-Text und Bildzeile der ersten Wiederholung wandern zum Titelbild (auch ein kurzer Absatz
+      // mit Bildquelle ohne „Foto:“). Ein Feed-Bild unter 300 px (Vorschau) fällt weg; eine
+      // Wiederholung im Text bleibt dann stehen.
+      hero.addEventListener('load', () => {
+        if (fromFeed() && hero.naturalWidth && hero.naturalWidth < HERO_MIN_WIDTH) {
+          hero.remove();
+          return;
+        }
+        if (!copies.length) return;
+        hero.alt = copies[0].getAttribute('alt') || '';
+        const caption = paragraphAfter(copies[0]);
+        if (caption && (caption.classList.contains('art-caption') || isCreditCaption(caption))
+            && !CAPTION_RE.test(caption.textContent || '')) {
+          caption.classList.add('art-caption');
+          hero.after(caption);
+        }
+        copies.forEach(removeImage);
+      }, { once: true });
+      // Große Fassung aus dem Text lädt nicht: einmal auf das Feed-Bild zurückfallen, dann aufgeben.
+      hero.addEventListener('error', () => {
+        if (!fromFeed() && item.image_url) hero.src = item.image_url;
+        else hero.remove();
+      });
       parts.push(hero);
     }
 

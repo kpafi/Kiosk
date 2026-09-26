@@ -146,6 +146,42 @@ async def test_failed_retry_keeps_existing_text(db, settings):
     assert row["body_html"] == "<p>Anfang</p>" and row["text_error"] == "HTTP 403"
 
 
+@pytest.mark.parametrize("feed_image,page_image,expected", [
+    ("https://i.example/bild.jpg?width=140", "https://i.example/bild.jpg?width=1200", "https://i.example/bild.jpg?width=1200"),
+    ("https://i.example/bild.jpg?width=640", "https://i.example/gross.jpg", "https://i.example/bild.jpg?width=640"),
+    ("https://i.example/bild.jpg?width=140", "https://i.example/logo.jpg?width=100", "https://i.example/bild.jpg?width=140"),
+    ("https://i.example/bild.jpg?width=140", None, "https://i.example/bild.jpg?width=140"),
+    (None, "https://i.example/gross.jpg", "https://i.example/gross.jpg"),
+])
+async def test_small_feed_image_is_replaced_by_page_image(db, settings, monkeypatch, feed_image, page_image, expected):
+    db.upsert_articles([make_row("alpha", 1, ago(hours=1), url=f"{PUBLIC}/artikel", image_url=feed_image)])
+    aid = db.one("SELECT id FROM articles")["id"]
+    f = make_fetcher(db, settings, lambda r: httpx.Response(200, headers={"content-type": "text/html"}, content=b"<p>x</p>"))
+
+    async def fake_extract(page, url):
+        return extract_mod.Extraction("full", "<p>Text</p>", "Text", 4, False, page_image, None)
+
+    monkeypatch.setattr(f, "_run_extract", fake_extract)
+    await f.extract_article(aid, f"{PUBLIC}/artikel", priority=True)
+    assert db.get_article(aid)["image_url"] == expected
+
+
+async def test_page_image_does_not_replace_image_of_already_extracted_article(db, settings, monkeypatch):
+    small = "https://i.example/bild.jpg?width=140"
+    db.upsert_articles([make_row("alpha", 1, ago(hours=1), url=f"{PUBLIC}/artikel", image_url=small)])
+    aid = db.one("SELECT id FROM articles")["id"]
+    db.store_extraction(aid, status="full", body_html="<p>alt</p>", body_text="alt", body_len=3, paywalled=False)
+    f = make_fetcher(db, settings, lambda r: httpx.Response(200, headers={"content-type": "text/html"}, content=b"<p>x</p>"))
+
+    async def fake_extract(page, url):
+        return extract_mod.Extraction("full", "<p>Text</p>", "Text", 4, False, "https://i.example/gross.jpg", None)
+
+    monkeypatch.setattr(f, "_run_extract", fake_extract)
+    await f._extract(aid, f"{PUBLIC}/artikel")
+    row = db.get_article(aid)
+    assert row["body_text"] == "Text" and row["image_url"] == small
+
+
 async def test_same_article_is_never_extracted_twice_concurrently(db, settings):
     aid = _article(db)
     calls = []

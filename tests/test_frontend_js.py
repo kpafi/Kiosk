@@ -5,6 +5,7 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -72,3 +73,40 @@ def test_parse_hash(out):
     assert r["#/profile"]["name"] == "profiles" and r["#/profile#zeitungen"]["frag"] == "zeitungen"
     assert r["#/profile/neu"]["name"] == "editor" and r["#/profile/neu"]["id"] == "neu"
     assert r["#/quatsch"]["name"] == "list" and r["#/quatsch"]["hash"] == "#/"
+
+
+def test_image_key_matches_python():
+    """imageKey/isSmallImageUrl in format.js folgen denselben Regeln wie image_key/is_small_image_url in
+    app/extract.py; sameImage (Browser, zusätzlich unscharf) wird gegen die Client-Spalte geprüft."""
+    from app.extract import image_key, is_small_image_url
+    from tests.test_extract import IMAGE_PAIRS
+
+    urls = sorted({u for a, b, *_ in IMAGE_PAIRS for u in (a, b)} | {
+        "//cdn.example/w100/bild_w200.png", "kaputt", "https://a.example/x?url=%E2%82%ZZ&w=1",
+        "https://a.example/p?src=//cdn.example/b.jpg", "https://a.example/p?url=kein-link&w=5",
+        "https://a.example/p?t=1&src=%20/v.mp4%0A&rect=(1,2)&w=5", "https://a.example/p?src=/a&src=/b&im=x",
+        "HTTPS://A.Example/Bild/X_W9_r1.JPG?Width=5&ID=2", "https://a.example/foto_w960_r1.5_fpx4.jpg#x",
+        "https://a.example/h1/w55/foto_r2_fpy4.jpg.webp?s=abc&auth=Q",
+        "\ufeffhttps://a.example/bild.jpg", "\x1chttps://a.example/bild.jpg "})
+    deep = "https://a.example/bild.jpg"
+    for _ in range(7):   # url= wird höchstens 5 Ebenen tief ausgepackt
+        deep = "https://p.example/proxy?url=" + quote(deep, safe="")
+    urls.append(deep)
+    script = """
+const fmt = await import(process.argv[1] + '/format.js');
+const input = JSON.parse(process.argv[2]);
+console.log(JSON.stringify({ keys: input.urls.map((u) => fmt.imageKey(u, true)),
+  loose: input.urls.map((u) => fmt.imageKey(u)),
+  small: input.urls.map((u) => fmt.isSmallImageUrl(u)),
+  same: input.pairs.map(([a, b]) => [fmt.sameImage(a, b), fmt.sameImage(b, a)]) }));
+"""
+    payload = json.dumps({"urls": urls, "pairs": [[a, b] for a, b, *_ in IMAGE_PAIRS]})
+    res = subprocess.run([NODE, "--input-type=module", "-e", script, str(JS.as_uri()), payload],
+                         capture_output=True, text=True, timeout=30, env={"PATH": ""})
+    assert res.returncode == 0, res.stderr
+    got = json.loads(res.stdout)
+    # strict (Server-Standard) und unscharf (Browser-Standard, ohne Zuschnitt-Parameter) je gleich.
+    assert [(k["full"], k["base"]) for k in got["keys"]] == [image_key(u) for u in urls]
+    assert [(k["full"], k["base"]) for k in got["loose"]] == [image_key(u, strict=False) for u in urls]
+    assert got["small"] == [is_small_image_url(u) for u in urls]
+    assert got["same"] == [[client, client] for *_, client in IMAGE_PAIRS]

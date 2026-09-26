@@ -5,7 +5,7 @@ import html
 import re
 from dataclasses import dataclass, replace
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import trafilatura
 
@@ -132,6 +132,9 @@ class _Sanitizer(HTMLParser):
         self.text.append(data)
 
 
+_EMPTY_P_RE = re.compile(r"(<p>\s*</p>\s*)+")
+
+
 def _normalize_ws(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
@@ -141,22 +144,171 @@ def sanitize(fragment: str, base_url: str) -> tuple[str, str]:
     s = _Sanitizer(base_url)
     s.feed(fragment)
     s.close()
-    body = "".join(s.out)
-    body = re.sub(r"^\s*<h1>.*?</h1>\s*", "", body, count=1, flags=re.S)  # Titel steht separat
-    body = re.sub(r"(<p>\s*</p>\s*)+", "", body)
+    body = _EMPTY_P_RE.sub("", "".join(s.out))
     text = _normalize_ws("".join(s.text))
+    # Erst Müll-Absätze weg, dann doppelte Bilder: sonst bliebe nur das erste Vorkommen eines Bildes
+    # stehen, und fiele es danach mit seinem Müll-Absatz weg, wäre das Bild ganz verloren. Die
+    # führende <h1> (Titel, steht separat) erst nach den Müll-Absätzen: Ein leerer Absatz davor
+    # verdeckt sie sonst, und ein zweiter Durchlauf käme zu einem anderen Ergebnis.
     cleaned = _drop_junk_paragraphs(body)
-    if cleaned != body:
-        body, text = cleaned, html_to_text(cleaned)
-    return body.strip(), text
+    cleaned = re.sub(r"^\s*<h1>.*?</h1>\s*", "", cleaned, count=1, flags=re.S)
+    cleaned = _EMPTY_P_RE.sub("", _drop_duplicate_images(cleaned))
+    if cleaned != body:   # entfernte Absätze und Bildunterschriften ändern auch den reinen Text
+        text = html_to_text(cleaned)
+    return cleaned.strip(), text
+
+
+# ---- Bild-Schlüssel: dasselbe Bild in anderer Größe erkennen ----
+# Gleiche Regeln wie imageKey() in static/js/format.js (beide Stellen gemeinsam ändern!):
+#  1. Fragment (#…) und Schema (http:// bzw. https://, //) weg; nur der Host wird klein geschrieben,
+#     Pfad und Query bleiben, wie sie sind (Bild-IDs können Groß-/Kleinschreibung unterscheiden).
+#  2. Query (?…): bleibt, nur ohne Größen- und Signatur-Parameter (w, width, h, height, q, quality,
+#     dpr, fit, resize, func, org_if_sml, auto, format, fm, s, sig, itok, smart; Name ohne Beachtung
+#     der Schreibung). Zuschnitt-Parameter (crop, rect, im) bleiben hier (strict, Standard des
+#     Servers): anderer Ausschnitt kann ein anderes Bild sein (CBC im=Crop,rect=(…)). Nur mit
+#     strict=False (Standard von imageKey() im Browser, für die Anzeige) fallen auch sie weg.
+#     Steht bei einem Pfad ohne Bild-Endung in url= oder src= eine URL (absolut oder mit / beginnend,
+#     dann auf dem Host der äußeren URL), ist deren Schlüssel der Schlüssel (Bild-Proxys wie
+#     /_next/image?url=…&w=640), höchstens 5 Ebenen tief; die übrigen Parameter der äußeren URL
+#     (ohne Größen-Parameter) werden angehängt, außer die innere URL hat eine Bild-Endung
+#     (/thumb?src=/v.mp4&t=10 und &t=50 sind verschiedene Bilder).
+#  3. Pfadsegmente, die nur eine Größe angeben, weg: /w960/, /h540/ (mind. zwei Ziffern), /1024x683/.
+#  4. Im Dateinamen die Endung(en) weg (.jpg, .JPG, .jpg.webp …), dann Größen-Token weg:
+#     _w960 bzw. -w960, _1024x683 bzw. -1024x683, @2x, -scaled; die Spiegel-Zuschnitte _r1.5,
+#     _fpx43.2, _fpy41 nur, wenn der Dateiname auch ein _w960-Token hat (Token enden an _ - . @
+#     oder am Namensende).
+#  Schlüssel = (Host+Pfad[+?Query], bereinigter Dateiname falls ≥ 8 Zeichen, sonst "").
+#  Der Server (same_image) wertet nur gleiche Schlüssel als gleiches Bild; die unscharfe
+#  Erkennung (gleicher Dateiname, abweichende Größen-Segmente) macht nur sameImage() im Browser,
+#  denn ein verlorenes Bild wiegt schwerer als ein doppeltes.
+_SIZE_DIR_RE = re.compile(r"/(?:[wh]\d{2,}|\d+x\d+)(?=/)")
+_SIZE_TOKEN_RE = re.compile(r"(?:[_-]w\d+|[_-]\d+x\d+|@\d+x|-scaled)(?=[_.@-]|\Z)")
+_WIDTH_TOKEN_RE = re.compile(r"_w\d+(?=[_.@-]|\Z)")
+_CROP_TOKEN_RE = re.compile(r"(?:_r\d+(?:\.\d+)?|_fp[xy]\d+(?:\.\d+)?)(?=[_.@-]|\Z)")
+_IMAGE_EXT_RE = re.compile(r"\.(?:jpe?g|png|webp|gif|avif)\Z", re.I)
+_EXT_RE = re.compile(r"(?:\.(?:jpe?g|png|webp|gif|avif))+\Z|\.[a-z][a-z0-9]{1,4}\Z", re.I)
+_SIZE_PARAMS = {"w", "width", "h", "height", "q", "quality", "dpr", "fit", "resize",
+                "func", "org_if_sml", "auto", "format", "fm", "s", "sig", "itok", "smart"}
+_CROP_PARAMS = {"crop", "rect", "im"}   # nur mit strict=False entfernt (siehe oben)
+_URL_PARAM_RE = re.compile(r"^(?:(?:https?:)?//|/)", re.I)
+_IMAGE_BASE_MIN = 8
+_URL_PARAM_DEPTH = 5
+_URL_SPACE = " \t\n\r\f\v"   # nur ASCII-Leerraum abschneiden (JS trim() und Python strip() unterscheiden sich)
+
+
+def image_key(url: str | None, strict: bool = True, _depth: int = 0) -> tuple[str, str]:
+    """Schlüssel einer Bild-URL: (Host+Pfad[+?Query] bereinigt, bereinigter Dateiname oder "")."""
+    raw = re.sub(r"#.*\Z", "", (url or "").strip(_URL_SPACE), flags=re.S)
+    raw = re.sub(r"^//", "", re.sub(r"^[a-z][a-z0-9+.-]*://", "", raw, flags=re.I))
+    path, _, query = raw.partition("?")
+    host, slash, rest = path.partition("/")
+    path = host.lower() + slash + rest
+    drop = _SIZE_PARAMS if strict else _SIZE_PARAMS | _CROP_PARAMS
+    kept = []
+    inner = None
+    for part in query.split("&") if query else ():
+        name, _, value = part.partition("=")
+        name = name.lower()
+        if (inner is None and name in ("url", "src") and not _IMAGE_EXT_RE.search(path)
+                and _depth < _URL_PARAM_DEPTH):
+            candidate = unquote(value).strip(_URL_SPACE)
+            if _URL_PARAM_RE.match(candidate):
+                if candidate.startswith("/") and not candidate.startswith("//"):
+                    candidate = host + candidate   # relativ: Host der äußeren URL
+                inner = candidate
+                continue
+        if part and name not in drop:
+            kept.append(part)
+    if inner is not None:
+        full, base = image_key(inner, strict, _depth + 1)
+        inner_path = re.sub(r"[?#].*\Z", "", inner, flags=re.S)
+        if kept and not _IMAGE_EXT_RE.search(inner_path):
+            full += ("&" if "?" in full else "?") + "&".join(kept)
+        return full, base
+    cut = path.rfind("/")
+    folder = _SIZE_DIR_RE.sub("", path[:cut + 1])
+    stem = _EXT_RE.sub("", path[cut + 1:])
+    if _WIDTH_TOKEN_RE.search(stem):
+        stem = _CROP_TOKEN_RE.sub("", stem)
+    stem = _SIZE_TOKEN_RE.sub("", stem)
+    full = folder + stem + ("?" + "&".join(kept) if kept else "")
+    return full, stem if len(stem) >= _IMAGE_BASE_MIN else ""
+
+
+def same_image(a: str | None, b: str | None) -> bool:
+    """True nur, wenn beide URLs sicher dasselbe Bild zeigen (gleicher Schlüssel)."""
+    full_a, full_b = image_key(a)[0], image_key(b)[0]
+    return bool(full_a) and full_a == full_b
+
+
+# Kleines Bild laut URL (Breite < 200 px; _w120, w_64 in Bild-Diensten, /80x80/, width=, dimensions=): Autorenfoto, Wappen, Symbol. Solche Bilder wiederholen
+# sich absichtlich (z. B. Vereinswappen in einer Ergebnistabelle) und werden nie als Duplikat
+# entfernt. Gleiche Regel wie isSmallImageUrl() in static/js/format.js.
+_SMALL_URL_RE = re.compile(r"_w(\d+)(?=[_.@-]|$)|(?:,|%2c|/)w_(\d+)|/(\d{2,3})x\d{2,3}/|[?&](?:width|dimensions)=(\d+)")
+_SMALL_MAX = 200
+
+
+def is_small_image_url(url: str | None) -> bool:
+    for m in _SMALL_URL_RE.finditer((url or "").lower()):
+        value = next(g for g in m.groups() if g)
+        if int(value) < _SMALL_MAX:
+            return True
+    return False
+
+
+# Bild im bereinigten HTML, samt einem Link, der nur das Bild umschließt; danach optional das
+# schließende </p> bzw. </figure> und ein direkt folgender Absatz (möglicher Bildquellen-Absatz).
+_IMG_RE = re.compile(
+    r"(?:<a\b[^>]*>\s*(<img\b[^>]*>)\s*</a>|(<img\b[^>]*>))"
+    r"(\s*(?:</(?:p|figure)>\s*)?)(<p>(?:(?!</p>|<img\b).)*</p>)?", re.S)
+_SRC_RE = re.compile(r'\ssrc="([^"]*)"')
+# Platzhalter für ein entferntes Bild: Kommentare erzeugt der Sanitizer nie (Text ist escaped).
+_DROP_MARK = "<!--dup-->"
+# <figure>, die durch das Entfernen (Platzhalter) leer geworden ist, ggf. mit ihrer Bildunterschrift.
+# Andere <figure> ohne Bild (nur Bildunterschrift) bleiben unangetastet.
+_EMPTY_FIGURE_RE = re.compile(
+    r"<figure>\s*(?:<p>\s*)?" + re.escape(_DROP_MARK) + r"\s*(?:</p>\s*)?"
+    r"(?:<figcaption>(?:(?!</figcaption>).)*</figcaption>\s*)?</figure>\s*", re.S)
+# Absatz, der nur die Bildquelle nennt („Foto: dpa“); gleiche Regel wie CAPTION_RE in article.js.
+CAPTION_RE = re.compile(r"^\s*(?:Fotos?|Bilder?|Quelle|Photo|Image)\s*:", re.I)
+
+
+def _drop_duplicate_images(body: str) -> str:
+    """Dasselbe Bild (gleicher Schlüssel) nur beim ersten Vorkommen behalten, samt dem direkt
+    folgenden Bildquellen-Absatz; kleine Bilder bleiben immer. Nur die <figure>, die dadurch leer
+    geworden ist, fällt weg (leere <p> entfernt sanitize danach)."""
+    seen: set[str] = set()
+    dropped = False
+
+    def repl(m: re.Match) -> str:
+        nonlocal dropped
+        src_m = _SRC_RE.search(m.group(1) or m.group(2))
+        src = html.unescape(src_m.group(1)) if src_m else ""
+        key = image_key(src)[0] if src and not is_small_image_url(src) else ""
+        if not key:
+            return m.group(0)
+        if key not in seen:
+            seen.add(key)
+            return m.group(0)
+        dropped = True
+        caption = m.group(4) or ""
+        if caption and CAPTION_RE.match(html_to_text(caption)):
+            caption = ""
+        return _DROP_MARK + m.group(3) + caption
+
+    out = _IMG_RE.sub(repl, body)
+    return _EMPTY_FIGURE_RE.sub("", out).replace(_DROP_MARK, "") if dropped else body
 
 
 # Absätze ohne Artikelinhalt, die trafilatura bei manchen Verlagen mitnimmt (z. B. Al Jazeera):
-# kurze Datumszeile „Published On 12 Sep 2026“ und ein Absatz, der nur aus dem Link „NewsFeed“ besteht.
+# kurze Datumszeile „Published On 12 Sep 2026“ und ein Absatz, der nur aus dem Link „NewsFeed“ besteht;
+# außerdem Absätze, die nur aus einem Bedienelement- oder Werbe-Etikett bestehen (NPR „hide caption“),
+# und Absätze ohne Text und ohne Bild (<p><strong></strong></p>).
 _PARA_RE = re.compile(r"<p>(.*?)</p>\s*", re.S)
 _PUBLISHED_RE = re.compile(r"^\s*Published On\s+\d{1,2}\s+\w+\s+\d{4}")
 _PUBLISHED_MAX_LEN = 60     # längere Absätze mit „Published On …“ sind Artikeltext
 _NEWSFEED_RE = re.compile(r"^\s*<a\b[^>]*>\s*NewsFeed\s*</a>\s*$")
+_JUNK_LABELS = {"hide caption", "toggle caption", "advertisement", "werbung", "anzeige"}
 
 
 def _drop_junk_paragraphs(body: str) -> str:
@@ -165,6 +317,8 @@ def _drop_junk_paragraphs(body: str) -> str:
         if _NEWSFEED_RE.match(inner):
             return ""
         text = html_to_text(inner)
+        if text.casefold() in _JUNK_LABELS or (not text and "<img" not in inner):
+            return ""
         if len(text) < _PUBLISHED_MAX_LEN and _PUBLISHED_RE.match(text):
             return ""
         return m.group(0)

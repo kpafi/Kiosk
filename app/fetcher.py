@@ -23,7 +23,7 @@ import httpx
 
 from .config import Settings
 from .db import Database, utcnow
-from .extract import drop_title_echo, extract, is_placeholder, safe_http_url, strip_html
+from .extract import drop_title_echo, extract, is_placeholder, is_small_image_url, safe_http_url, strip_html
 from .netguard import BlockedURL, ResolveError, check_url, server_addr_blocked
 from .sources import Catalog, Source
 
@@ -661,10 +661,15 @@ class Fetcher:
             return
         row = self.db.get_article(article_id)
         result = drop_title_echo(result, row["title"] if row else None)
+        # Feed-Bild nur als kleine Vorschau (Guardian ?width=140), die Seite nennt ein großes: das
+        # große wird Titelbild. Nur beim ersten Holen des Textes; schon geholte Artikel bleiben, wie sie sind.
+        feed_image = row["image_url"] if row and row["extracted_at"] is None else None
+        replace_image = bool(feed_image and is_small_image_url(feed_image)
+                             and result.image_url and not is_small_image_url(result.image_url))
         self.db.store_extraction(
             article_id, status=result.status, body_html=result.body_html, body_text=result.body_text,
             body_len=result.body_len, paywalled=result.paywalled, image_url=result.image_url,
-            author=result.author,
+            author=result.author, replace_image=replace_image,
         )
 
 

@@ -487,8 +487,11 @@ class Database:
     def store_extraction(self, article_id: int, *, status: str, body_html: str | None,
                          body_len: int, paywalled: bool, error: str | None = None,
                          image_url: str | None = None, author: str | None = None,
-                         body_text: str | None = None) -> None:
+                         body_text: str | None = None, replace_image: bool = False) -> None:
         """Speichert ein endgültiges Ergebnis (auch endgültige Fehler) und setzt den Retry-Zähler zurück.
+
+        image_url füllt nur ein fehlendes Bild; mit replace_image=True ersetzt es das vorhandene
+        (Feed-Vorschaubild durch das große Bild aus den Seiten-Metadaten).
 
         Bringt das neue Ergebnis keinen Text (Fehler oder leere Extraktion), der Artikel hat aber
         schon welchen, bleiben Text, Länge, Paywall-Markierung und Status erhalten; nur
@@ -506,9 +509,11 @@ class Database:
             c.execute(
                 "UPDATE articles SET text_status=?, body_html=?, body_text=?, body_len=?, paywalled=?, "
                 "text_error=?, extracted_at=?, attempts=0, next_attempt_at=NULL, "
-                "image_url=COALESCE(image_url, ?), author=COALESCE(author, ?) WHERE id=?",
+                "image_url=CASE WHEN ? THEN ? ELSE COALESCE(image_url, ?) END, "
+                "author=COALESCE(author, ?) WHERE id=?",
                 (status, body_html, body_text, body_len, 1 if paywalled else 0,
-                 (error or None) and error[:500], utcnow(), image_url, author, article_id),
+                 (error or None) and error[:500], utcnow(), 1 if replace_image and image_url else 0,
+                 image_url, image_url, author, article_id),
             )
 
     def schedule_retry(self, article_id: int, error: str, retry_after: float | None = None) -> str:

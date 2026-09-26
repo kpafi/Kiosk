@@ -21,6 +21,66 @@ export function statusPill() {
     h('span', { text: n ? `Hole neue Artikel · ${n} Zeitungen` : 'Hole neue Artikel' }));
 }
 
+// Filterchips: Ein gewählter Profil-Chip rückt an Stelle 2 direkt hinter „Ungelesen“. Die Liste wird
+// beim Profilwechsel neu aufgebaut; deshalb merkt sich der Tipp Lage und Farben aller Chips, und die
+// neue Zeile gleitet von dort an ihren Platz (FLIP, 200 ms, bei „weniger Bewegung“ ohne Animation).
+// Der „Ungelesen“-Chip wechselt seine Farben mit derselben Überblendung.
+const CHIP_MS = 200;
+// { at: Zeitpunkt, hash: Ziel, focus: Schlüssel des fokussierten Chips, map: Map<Schlüssel, {left, bg, fg, border}> }
+let chipsBefore = null;
+
+function rememberChips(row, hash) {
+  const map = new Map();
+  for (const el of row.querySelectorAll('.chip[data-key]')) {
+    const cs = getComputedStyle(el);
+    map.set(el.dataset.key, {
+      left: el.getBoundingClientRect().left, bg: cs.backgroundColor, fg: cs.color, border: cs.borderColor,
+    });
+  }
+  const focused = row.contains(document.activeElement) ? document.activeElement.closest('.chip[data-key]') : null;
+  chipsBefore = { at: Date.now(), hash, focus: focused ? focused.dataset.key : null, map };
+}
+
+/** Klick, der die Seite nicht selbst wechselt (neuer Tab/Fenster, Mittelklick): nichts merken. */
+const isModified = (e) => e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey;
+
+function animateChips(row) {
+  if (!row.isConnected) return;   // Ansicht schon wieder ersetzt
+  const before = chipsBefore;
+  chipsBefore = null;
+  if (!before || Date.now() - before.at > 2000 || before.hash !== (location.hash || '#/')) return;
+  const focusChip = before.focus ? row.querySelector(`.chip[data-key="${before.focus}"]`) : null;
+  const restoreFocus = () => { if (focusChip && focusChip.isConnected) focusChip.focus({ preventScroll: true }); };
+  // Fokus sofort zurückgeben (vor den Animationen), damit Tastatur und Vorleser nicht warten.
+  restoreFocus();
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  // Durchsichtiger Chip-Hintergrund wird in der Animation deckend (Seitenfarbe --bg), sonst scheinen
+  // sich kreuzende Chips durch.
+  const pageBg = getComputedStyle(document.body).backgroundColor;
+  const solid = (c) => (c === 'transparent' || /^rgba\(.*,\s*0\)$/.test(c) ? pageBg : c);
+  for (const el of row.querySelectorAll('.chip[data-key]')) {
+    const old = before.map.get(el.dataset.key);
+    if (!old) continue;
+    const cs = getComputedStyle(el);
+    const dx = old.left - el.getBoundingClientRect().left;
+    const recolor = old.bg !== cs.backgroundColor || old.fg !== cs.color;
+    if (Math.abs(dx) < 1 && !recolor) continue;
+    const from = { offset: 0, transform: `translateX(${dx}px)` };
+    const to = { offset: 1, transform: 'none' };
+    const frames = [from, to];
+    if (recolor) {
+      Object.assign(from, { backgroundColor: solid(old.bg), borderColor: old.border, color: old.fg });
+      Object.assign(to, { backgroundColor: solid(cs.backgroundColor), borderColor: cs.borderColor, color: cs.color });
+      // Schrift wechselt in der Mitte, wenn der Hintergrund halb überblendet ist (sonst kurz unlesbar).
+      frames.splice(1, 0, { offset: 0.5, color: old.fg }, { offset: 0.5, color: cs.color });
+    }
+    // Aktiver und eben abgewählter Chip (Farbwechsel) gleiten über die anderen hinweg.
+    if (el.classList.contains('is-on') || recolor) Object.assign(el.style, { position: 'relative', zIndex: '1' });
+    const anim = el.animate(frames, { duration: CHIP_MS, easing: 'ease-out' });
+    anim.finished.catch(() => {}).then(() => { el.style.position = ''; el.style.zIndex = ''; });
+  }
+}
+
 export function listView(route) {
   const pid = route.params.get('p');
   const profile = pid ? profileById(pid) : null;
@@ -60,18 +120,28 @@ export function listView(route) {
 
   function buildChips() {
     const profiles = state.profiles || [];
+    const isActive = (p) => state.ctx.type === 'profile' && String(p.id) === String(state.ctx.id);
+    // Aktives Profil an Stelle 2, die übrigen in ihrer gespeicherten Reihenfolge.
+    const ordered = [...profiles.filter(isActive), ...profiles.filter((p) => !isActive(p))];
+    const unread = chip('Ungelesen', {
+      on: state.unread,
+      onClick: () => {
+        setUnreadFilter(!state.unread);
+        rebuildFeed();
+        rememberChips(chipsEl, location.hash || '#/');
+        buildChips();
+        animateChips(chipsEl);
+      },
+    });
+    unread.dataset.key = 'u';
     replace(chipsEl,
-      chip('Ungelesen', {
-        on: state.unread,
-        onClick: () => {
-          setUnreadFilter(!state.unread);
-          rebuildFeed();
-          buildChips();
-        },
-      }),
-      profiles.map((p) => {
-        const active = state.ctx.type === 'profile' && String(p.id) === String(state.ctx.id);
-        return chip(p.name, { on: active, href: active ? '#/' : `#/?p=${p.id}` });
+      unread,
+      ordered.map((p) => {
+        const active = isActive(p);
+        const el = chip(p.name, { on: active, href: active ? '#/' : `#/?p=${p.id}` });
+        el.dataset.key = `p${p.id}`;
+        el.addEventListener('click', (e) => { if (!isModified(e)) rememberChips(chipsEl, el.getAttribute('href')); });
+        return el;
       }),
       iconButton(pencil(16), 'Profile bearbeiten', { href: '#/profile', small: true }));
   }
@@ -139,6 +209,11 @@ export function listView(route) {
   const el = h('div', { class: 'view-list' }, header, chipsEl, statusSlot, feedHolder);
 
   buildChips();
+  // Nach dem Einhängen: Chipzeile ganz nach links (aktiver Chip sichtbar), dann ggf. gleiten lassen.
+  requestAnimationFrame(() => {
+    chipsEl.scrollLeft = 0;
+    animateChips(chipsEl);
+  });
   renderStatus();
   feed.start();
   timer = setTimeout(poll, wasRunning ? 5000 : 60000);

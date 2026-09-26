@@ -53,11 +53,6 @@ function barChip(item) {
   showCount ? h('span', { class: 'bar-count t-counter', 'aria-hidden': 'true', text: item.unread > 999 ? '999+' : item.unread }) : null));
 }
 
-/** Rechter Rand ausblenden, solange rechts noch Chips versteckt sind. */
-function paintFade(scroller) {
-  scroller.classList.toggle('fade-end', scroller.scrollLeft + scroller.clientWidth < scroller.scrollWidth - 1);
-}
-
 export function renderBar() {
   const el = barEl();
   const items = [...(state.bar || [{ type: 'all', label: 'ALLE' }])];
@@ -71,23 +66,27 @@ export function renderBar() {
     });
   }
   const [all, ...rest] = [items.find((i) => i.type === 'all'), ...items.filter((i) => i.type !== 'all')];
+  // Scroll-Lage über das Neuzeichnen retten, sonst springt die Leiste beim Tipp auf einen Chip rechts
+  // an den Anfang zurück.
+  const oldScroller = el.querySelector('.bar-scroll');
+  const scrollLeft = oldScroller ? oldScroller.scrollLeft : 0;
   const scroller = h('div', { class: 'bar-scroll' }, rest.map(barChip));
-  scroller.addEventListener('scroll', () => paintFade(scroller), { passive: true });
   el.replaceChildren(
     barChip(all),
     scroller,
     h('a', { class: 'icon-btn', href: '#/profile', 'aria-label': 'Zur Leiste hinzufügen' }, plus(20)),
   );
-  // Aktiven Chip sichtbar machen (nur horizontal, die Seite scrollt nicht mit).
+  scroller.scrollLeft = scrollLeft;
+  // Aktiven Chip nur dann sanft ins Bild holen (nur horizontal, die Seite scrollt nicht mit), wenn er
+  // außerhalb liegt; 12 px Luft wie scroll-padding.
   const active = scroller.querySelector('.is-on');
+  if (!active) return;
   requestAnimationFrame(() => {
-    if (active) {
-      const left = active.offsetLeft - scroller.offsetLeft;
-      if (left + active.offsetWidth > scroller.scrollLeft + scroller.clientWidth || left < scroller.scrollLeft) {
-        scroller.scrollLeft = Math.max(0, left - 8);
-      }
+    const left = active.offsetLeft - scroller.offsetLeft;
+    if (left + active.offsetWidth > scroller.scrollLeft + scroller.clientWidth || left < scroller.scrollLeft) {
+      const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+      scroller.scrollTo({ left: Math.max(0, left - 12), behavior: reduce ? 'auto' : 'smooth' });
     }
-    paintFade(scroller);
   });
 }
 
@@ -99,7 +98,3 @@ export function showBar(visible) {
 }
 
 on('bar', () => { if (!barEl().hidden) renderBar(); });
-window.addEventListener('resize', () => {
-  const scroller = barEl().querySelector('.bar-scroll');
-  if (scroller) paintFade(scroller);
-}, { passive: true });

@@ -34,6 +34,7 @@ const PAGE_VIEWS = { settings: settingsView, sources: sourcesView, editor: profi
 let current = { key: null, view: null };   // Inhalt von #view
 let reader = null;                          // offene Leseansicht in #reader
 let listScroll = 0;                         // Scrollposition der Liste (Handy)
+let openedId = null;                        // zuletzt geöffneter Artikel (Handy: Fokus zurück auf seine Zeile)
 let afterLogin = null;                      // Ziel nach dem Anmelden
 let afterLoginUser = null;                  // Benutzer-ID, zu der afterLogin gehört
 
@@ -141,8 +142,13 @@ function route() {
     reader = articleView(r.id);
     readerEl.replaceChildren(reader.el);
     setLayout('article', isDesktop() && list.bar);
+    openedId = Number(r.id);
     if (isDesktop()) readerEl.scrollTop = 0;
-    else window.scrollTo(0, 0);
+    else {
+      window.scrollTo(0, 0);
+      // Handy: Die Liste ist ausgeblendet, der Fokus läge sonst auf der unsichtbaren Zeile.
+      readerEl.focus({ preventScroll: true });
+    }
     setTitle({ title: 'Artikel' });
     return;
   }
@@ -166,7 +172,21 @@ function route() {
     window.scrollTo(0, 0);
     viewEl.scrollTop = 0;
   } else if (wasArticle && !isDesktop()) {
-    requestAnimationFrame(() => window.scrollTo(0, listScroll));
+    // Zurück zur (wiederverwendeten) Liste: Scrollstand wiederherstellen, dann Fokus auf die Zeile
+    // des zuletzt geöffneten Artikels (fehlt sie, auf die Liste), damit Tastatur und Vorleser dort
+    // weitermachen.
+    const id = openedId;
+    requestAnimationFrame(() => {
+      window.scrollTo(0, listScroll);
+      if (current.view !== view || isSheetOpen()) return;
+      const row = id != null ? viewEl.querySelector(`.row[data-id="${id}"]`) : null;
+      (row || viewEl).focus({ preventScroll: true });
+      // Nach mehrfach „Nächster“ kann die Zeile außerhalb des Bildes liegen: dann heranholen.
+      if (row) {
+        const r = row.getBoundingClientRect();
+        if (r.top < 0 || r.bottom > window.innerHeight) row.scrollIntoView({ block: 'nearest' });
+      }
+    });
   }
   view.onShow?.();
   if (fresh) focusView(view);

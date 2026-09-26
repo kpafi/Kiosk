@@ -154,6 +154,13 @@ Artikelfelder: `text_status` ist `full`, `partial` (Paywall oder sehr kurz), `em
   60 s neu berechnet; Änderungen an Profilen oder Quellen, „alles gelesen“, das Setzen des
   Gelesen-Status eines Artikels, ein beendeter Sammellauf und ein neuer Tag verwerfen den
   Zwischenspeicher sofort. Auch `unread` in `/api/sources` zählt nur Artikel ohne Paywall.
+- `unread` eines Profils kann `null` sein („nicht gezählt“), und zwar in `GET /api/profiles`,
+  `POST /api/profiles`, `PATCH /api/profiles/{id}`, `POST /api/profiles/reorder` (je Profil `unread`) und
+  in `GET`/`PUT /api/bar` (`unread` der Einträge mit `type: profile`). Alle Profil-Zähler einer Anfrage
+  haben zusammen höchstens 3 s; was dann noch fehlt, ist `null` und wird bei der nächsten Anfrage
+  gezählt. Braucht die Zählung eines Profils allein länger als 2 s, bleibt es 10 Minuten lang `null`
+  (Lesestand-Änderungen setzen das nicht zurück, eine Änderung des Profils schon). Alle anderen
+  `unread`-Werte (`ALLE` und Zeitungen in der Leiste, `/api/sources`, `/api/counts`) sind nie `null`.
 - Leiste: `ALLE` zuerst, danach Lieblingszeitungen und Profile mit `in_bar` in der Reihenfolge aus
   `bar_order`; nicht dort genannte hängen hinten an (erst Zeitungen, dann Profile). `label` ist für
   Zeitungen `short` aus `sources.yaml` (höchstens 12 Zeichen, Versalien), für Profile der Name in Versalien.
@@ -178,7 +185,13 @@ Artikelfelder: `text_status` ist `full`, `partial` (Paywall oder sehr kurz), `em
 
 ### Abruf und Wiederholungen
 
-- Feeds maximal 10 MB, Artikelseiten maximal 5 MB. Angefordert wird unkomprimiert
+- Feeds und Artikelseiten maximal 5 MB; eine größere Artikelseite ist sofort endgültig `failed`. Von
+  einem Feed zählen nur die 300 neuesten Einträge (nach Datum, Einträge ohne Datum dahinter), je Quelle
+  und Lauf kommen höchstens 150 neue Artikel dazu (der Rest beim nächsten Lauf; wird die Grenze erreicht,
+  speichert der Abruf kein ETag/Last-Modified, damit kein 304 den Rest zurückhält). feedparser läuft in
+  den Worker-Prozessen der Textextraktion (höchstens 30 s, sonst wie eine hängende Extraktion).
+  ETag und Last-Modified werden nur gespeichert und gesendet, wenn sie aus druckbarem ASCII bestehen;
+  ein gescheiterter Abruf löscht beide (der nächste Abruf geht ohne Bedingung). Angefordert wird unkomprimiert
   (`Accept-Encoding: identity`); schickt ein Server trotzdem gzip/deflate (auch rohes deflate), wird
   selbst und begrenzt entpackt (das Limit gilt für übertragene und entpackte Bytes); ein abgeschnittener
   komprimierter Datenstrom gilt als vorübergehender Fehler. `identity` und unbekannte Werte im Header
@@ -187,18 +200,27 @@ Artikelfelder: `text_status` ist `full`, `partial` (Paywall oder sehr kurz), `em
   User-Agent, beide zusammen höchstens 60 s.
 - Private, lokale und Metadaten-Adressen werden bei jedem Hop abgelehnt, zusätzlich wird nach dem
   Verbindungsaufbau die tatsächliche Gegenstelle geprüft (DNS-Rebinding). Rest-Risiko: Die Anfrage
-  ist dann bereits gesendet, verworfen wird nur die Antwort.
+  ist dann bereits gesendet, verworfen wird nur die Antwort. Erlaubt sind nur die Standard-Ports
+  (80 für http, 443 für https); andere Ports sind sofort endgültig `failed`. Weitere Ziele sperrt
+  `KIOSK_FETCH_DENY_IPS` (z. B. öffentliche Adressen des eigenen Servers), geprüft wie die privaten
+  Adressen bei der Namensauflösung und an der Gegenstelle.
+- Extrahierter Text: höchstens ca. 500 000 Zeichen bereinigtes HTML (danach endet er am nächsten
+  Element, Status `partial`) und höchstens 100 Bilder.
 - Die Textextraktion (trafilatura) läuft in 2 eigenen Worker-Prozessen und darf höchstens 90 s reine
   Laufzeit brauchen (es sind nie mehr Aufträge im Pool als Worker, die Wartezeit auf einen freien Worker
   zählt nicht mit). Hängt sie, wird der Worker-Pool beendet und neu angelegt; der Artikel gilt als
   vorübergehend gescheitert (`Extraktion Zeitüberschreitung`, zählt als Versuch). Ein Artikel, dessen
   Extraktion dabei nur mit abgebrochen wurde, bleibt ohne gezählten Versuch sofort fällig. Stirbt ein
-  Worker von selbst (z. B. Speicher), zählt der Versuch für alle betroffenen Artikel. Jeder Worker wird
+  Worker von selbst (z. B. Speicher, auch durch einen feindlichen Feed im selben Pool), ist der Schuldige
+  unbekannt: Betroffene Artikel werden beim ersten Mal ohne gezählten Versuch neu eingeplant, erst ein
+  zweiter Absturz mit demselben Artikel zählt. Jeder Worker wird
   nach 25 Aufträgen durch einen frischen Prozess ersetzt (begrenzt den Speicherverbrauch).
 - Ungültige URLs (z. B. kaputte IPv6-Klammer, Port außerhalb des Bereichs, nicht unterstütztes Schema,
   auch in einer Umleitung) sind sofort endgültig `failed`.
 - Bereits gesehene Feed-Einträge (Quelle + GUID) stehen in `seen_guids` und werden nicht erneut angelegt,
-  auch nachdem der Artikel gelöscht wurde; diese Einträge bleiben doppelt so lange wie die Artikel.
+  auch nachdem der Artikel gelöscht wurde. Solange ein Eintrag im Feed steht, wird sein Zeitstempel
+  (höchstens täglich) aufgefrischt; gelöscht wird er erst, wenn er doppelt so lange wie die
+  Aufbewahrungsfrist nicht mehr im Feed stand.
 - Vorübergehende Fehler (Timeouts, Netzwerk- und DNS-Fehler, 5xx, 408/425/429, Größenlimit) werden
   nach 1 h, 4 h und 12 h erneut versucht, danach gilt der Artikel als `failed`. Ein `Retry-After`
   bei 429 wird respektiert (höchstens 12 h). Andere 4xx sind sofort endgültig `failed`.
@@ -215,7 +237,9 @@ geladen; Abrufe auf Anforderung haben eine eigene Grenze von 2 gleichzeitigen Ab
 nicht auf die Warteschlange des Hintergrundlaufs (ein Hintergrund-Abruf belegt einen Artikel erst,
 wenn er selbst an der Reihe ist, und prüft dann erneut, ob der Artikel noch fällig ist). Für die
 Textextraktion selbst teilen sie sich die 2 Worker-Prozesse mit dem Hintergrund und warten dort
-höchstens auf einen frei werdenden Worker (also höchstens ca. 90 s).
+höchstens auf einen frei werdenden Worker (also höchstens ca. 90 s). Höchstens 20 Abrufe auf
+Anforderung laufen oder warten gleichzeitig; darüber hinaus startet keiner (`extracting: false`).
+`?retry=true` startet frühestens 2 Minuten nach dem letzten Abruf auf Anforderung desselben Artikels neu.
 Hat ein `pending`-Artikel schon Text, wird er nach einem Fehlschlag `partial` statt endlos neu versucht.
 
 ## Konfiguration
@@ -238,15 +262,26 @@ Suche, Zähler, Artikel per ID).
 | `KIOSK_SESSION_DAYS` | `30` | Gültigkeit der Session, 1 bis 365 |
 | `KIOSK_TZ` | `Europe/Berlin` | Zeitzone (IANA-Name), in der der Tag für die Ungelesen-Zähler um 00:00 beginnt |
 | `KIOSK_DOCS` | `0` | `1` schaltet die API-Doku unter `/docs` und `/openapi.json` ein (nach Login); in Produktion aus |
+| `KIOSK_SECRET` | – | Secret der Session-Cookies, mindestens 32 Zeichen; sonst wird `/data/secret.key` einmalig erzeugt |
+| `KIOSK_FETCH_DENY_IPS` | – | Zusätzlich gesperrte Ziele für Feed- und Artikelabrufe: IPs oder Netze (CIDR), kommagetrennt, z. B. die Adressen des eigenen Servers `203.0.113.10,2001:db8:1234:5678::/64` (kein ganzes Provider-Netz wie `2a01:4f8::/32`, das sperrte auch dort gehostete Nachrichtenseiten); `deploy.sh` trägt diesen Wert ein, wenn er in der `.env` fehlt |
 
-Werte außerhalb der Grenzen und unbekannte Zeitzonen brechen den Start mit einer klaren Fehlermeldung ab.
+Werte außerhalb der Grenzen, unbekannte Zeitzonen, ungültige Einträge in `KIOSK_FETCH_DENY_IPS` und ein
+Secret unter 32 Zeichen (auch eine leere oder zu kurze `secret.key`) brechen den Start mit einer klaren
+Fehlermeldung ab. Die App legt Dateien nur für den eigenen Benutzer lesbar an (umask 077).
+
+Schutz der einen Event-Loop: Jede Leseabfrage während einer API-Anfrage darf höchstens 2 s laufen,
+sonst bricht SQLite sie ab (503, bei der Suche „Die Suche dauert zu lange“). Hintergrundarbeit
+(Sammler, Extraktion, Aufräumen, Migration) hat keine solche Frist. Die Suche nutzt höchstens 8 Wörter; Präfix-Suche gilt
+erst ab 3 Zeichen, kürzere Wörter (auch in Profil-Begriffen) zählen nur exakt. Jeder Benutzer hat
+höchstens 50 Profile (409).
 
 Sessions gehören einem Benutzer (signiertes Cookie mit Benutzer-ID, `users.session_epoch` und einem
 Fingerabdruck des Passwort-Hashes). Abmelden und `passwd` erhöhen die Epoche und beenden damit alle
 Sitzungen dieses Benutzers, andere bleiben angemeldet; gesperrte Benutzer bekommen 401. Abmelden
 gilt also auf allen Geräten dieses Benutzers (Handy, Laptop), nicht nur im aktuellen Browser.
-Login-Bremse: höchstens 8 Versuche in 15 Minuten je IP und 30 je Benutzername, dazu höchstens
-200 pro Minute insgesamt (danach 429). Jeder Versuch zählt schon vor der Passwortprüfung (auch
+Login-Bremse: höchstens 8 Versuche in 15 Minuten je IP (IPv6: je /64-Netz) und 30 je Benutzername,
+dazu höchstens 200 pro Minute insgesamt (danach 429). Namen, die nicht den Regeln für Benutzernamen
+entsprechen, teilen sich einen gemeinsamen Zähler. Jeder Versuch zählt schon vor der Passwortprüfung (auch
 parallele Anfragen überholen die Bremse nicht); ein erfolgreicher Login setzt die Zähler für IP und
 Namen zurück. Höchstens zwei scrypt-Prüfungen laufen gleichzeitig. Abwägung: Wer viele IPs hat, kann
 einen Benutzernamen mit 30 falschen Versuchen für 15 Minuten sperren; die höhere Grenze je Name

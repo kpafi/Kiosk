@@ -6,7 +6,9 @@ import { api } from '../api.js';
 
 /**
  * @param {object} opts
- *   load(cursor) → Promise<{items, next}>   next = Cursor der nächsten Seite oder null
+ *   load(cursor, isStale) → Promise<{items, next}>   next = Cursor der nächsten Seite oder null;
+ *                isStale() ist true, sobald die Antwort nicht mehr gebraucht wird (Liste neu
+ *                gestartet oder zerstört): dann nichts mehr außerhalb der Liste schreiben
  *   dayGroups    Tagesüberschriften (HEUTE, GESTERN, …)
  *   mode, words  an articleRow
  *   filter(item) clientseitiger Filter (z. B. „Mit Bild“)
@@ -45,12 +47,13 @@ export function createFeed(opts) {
     if (loading || done) return;
     loading = true;
     const myGen = gen;
+    const isStale = () => myGen !== gen;
     try {
       // Mit Filter können Seiten leer bleiben: dann weiterladen (höchstens 5 Seiten am Stück).
       for (let i = 0; i < 5 && !done; i++) {
         const before = items.length;
-        const res = await opts.load(cursor);
-        if (myGen !== gen) return;
+        const res = await opts.load(cursor, isStale);
+        if (isStale()) return;
         cursor = res.next ?? null;
         done = cursor === null || cursor === undefined || !res.items.length;
         append(res.items);
@@ -59,13 +62,13 @@ export function createFeed(opts) {
       }
       if (done) finish();
     } catch (err) {
-      if (myGen !== gen) return;
+      if (isStale()) return;
       // Nicht aufgeben: Hinweis mit „Erneut laden“, derselbe Cursor wird wiederholt.
       showError(err);
       loading = false;
       return;
     } finally {
-      if (myGen === gen) loading = false;
+      if (!isStale()) loading = false;
     }
     // Sentinel noch sichtbar (kurze Seite)? Dann direkt nachladen.
     if (!done && isVisible()) more();
@@ -125,14 +128,16 @@ export function createFeed(opts) {
   return { el, start, reload: start, destroy, items, get done() { return done; } };
 }
 
-/** Fertige Listen-Ladefunktion für /api/articles mit Keyset- oder Offset-Paging. */
+/** Fertige Listen-Ladefunktion für /api/articles mit Keyset- oder Offset-Paging. onResponse nur für
+ *  Antworten, die die Liste noch braucht (sonst überschriebe eine verspätete Antwort z. B. den
+ *  Wasserstand der neuen Liste). */
 export function articlesLoader(params, { offsetPaging = false, onResponse } = {}) {
-  return async (cursor) => {
+  return async (cursor, isStale = () => false) => {
     // Ohne free-Parameter blendet das Backend Paywall-Artikel immer aus.
     const p = { limit: 40, ...params };
     if (cursor != null) p[offsetPaging ? 'offset' : 'before'] = cursor;
     const res = await api('articles', { params: p });
-    onResponse?.(res, cursor);
+    if (!isStale()) onResponse?.(res, cursor);
     return { items: res.items || [], next: offsetPaging ? res.next_offset : res.next_before };
   };
 }

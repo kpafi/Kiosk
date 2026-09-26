@@ -569,3 +569,120 @@ def test_unread_counters_count_only_today(db, monkeypatch):
     # „alles gelesen“ markiert auch die älteren
     assert db.mark_all_read(UID, ["alpha"]) == 1
     assert db.source_counts(UID)["alpha"] == {"total": 2, "unread": 0, "unread_all": 0}
+
+
+# ---- Schutz der Event-Loop: Suche, Profil-Begriffe, Zeitlimit -----------------------
+
+def test_fts_prefix_only_for_words_of_three_or_more_chars_and_word_cap():
+    from app.db import SEARCH_MAX_WORDS, _terms_query
+    assert _fts_query("a bc abc") == '"a" AND "bc" AND "abc"*'
+    assert _fts_query("U.S. Börse") == '"U.S." AND "Börse"*'      # letztes Wort "s": exakt
+    many = " ".join(f"w{i:02d}x" for i in range(20))
+    assert _fts_query(many).count(" AND ") == SEARCH_MAX_WORDS - 1  # der Rest zählt nicht
+    assert _fts_query("a " * 100).count('"a"') == SEARCH_MAX_WORDS
+    assert _terms_query(["EU", "NATO", "interest rates", "g 7"]) == '"EU" OR "NATO"* OR "interest rates"* OR "g 7"'
+
+
+def test_short_search_word_matches_exactly(db):
+    db.upsert_articles([make_row("alpha", 1, ago(hours=1), title="EU beschließt"),
+                        make_row("alpha", 2, ago(hours=2), title="Europa wählt")])
+    assert [r["title"] for r in list_all(db, query="eu")] == ["EU beschließt"]
+    assert {r["title"] for r in list_all(db, query="eur")} == {"Europa wählt"}
+
+
+SLOW_SQL = ("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?) "
+            "SELECT COUNT(*) AS c FROM n")
+
+
+def test_slow_read_query_is_aborted(db):
+    import time
+    from app.db import QueryTimeout
+    t0 = time.monotonic()
+    with pytest.raises(QueryTimeout):
+        db.q(SLOW_SQL, (10**10,), time_limit=0.2)
+    assert time.monotonic() - t0 < 3
+    # Die Verbindung bleibt benutzbar, ohne Frist läuft dieselbe (kurze) Abfrage durch.
+    assert db.one(SLOW_SQL, (1000,))["c"] == 1000
+    assert db.one(SLOW_SQL, (200_000,), time_limit=None)["c"] == 200_000
+
+
+def test_time_limit_does_not_apply_inside_transactions(db):
+    with db.tx():
+        assert db.one(SLOW_SQL, (300_000,), time_limit=1e-9)["c"] == 300_000
+
+
+def test_count_queries_use_covering_source_index(db):
+    """source_counts und unread_free_by_source lesen nur den Index, nicht die Zeilen samt Volltext."""
+    seen: list[tuple] = []
+    real = db.q
+
+    def spy(sql, params=(), **kw):
+        seen.append((sql, params))
+        return real(sql, params, **kw)
+
+    db.q = spy
+    db.source_counts(UID)
+    db.unread_free_by_source(UID)
+    assert len(seen) == 2
+    for sql, params in seen:
+        plan = " | ".join(r["detail"] for r in real("EXPLAIN QUERY PLAN " + sql, params))
+        assert "COVERING INDEX idx_articles_source_counts" in plan, plan
+
+
+def test_existing_database_gets_new_source_index(tmp_path):
+    d = Database(tmp_path / "k.db")
+    d.q("DROP INDEX idx_articles_source_counts")
+    d.q("CREATE INDEX idx_articles_source ON articles (source_id, published_at DESC)")
+    d.close()
+    d = Database(tmp_path / "k.db")
+    idx = {r["name"] for r in d.q("PRAGMA index_list(articles)")}
+    assert "idx_articles_source_counts" in idx and "idx_articles_source" not in idx
+    d.close()
+
+
+# ---- seen_guids und neue Artikel je Lauf ---------------------------------------------
+
+def test_seen_guid_is_refreshed_while_entry_stays_in_feed(db):
+    """Ein Eintrag ohne Datum, der dauerhaft im Feed steht, kommt nach purge nicht als neu zurück."""
+    row = make_row("alpha", 1, ago(hours=1))
+    assert db.upsert_articles([row]) == 1
+    db.q("UPDATE seen_guids SET first_seen=?", (ago(days=170),))
+    db.q("UPDATE articles SET published_at=?", (ago(days=100),))
+    assert db.upsert_articles([{**row, "fetched_at": ago(seconds=0)}]) == 0
+    assert db.one("SELECT first_seen FROM seen_guids")["first_seen"] >= ago(minutes=1)
+    assert db.purge(90) == 1                     # der Artikel ist weg ...
+    assert db.one("SELECT COUNT(*) AS n FROM seen_guids")["n"] == 1   # ... der Eintrag bleibt bekannt
+    assert db.upsert_articles([{**row, "fetched_at": ago(seconds=0)}]) == 0
+
+
+def test_seen_guid_refresh_at_most_daily(db):
+    row = make_row("alpha", 1, ago(hours=1))
+    db.upsert_articles([row])
+    recent = ago(hours=3)
+    db.q("UPDATE seen_guids SET first_seen=?", (recent,))
+    db.upsert_articles([{**row, "fetched_at": ago(seconds=0)}])
+    assert db.one("SELECT first_seen FROM seen_guids")["first_seen"] == recent
+
+
+def test_upsert_max_new_leaves_rest_unseen(db):
+    rows = [make_row("alpha", i, ago(minutes=i)) for i in range(5)]
+    assert db.upsert_articles(rows, max_new=2) == 2
+    assert db.one("SELECT COUNT(*) AS n FROM seen_guids")["n"] == 2
+    assert db.upsert_articles(rows, max_new=2) == 2   # die nächsten beiden
+    assert db.upsert_articles(rows) == 1
+
+
+# ---- Validatoren eines Feeds -----------------------------------------------------------
+
+def test_record_fetch_validators(db):
+    db.record_fetch("alpha", ok=True, validators=('"v1"', "Mon, 01 Sep 2026 10:00:00 GMT"))
+    st = db.source_states()["alpha"]
+    assert (st["etag"], st["last_modified"]) == ('"v1"', "Mon, 01 Sep 2026 10:00:00 GMT")
+    db.record_fetch("alpha", ok=True)                  # 304: bleiben
+    assert db.source_states()["alpha"]["etag"] == '"v1"'
+    db.record_fetch("alpha", ok=True, validators=(None, "Mon, 01 Sep 2026 11:00:00 GMT"))
+    st = db.source_states()["alpha"]
+    assert st["etag"] is None and st["last_modified"] == "Mon, 01 Sep 2026 11:00:00 GMT"
+    db.record_fetch("alpha", ok=False, error="HTTP 500")  # Fehlschlag löscht beide
+    st = db.source_states()["alpha"]
+    assert st["etag"] is None and st["last_modified"] is None and st["last_error"] == "HTTP 500"

@@ -1,7 +1,9 @@
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
-RUN groupadd -g 1000 kiosk && useradd -u 1000 -g kiosk -m kiosk
+# Eigene uid/gid nur für Kiosk: 1000 gehört auf der Box schon einem anderen Dienst (maildigest).
+# docker-compose.yml setzt dieselbe als user: (gilt dann auch für ältere Images beim Zurückrollen).
+RUN groupadd -g 10100 kiosk && useradd -u 10100 -g kiosk -m kiosk
 
 WORKDIR /app
 COPY requirements.txt .

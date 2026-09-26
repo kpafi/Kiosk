@@ -25,6 +25,8 @@ export function profileEditorView(route) {
   let addingTerm = false;
   let confirmDelete = false;
   let error = '';
+  let busy = false;    // Speichern oder Löschen läuft (Enter im Namensfeld umgeht den gesperrten Knopf)
+  let alive = true;    // false nach destroy(): nach spätem Erfolg nicht mehr zurücknavigieren
 
   function load() {
     Promise.allSettled([state.sources ? null : loadSources(), isNew ? null : loadProfiles()]).then(([, loaded]) => {
@@ -56,8 +58,10 @@ export function profileEditorView(route) {
   }
 
   async function save() {
+    if (busy || (!isNew && !profile)) return;
     error = validate();
     if (error) { build(); return; }
+    busy = true;
     saveBtn.disabled = true;
     const body = { name: draft.name.trim(), terms: draft.terms, in_bar: draft.in_bar, sources: draft.sources };
     try {
@@ -66,17 +70,22 @@ export function profileEditorView(route) {
       await Promise.allSettled([loadProfiles(), loadBar()]);
       emit('profiles');
       toast('Profil gespeichert');
-      // Zurück wie mit der Zurück-Taste (zum Profil-Blatt), ohne doppelten #/profile-Eintrag.
-      goBack('#/profile');
+      // Zurück wie mit der Zurück-Taste (zum Profil-Blatt), ohne doppelten #/profile-Eintrag. busy
+      // bleibt gesetzt: history.back() wechselt die Ansicht erst später, bis dahin kein zweites Speichern.
+      if (alive) goBack('#/profile');
     } catch (err) {
+      busy = false;
+      saveBtn.disabled = false;
       error = err.detail || err.message;
       build();
-    } finally {
-      saveBtn.disabled = false;
     }
   }
 
-  async function remove() {
+  async function remove(e) {
+    if (busy) return;
+    busy = true;
+    saveBtn.disabled = true;
+    if (e && e.currentTarget) e.currentTarget.disabled = true;
     try {
       await api(`profiles/${profile.id}`, { method: 'DELETE' });
       await Promise.allSettled([loadProfiles(), loadBar()]);
@@ -85,9 +94,13 @@ export function profileEditorView(route) {
       toast('Profil gelöscht');
       // Aus dem Profil-Blatt geöffnet: zurück wie beim Speichern (sonst stünde das Blatt zweimal
       // im Verlauf). Sonst nicht zurück: der vorige Eintrag kann eine Liste des gelöschten Profils sein.
+      // busy bleibt gesetzt (wie beim Speichern): Das Profil gibt es nicht mehr.
+      if (!alive) return;
       if (parseHash(state.prevHash || '').name === 'profiles') goBack('#/profile');
       else replaceHash('#/profile');
     } catch (err) {
+      busy = false;
+      saveBtn.disabled = false;
       error = err.status === 409 ? 'Vorgegebene Profile lassen sich nicht löschen.' : err.detail || err.message;
       confirmDelete = false;
       build();
@@ -235,5 +248,8 @@ export function profileEditorView(route) {
   }
 
   load();
-  return { el, layout: 'page', bar: false, title: 'Profil' };
+  return {
+    el, layout: 'page', bar: false, title: 'Profil',
+    destroy() { alive = false; },
+  };
 }

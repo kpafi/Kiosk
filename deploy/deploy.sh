@@ -4,6 +4,11 @@ set -euo pipefail
 BOX="${BOX:-kiosk-server}"
 DEST=/opt/kiosk
 HOST=kiosk.example.org
+# Zusätzlich gesperrte Abrufziele (KIOSK_FETCH_DENY_IPS): die eigenen Adressen der Box, damit ein
+# Feed oder Artikel nicht auf Dienste des Servers selbst zeigen kann. Wird in eine bestehende .env
+# nur eingetragen, wenn der Schlüssel dort fehlt; ein vorhandener Wert bleibt. Kein ganzes
+# Provider-Netz eintragen (2a01:4f8::/32 sperrte auch dort gehostete Nachrichtenseiten).
+FETCH_DENY_IPS="203.0.113.10,2001:db8:1234:5678::/64"
 cd "$(dirname "$0")/.."
 BUILD=$(date -u +%Y%m%dT%H%M%SZ)
 # Wartezeit auf /healthz nach dem Start (Sekunden); die Schema-Migration kann bei großen
@@ -30,32 +35,101 @@ Deploy abgebrochen, der neue Container (kiosk:candidate) läuft evtl. schon.
 Zurückrollen auf den letzten geprüften Stand:
   cd $DEST && docker compose down
   docker tag $target kiosk:latest
+  chown -R 10100:10100 $DEST/data
   Datenbank zurück (Schema evtl. schon migriert): Pre-Deploy-Backup
     ${predeploy:-<keins angelegt>}
-  gunzip -c <Backup> > $DEST/data/kiosk.db, $DEST/data/kiosk.db-wal und -shm löschen,
-  chown 1000:1000 $DEST/data/kiosk.db
+  bei gestopptem Container; geschrieben wird nur als 10100, root folgt so keinem Symlink aus dem Container:
+  cd / && gunzip -c <Backup> | setpriv --reuid=10100 --regid=10100 --clear-groups \
+    sh -c 'cd $DEST/data && rm -f kiosk.db kiosk.db-wal kiosk.db-shm && umask 077 && cat > kiosk.db'
   cd $DEST && docker compose up -d --no-build
+  (docker-compose.yml setzt user: 10100:10100, auch das ältere Image läuft damit als 10100;
+  data/ gehört 10100, nicht auf 1000 zurückstellen)
+MSG
+}
+
+# Scheitert das Umstellen von data/ oder der Start selbst: Das Schema ist dann noch nicht migriert
+# (der neue Container lief nicht an), eine Datenbank muss nicht zurück.
+start_hint() {
+  local target
+  if [ -n "$good_image" ]; then target="kiosk:good"; else target="${prev_image:-<kein vorheriges Image, erster Deploy>}"; fi
+  cat >&2 <<MSG
+Deploy abgebrochen beim Umstellen von data/ auf uid 10100 oder beim Start des neuen Containers.
+Keine Datenbank-Wiederherstellung nötig. Weiter mit dem letzten geprüften Stand:
+  cd $DEST && docker compose down
+  docker tag $target kiosk:latest
+  chown -R 10100:10100 $DEST/data && chmod 700 $DEST/data
+  cd $DEST && docker compose up -d --no-build
+  (docker-compose.yml setzt user: 10100:10100, das ältere Image läuft damit als 10100 und kann
+  data/ schreiben; data/ nicht auf 1000 zurückstellen. Lief der neue Container doch schon an,
+  gilt der Hinweis mit dem Pre-Deploy-Backup: ${predeploy:-<keins angelegt>})
+Brach nur die SSH-Verbindung ab, läuft der Schritt auf der Box zu Ende; erst nachsehen:
+  cat $DEST/backups/deploy-start.log; docker ps --filter name=kiosk
 MSG
 }
 
 echo "== Code nach $BOX:$DEST"
 ssh "$BOX" "mkdir -p $DEST/data"
 # /bin/ und /backups/ gibt es nur auf dem Server; ohne Exclude würde --delete sie löschen.
-rsync -az --delete --itemize-changes \
+# Auf die Box kommt nur, was Build und Betrieb brauchen: Dockerfile, .dockerignore,
+# docker-compose.yml, requirements.txt, app/, static/, sources.yaml, deploy/ (backup.sh,
+# Caddyfile.kiosk), dazu README.md und .env.example als Doku. Ältere Deploys luden auch
+# Entwicklungsdateien hoch; die entfernt der Schritt "Besitzer und Rechte".
+# Auf dem Server gehört der Code root und ist nur für root schreibbar (sonst kämen uid und
+# Modi 775/664 vom Laptop mit). Nichts davon wird direkt ausgeführt: backup.sh installiert der
+# nächste Schritt mit eigenem Modus, deploy.sh und user.sh laufen auf dem Laptop.
+rsync -az --delete --itemize-changes --chown=root:root --chmod=D755,F644 \
   --exclude /data/ --exclude /bin/ --exclude /backups/ --exclude .env \
   --exclude venv/ --exclude .venv/ --exclude '__pycache__/' \
   --exclude .git/ --exclude '*.pyc' --exclude .pytest_cache/ \
+  --exclude /.claude/ --exclude /design/ --exclude /docs/ --exclude /tests/ \
+  --exclude /pytest.ini --exclude /requirements-dev.txt --exclude /.gitignore \
   ./ "$BOX:$DEST/"
 
 echo "== .env"
-ssh "$BOX" "cd $DEST && if [ ! -f .env ]; then
-  umask 077
-  pw=\$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')
-  printf 'KIOSK_PASSWORD=%s\nKIOSK_FETCH_INTERVAL=900\nKIOSK_RETENTION_DAYS=90\n' \"\$pw\" > .env
-  chmod 600 .env
-  echo 'Neue .env angelegt. Passwort steht in $DEST/.env'
-else echo '.env vorhanden, unverändert'; fi
-chown -R 1000:1000 $DEST/data"
+# Neue .env mit Zufallspasswort (nie ausgegeben); KIOSK_FETCH_DENY_IPS wird ergänzt, wenn der
+# Schlüssel fehlt, ein vorhandener Wert bleibt. Immer root, Modus 600.
+ssh "$BOX" bash -s -- "$DEST" "$FETCH_DENY_IPS" <<'ENV'
+set -euo pipefail
+cd "$1"
+deny=$2
+umask 077
+if [ ! -f .env ]; then
+  pw=$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')
+  printf 'KIOSK_PASSWORD=%s\nKIOSK_FETCH_INTERVAL=900\nKIOSK_RETENTION_DAYS=90\n' "$pw" > .env
+  echo "Neue .env angelegt. Passwort steht in $1/.env"
+else
+  echo ".env vorhanden"
+fi
+if ! grep -q '^[[:space:]]*KIOSK_FETCH_DENY_IPS=' .env; then
+  if [ -n "$(tail -c1 .env)" ]; then echo >> .env; fi   # letzte Zeile ohne Zeilenende
+  printf 'KIOSK_FETCH_DENY_IPS=%s\n' "$deny" >> .env
+  echo "KIOSK_FETCH_DENY_IPS=$deny in .env ergänzt"
+fi
+chown root:root .env
+chmod 600 .env
+ENV
+
+echo "== Besitzer und Rechte (Code)"
+# Idempotent bei jedem Deploy. Code, Konfiguration, bin/ und backups/: root, für andere nicht
+# schreibbar (frühere Deploys brachten uid 1000 und 775/664 vom Laptop mit). data/ bleibt hier
+# unberührt: Der alte Container läuft bis zum Start des neuen weiter und braucht es unverändert
+# (siehe "Datenverzeichnis" direkt vor dem Start).
+ssh "$BOX" bash -s -- "$DEST" <<'PERMS'
+set -euo pipefail
+dest=$1
+# Schutz für die rm -rf weiter unten: nie ein leerer oder relativer Pfad
+case $dest in /?*) ;; *) echo "Ungültiges Ziel: '$dest'" >&2; exit 1 ;; esac
+chown root:root "$dest"
+chmod go-w "$dest"
+find "$dest" -mindepth 1 -path "$dest/data" -prune -o \( ! -user root -o ! -group root \) \
+  -exec chown -h root:root {} +
+find "$dest" -mindepth 1 -path "$dest/data" -prune -o ! -type l -perm /022 -exec chmod go-w {} +
+# Entwicklungsdateien früherer Deploys (rsync lädt sie nicht mehr hoch, --delete räumt
+# ausgeschlossene Pfade nicht weg).
+rm -rf -- "$dest/.claude" "$dest/design" "$dest/docs" "$dest/tests" "$dest/pytest.ini" \
+  "$dest/requirements-dev.txt" "$dest/.gitignore"
+echo "Rechte gesetzt: Code root, für andere nicht schreibbar"
+PERMS
 
 echo "== Backup-Skript und Cron"
 # Wird bei jedem Deploy überschrieben (idempotent).
@@ -70,6 +144,14 @@ chmod 644 /etc/cron.d/kiosk-backup"
 # keinen Rückweg.
 old_keeps_running() {
   echo "Deploy abgebrochen vor dem Start des neuen Containers. Alter Container läuft weiter, nichts zu tun." >&2
+  # Das neue docker-compose.yml (user: 10100) liegt schon auf der Box. Gehört data/ noch einer
+  # anderen uid (erster Deploy nach dem Wechsel), startete ein händisches `docker compose up`
+  # den Container als 10100 ohne Zugriff auf data/.
+  cat >&2 <<EOF
+Achtung: Gehört $DEST/data noch nicht uid 10100 (ls -ln $DEST), vor dem nächsten erfolgreichen
+Deploy kein 'docker compose up' von Hand ausführen. Sonst zuerst:
+  chown -R 10100:10100 $DEST/data
+EOF
   exit 1
 }
 
@@ -97,8 +179,60 @@ fi
 # Explizite Prüfungen (if ! ...) rufen rollback_hint selbst auf, ERR greift dort nicht.
 trap rollback_hint ERR
 
-echo "== Container starten"
-ssh "$BOX" "cd $DEST && KIOSK_IMAGE=kiosk:candidate docker compose up -d --no-build --remove-orphans"
+echo "== Datenverzeichnis für uid 10100 und Container starten"
+# Kiosk läuft als eigene uid/gid 10100 (Dockerfile, docker-compose.yml user:); frühere Versionen
+# liefen als 1000, die auf der Box maildigest gehört. Umstellen und Start in EINEM Aufruf auf der
+# Box: Bricht die SSH-Verbindung dazwischen ab, liefe sonst der alte Container (uid 1000) gegen ein
+# data/, das er nicht mehr lesen darf. Bis dahin arbeitet er mit seinen offenen Dateien weiter.
+# data/ gehört danach 10100 und ist nur für ihn lesbar: Verzeichnis 700, Datenbank und Secret 600.
+# chown -R folgt keinen Symlinks (-P ist Standard); das chmod der Dateien läuft als 10100, damit
+# root keinem Symlink folgt, den der Container dort anlegen könnte. cd /: Die SSH-Sitzung beginnt
+# in /root (700); find als 10100 bräche dort ab ("Konnte nicht ... zurückkehren").
+# Robust gegen einen Abbruch der SSH-Verbindung (oder Strg-C) zwischen chown und compose up: Das
+# Skript wird als Ganzes gelesen ({ ... }), ignoriert HUP, PIPE und INT und schreibt nach
+# backups/deploy-start.log (am Ende an SSH weitergereicht). Es hält das Lock von backup.sh, damit
+# der tägliche Lauf um 03:30 nicht dazwischen kommt. Exit 42: nichts verändert.
+rc=0
+ssh "$BOX" bash -s -- "$DEST" <<'START' || rc=$?
+{
+set -euo pipefail
+trap '' HUP PIPE INT
+cd /
+dest=$1
+mkdir -p "$dest/backups"
+log="$dest/backups/deploy-start.log"
+exec 3>&1 >"$log" 2>&1
+trap 'rc=$?; cat "$log" >&3 2>/dev/null || true; exit $rc' EXIT
+# 10100 darf auf dem Host niemandem sonst gehören (sonst bekäme dieser Benutzer data/).
+for db in passwd group; do
+  if owner=$(getent "$db" 10100); then
+    echo "FEHLER: 10100 gehört auf dem Host schon ${owner%%:*} ($db); data/ bleibt unverändert."
+    exit 42
+  fi
+done
+exec 9>"$dest/backups/.backup.lock"
+if ! flock -w 300 9; then
+  echo "FEHLER: Ein Kiosk-Backup hält das Lock seit über 300 s; data/ bleibt unverändert."
+  exit 42
+fi
+mkdir -p "$dest/data"
+chown -R 10100:10100 "$dest/data"
+chmod 700 "$dest/data"
+setpriv --reuid=10100 --regid=10100 --clear-groups \
+  find "$dest/data" -maxdepth 1 -type f \( -name 'kiosk.db*' -o -name secret.key \) ! -perm 600 \
+  -exec chmod 600 {} +
+echo "data/ gehört 10100:10100 (700, Datenbank und Secret 600)"
+cd "$dest"
+KIOSK_IMAGE=kiosk:candidate docker compose up -d --no-build --remove-orphans
+exit 0
+}
+START
+if [ "$rc" = 42 ]; then
+  old_keeps_running
+elif [ "$rc" != 0 ]; then
+  start_hint
+  exit 1
+fi
 
 echo "== Warten auf /healthz (bis ${HEALTH_WAIT} s)"
 # Nach einem Update kann die Schema-Migration beim Start dauern (KIOSK_HEALTH_WAIT, Standard 300 s).

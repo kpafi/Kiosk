@@ -19,13 +19,15 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .auth import COOKIE_NAMES, LOGIN_ERROR, Auth, burn_time, normalize_username, verify_password
+from .auth import (COOKIE_NAMES, INVALID_NAME_KEY, LOGIN_ERROR, Auth, burn_time, ip_key, normalize_username,
+                   verify_password)
 from .config import docs_enabled, load_settings
-from .db import Database, _iso, utcnow
+from .db import Database, QueryTimeout, _iso, utcnow
 from .fetcher import Fetcher
 from .sources import Catalog
 from .state import State, state  # noqa: F401  (State für Importe von außen)
 from . import api_ui
+from . import db as db_mod
 from .api_ui import admin_user, article_scope, current_user, invalidate_unread, public_user
 from .users import seed_builtin_profiles
 
@@ -45,6 +47,18 @@ MAX_ID = 2**63 - 1                      # größter SQLite-INTEGER; größere We
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Alles, was die App anlegt (Datenbank samt -wal/-shm, secret.key), nur für den eigenen
+    # Benutzer lesbar; vor dem ersten Öffnen der Datenbank. Gilt auch für die Worker-Prozesse.
+    old_umask = os.umask(0o077)
+    try:
+        async with _running(app):
+            yield
+    finally:
+        os.umask(old_umask)
+
+
+@asynccontextmanager
+async def _running(app: FastAPI):
     state.settings = load_settings()
     state.catalog = Catalog.load(state.settings.sources_file)
     s = state.settings
@@ -114,12 +128,21 @@ app = FastAPI(title="Kiosk", version="0.1.0", lifespan=lifespan, redoc_url=None,
               docs_url="/docs" if _DOCS else None, openapi_url="/openapi.json" if _DOCS else None)
 
 
+@app.exception_handler(QueryTimeout)
+async def query_timeout(request: Request, exc: QueryTimeout):
+    """Eine Leseabfrage hat ihr Zeitlimit überschritten (siehe db.READ_TIME_LIMIT)."""
+    log.warning("Abfrage abgebrochen (%s %s): %s", request.method, request.url.path, exc)
+    return JSONResponse({"detail": "Die Anfrage dauert zu lange, bitte später erneut versuchen"},
+                        status_code=503)
+
+
 # ---- auth ----------------------------------------------------------------
 
 def _client_ip(request: Request) -> str:
-    # uvicorn --proxy-headers setzt request.client bereits aus X-Forwarded-For,
-    # aber nur für vertrauenswürdige Proxys (--forwarded-allow-ips).
-    return request.client.host if request.client else "?"
+    """Schlüssel der Login-Bremse für den Absender: IPv4-Adresse bzw. IPv6-/64-Netz (auth.ip_key).
+    uvicorn --proxy-headers setzt request.client bereits aus X-Forwarded-For, aber nur für
+    vertrauenswürdige Proxys (--forwarded-allow-ips)."""
+    return ip_key(request.client.host) if request.client else "?"
 
 
 def _load_user(request: Request) -> dict[str, Any] | None:
@@ -159,6 +182,22 @@ def _same_origin(request: Request) -> bool:
 @app.middleware("http")
 async def require_login(request: Request, call_next):
     path = request.url.path
+    # Leseabfragen während einer API-Anfrage bekommen eine Frist (db.READ_TIME_LIMIT); eine Aufgabe,
+    # die hier gestartet wird, erbt sie (Fetcher._spawn setzt sie für Extraktionen zurück).
+    if not path.startswith("/api/"):
+        return await _require_login(request, call_next, path)
+    token = db_mod.request_time_limit.set(db_mod.READ_TIME_LIMIT)
+    try:
+        return await _require_login(request, call_next, path)
+    except QueryTimeout as exc:
+        # Aus der Middleware selbst (z. B. Benutzer laden): Die Exception-Handler der App greifen
+        # erst hinter call_next, ohne dies würde es ein 500.
+        return await query_timeout(request, exc)
+    finally:
+        db_mod.request_time_limit.reset(token)
+
+
+async def _require_login(request: Request, call_next, path: str):
     if path.startswith("/api/") and request.method not in SAFE_METHODS and not _same_origin(request):
         return JSONResponse({"detail": "Fremde Herkunft abgelehnt"}, status_code=403)
     if path.startswith("/api/") or path in ("/docs", "/openapi.json"):
@@ -209,7 +248,9 @@ class LoginBody(BaseModel):
 async def login(body: LoginBody, request: Request):
     ip = _client_ip(request)
     username = normalize_username(body.username)
-    limit_key = username or body.username.strip().lower()[:64]
+    # Ungültige Namen teilen sich einen Zähler (sie können kein Konto treffen); so verdrängen
+    # beliebige Fantasienamen die Zähler echter Namen nicht aus der begrenzten Liste.
+    limit_key = username or INVALID_NAME_KEY
     # Der Versuch zählt schon vor der Passwortprüfung (atomar mit der Prüfung der Grenzen);
     # ein erfolgreicher Login gibt nur diese Reservierung zurück (die Zähler des Namens verfallen).
     if not state.auth.reserve(ip, limit_key):
@@ -471,6 +512,10 @@ async def list_articles(
                                       **filters)
         # Trefferzahl nur bei Suchen, gedeckelt
         total = state.db.count_articles(user["id"], cap=1000, query=q, **filters) if q else None
+    except QueryTimeout as e:
+        if q:
+            raise HTTPException(503, "Die Suche dauert zu lange, bitte genauer suchen") from e
+        raise
     except sqlite3.OperationalError as e:
         if q:
             raise HTTPException(400, "Ungültige Suchanfrage") from e
@@ -549,12 +594,13 @@ async def get_article(article_id: int = PathParam(ge=1, le=MAX_ID), retry: bool 
     # abgeschlossene Artikel übergehen (Fehlschläge zählen dabei weiter als Versuche).
     # Nicht blockierend: Die Extraktion läuft im Hintergrund, die Antwort meldet dann
     # text_status "pending" und extracting=true, die Oberfläche fragt erneut nach.
+    # Gedeckelt: Laufen schon zu viele Abrufe auf Anforderung oder liegt der letzte erneute
+    # Versuch keine zwei Minuten zurück, startet keiner (extracting bleibt false).
     due = row["next_attempt_at"] is None or row["next_attempt_at"] <= utcnow()
+    forced = retry and row["text_status"] in ("failed", "empty", "partial")
     extracting = state.fetcher.is_extracting(article_id)
-    if not extracting and ((row["text_status"] == "pending" and due)
-                           or (retry and row["text_status"] in ("failed", "empty", "partial"))):
-        state.fetcher.start_extraction(article_id, row["url"])
-        extracting = True
+    if not extracting and ((row["text_status"] == "pending" and due) or forced):
+        extracting = state.fetcher.start_extraction(article_id, row["url"], retry=forced)
     item = _decorate(dict(row))
     item["extracting"] = extracting
     if extracting:

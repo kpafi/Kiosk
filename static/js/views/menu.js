@@ -1,7 +1,7 @@
 // Menü-Blatt (E2Menu): Profile, Lieblingszeitungen, Gemerkt, Einstellungen, alles gelesen.
 import { h } from '../ui/dom.js';
 import { icon, checkCheck, chevronRight, close as closeIcon } from '../ui/icons.js';
-import { closeSheet, openSheet, rebuildSheet, sheetGrip } from '../ui/sheet.js';
+import { closeSheet, isSheetOpen, openSheet, rebuildSheet, sheetGrip } from '../ui/sheet.js';
 import { toast } from '../ui/dom.js';
 import { api } from '../api.js';
 import {
@@ -85,7 +85,7 @@ export function openMenu() {
     if (!confirming) {
       bottom = h('button', {
         type: 'button', class: 'pill pill--block', style: { marginTop: '12px' },
-        on: { click: () => { confirming = true; confirmMaxId = readAllWatermark(); rebuildSheet(build); panel.querySelector('.confirm .pill--primary')?.focus(); } },
+        on: { click: () => { confirming = true; confirmMaxId = readAllWatermark(); rebuildSheet(build, panel); panel.querySelector('.confirm .pill--primary')?.focus(); } },
       }, checkCheck(20), h('span', { text: 'Alles als gelesen markieren' }));
     } else {
       const what = unread !== null && unread !== undefined ? `${unread} Artikel` : 'Alle Artikel';
@@ -93,7 +93,7 @@ export function openMenu() {
         h('span', { class: 'confirm-text t-caption', text: `Wirklich? ${what}${name ? ` in „${name}“` : ''}` }),
         h('button', {
           type: 'button', class: 'pill', text: 'Abbrechen',
-          on: { click: () => { confirming = false; rebuildSheet(build); } },
+          on: { click: () => { confirming = false; rebuildSheet(build, panel); } },
         }),
         h('button', {
           type: 'button', class: 'pill pill--primary', text: 'Ja',
@@ -102,11 +102,11 @@ export function openMenu() {
               e.currentTarget.disabled = true;
               try {
                 await markAllRead(state.ctx, confirmMaxId);
-                closeSheet();
+                if (isSheetOpen(panel)) closeSheet();   // nicht ein inzwischen geöffnetes anderes Blatt
               } catch (err) {
                 toast(`Fehler: ${err.detail || err.message}`);
                 confirming = false;
-                rebuildSheet(build);
+                rebuildSheet(build, panel);
               }
             },
           },
@@ -128,10 +128,10 @@ export function openMenu() {
       bottom);
   }
 
-  openSheet(build, { label: 'Menü' });
+  const panel = openSheet(build, { label: 'Menü' });
   // Zähler frisch holen und Blatt nachziehen.
   // Zeitungen nur im Zeitungskontext (unread_all für die Rückfrage), sonst unnötig.
   Promise.allSettled([loadCounts(), loadProfiles(), loadBar(), state.ctx.type === 'source' ? loadSources() : null,
     state.counts ? null : loadFavorites()])
-    .then(() => rebuildSheet(build));
+    .then(() => rebuildSheet(build, panel));
 }

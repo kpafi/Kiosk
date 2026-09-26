@@ -98,13 +98,14 @@ export function searchView(route) {
     feed = createFeed({
       dayGroups: false,
       words,
-      load: async (cursor) => {
+      load: async (cursor, isStale) => {
         const params = {
           q, limit: 30, days: days || undefined,
           source: source || undefined, offset: cursor ?? undefined,
         };
         const res = await api('articles', { params });
-        if (cursor == null) {
+        // Verspätete Antwort einer älteren Anfrage (oder nach dem Leeren): Trefferzeile nicht anfassen.
+        if (cursor == null && !isStale()) {
           const total = typeof res.total === 'number' ? res.total : null;
           const n = total !== null ? (total >= 1000 ? '1000+' : total) : `${res.items.length}${res.next_offset ? '+' : ''}`;
           resultLine.firstChild.textContent = `${n} ${total === 1 ? 'TREFFER' : 'TREFFER'}`;

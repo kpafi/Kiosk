@@ -40,7 +40,8 @@ function withLongPress(el) {
 
 function barChip(item) {
   const active = isActive(item);
-  const showCount = item.type !== 'all' && item.unread > 0;
+  // Zähler null (Profil, Zahl nicht rechtzeitig berechnet): kein Zähler, Name ohne Zahl.
+  const showCount = item.type !== 'all' && typeof item.unread === 'number' && item.unread > 0;
   return withLongPress(h('a', {
     class: `bar-chip${item.type === 'all' ? ' bar-chip--all' : ''}${active ? ' is-on' : ''}`,
     href: hrefFor(item),

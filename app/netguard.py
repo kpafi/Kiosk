@@ -1,4 +1,4 @@
-"""Schutz vor SSRF: Nur öffentliche http(s)-Ziele dürfen abgerufen werden."""
+"""Schutz vor SSRF: Nur öffentliche http(s)-Ziele auf den Standard-Ports dürfen abgerufen werden."""
 from __future__ import annotations
 
 import asyncio
@@ -8,6 +8,18 @@ from urllib.parse import urlparse
 
 BLOCKED_HOSTNAMES = {"localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"}
 METADATA_IP = ipaddress.ip_address("169.254.169.254")
+# Nur die Standard-Ports: Feeds und Artikel liegen dort; andere Ports öffentlicher Hosts (Admin-
+# Oberflächen, Datenbanken) sind kein Ziel für einen Leser.
+DEFAULT_PORTS = {"http": 80, "https": 443}
+
+# Zusätzlich gesperrte Netze (KIOSK_FETCH_DENY_IPS, siehe config.fetch_deny_networks), gesetzt vom
+# Fetcher; gelten für die Namensprüfung und die tatsächliche Gegenstelle.
+_deny_networks: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = ()
+
+
+def set_deny_networks(networks) -> None:
+    global _deny_networks
+    _deny_networks = tuple(networks)
 
 
 class BlockedURL(Exception):
@@ -19,10 +31,13 @@ class ResolveError(Exception):
 
 
 def ip_is_blocked(ip: str | ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """True für alles, was nicht eindeutig eine öffentliche Unicast-Adresse ist."""
+    """True für alles, was nicht eindeutig eine öffentliche Unicast-Adresse ist, und für Adressen
+    aus KIOSK_FETCH_DENY_IPS."""
     addr = ipaddress.ip_address(ip) if isinstance(ip, str) else ip
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
         addr = addr.ipv4_mapped
+    if any(addr in net for net in _deny_networks):
+        return True
     return (
         addr == METADATA_IP
         or addr.is_private
@@ -43,6 +58,9 @@ async def check_url(url: str) -> None:
     host = (parsed.hostname or "").rstrip(".").lower()
     if not host:
         raise BlockedURL("Kein Hostname")
+    port = parsed.port  # ValueError bei ungültigem Port (Aufrufer: ungültige URL)
+    if port is not None and port != DEFAULT_PORTS[parsed.scheme]:
+        raise BlockedURL(f"Port nicht erlaubt: {port} (nur {DEFAULT_PORTS[parsed.scheme]} für {parsed.scheme})")
     if host in BLOCKED_HOSTNAMES or host.endswith(".localhost"):
         raise BlockedURL(f"Host nicht erlaubt: {host}")
     try:
@@ -55,8 +73,7 @@ async def check_url(url: str) -> None:
         return
     loop = asyncio.get_running_loop()
     try:
-        infos = await loop.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80),
-                                       type=socket.SOCK_STREAM)
+        infos = await loop.getaddrinfo(host, DEFAULT_PORTS[parsed.scheme], type=socket.SOCK_STREAM)
     except socket.gaierror as e:
         raise ResolveError(f"Name nicht auflösbar: {host} ({e})") from e
     if not infos:

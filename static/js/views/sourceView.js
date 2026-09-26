@@ -19,6 +19,7 @@ export function sourceView(route) {
   let mode = state.unread ? 'unread' : 'all'; // unread | all | images
   let confirming = false;
   let confirmMaxId;   // Stand der Liste beim Öffnen der Rückfrage
+  let alive = true;   // false nach destroy(): späte Antworten bauen die Liste nicht mehr neu auf
 
   const titles = h('div', { class: 'hdr-titles' });
   const favBtn = iconButton(star(20), 'Lieblingszeitung', { onClick: toggleFavorite });
@@ -48,7 +49,7 @@ export function sourceView(route) {
     const name = s ? s.name : id;
     const parts = [s ? s.country : null];
     const unread = unreadCount();
-    if (unread !== null) parts.push(`${unread} ungelesen heute`);
+    if (typeof unread === 'number') parts.push(`${unread} ungelesen heute`);   // null: nicht berechnet
     if (s && s.last_ok_at) parts.push(`${ago(s.last_ok_at)} geholt`);
     replace(titles,
       h('h1', { class: 't-section', text: name.toUpperCase() }),
@@ -98,7 +99,8 @@ export function sourceView(route) {
       h('button', {
         type: 'button', class: 'pill pill--primary', text: 'Ja',
         on: {
-          click: async () => {
+          click: async (e) => {
+            e.currentTarget.disabled = true;   // kein zweiter Auftrag, solange der erste läuft
             try {
               await markAllRead({ type: 'source', id }, confirmMaxId);
             } catch (err) {
@@ -126,6 +128,7 @@ export function sourceView(route) {
   }
 
   function rebuild() {
+    if (!alive) return;   // sonst überschriebe die alte Ansicht listItems und Wasserstand der neuen
     feed?.destroy();
     feed = createFeed({
       dayGroups: true,
@@ -215,6 +218,6 @@ export function sourceView(route) {
 
   return {
     el, layout: 'list', bar: true, title: src() ? src().name : 'Zeitung',
-    destroy() { feed?.destroy(); offs.forEach((off) => off()); },
+    destroy() { alive = false; feed?.destroy(); offs.forEach((off) => off()); },
   };
 }

@@ -567,3 +567,64 @@ def test_saved_list_hides_summary_of_paywalled_articles(authed):
     items = {it["id"]: it for it in authed.get("/api/articles", params={"later": "true"}).json()["items"]}
     assert items[ids["alpha-1"]]["paywalled"] == 1 and items[ids["alpha-1"]]["summary"] == ""
     assert items[ids["alpha-2"]]["summary"] == "Zusammenfassung 2"
+
+
+def test_profiles_per_user_are_capped(authed):
+    existing = len(authed.get("/api/profiles").json())
+    for i in range(api_ui.MAX_PROFILES - existing):
+        assert authed.post("/api/profiles", json={"name": f"P{i}"}).status_code == 201
+    r = authed.post("/api/profiles", json={"name": "zu viel"})
+    assert r.status_code == 409 and f"Höchstens {api_ui.MAX_PROFILES} Profile" in r.json()["detail"]
+    pid = authed.get("/api/profiles").json()[-1]["id"]
+    assert authed.delete(f"/api/profiles/{pid}").status_code == 204
+    assert authed.post("/api/profiles", json={"name": "wieder Platz"}).status_code == 201
+
+
+def test_too_expensive_profile_counter_is_null_and_not_retried(authed, monkeypatch):
+    from app.db import QueryTimeout
+    api_ui.invalidate_unread()
+    calls = []
+
+    def slow(*a, time_limit=None, **kw):
+        calls.append(time_limit)
+        raise QueryTimeout("Abfrage nach 2 s abgebrochen")
+
+    monkeypatch.setattr(state.db, "count_articles", slow)
+    r = authed.get("/api/profiles")
+    assert r.status_code == 200 and [p["unread"] for p in r.json()] == [None] * 4
+    assert len(calls) == 4
+    # Markiert als zu teuer: weder die Liste noch die Leiste noch ein Lesestand-Wechsel zählen neu.
+    assert authed.get("/api/profiles").status_code == 200
+    bar = authed.get("/api/bar").json()["items"]
+    assert [it["unread"] for it in bar if it["type"] == "profile"] == [None, None]
+    api_ui.invalidate_unread(UID)
+    authed.get("/api/profiles")
+    assert len(calls) == 4
+    # Wer das Profil ändert, bekommt einen neuen Versuch.
+    pid = authed.get("/api/profiles").json()[0]["id"]
+    authed.patch(f"/api/profiles/{pid}", json={"name": "Neu"})
+    assert len(calls) == 5
+
+
+def test_profile_counts_share_one_time_budget(authed, monkeypatch):
+    from types import SimpleNamespace
+    from app.db import QueryTimeout
+    api_ui.invalidate_unread()
+    monkeypatch.setattr(api_ui, "PROFILE_COUNT_BUDGET", 0.3)
+    # Simulierte Uhr statt echter Wartezeit: Der Test hängt nicht von der Last des Rechners ab.
+    clock = [1000.0]
+    monkeypatch.setattr(api_ui, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    def count(*a, time_limit=None, **kw):
+        if time_limit < 0.2:    # die Zählung braucht 0,2 s
+            clock[0] += time_limit
+            raise QueryTimeout("Abfrage abgebrochen")
+        clock[0] += 0.2
+        return 5
+
+    monkeypatch.setattr(state.db, "count_articles", count)
+    first = [p["unread"] for p in authed.get("/api/profiles").json()]
+    assert first == [5, None, None, None]
+    # Nicht Gezähltes wird nicht als „zu teuer“ gemerkt: Die nächste Anfrage zählt weiter.
+    second = [p["unread"] for p in authed.get("/api/profiles").json()]
+    assert second == [5, 5, None, None]

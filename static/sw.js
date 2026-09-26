@@ -71,8 +71,15 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-// Netzwerk zuerst, Cache nur als Rückfall (offline). /api/, /healthz, API-Doku und fremde Hosts
-// gehen direkt durch.
+// Gecachte Kopie; Seitenaufrufe fallen auf /index.html zurück (Hash-Router).
+function fromCache(req) {
+  return caches.match(req, { ignoreSearch: true })
+    .then((hit) => hit || (req.mode === 'navigate' ? caches.match('/index.html') : undefined));
+}
+
+// Netzwerk zuerst, Cache nur als Rückfall: offline und bei Serverfehlern (5xx, etwa 502/503 von
+// Caddy während eines Deploys). Gibt es keine Kopie, geht die Fehlerseite durch. Gecacht werden nur
+// erfolgreiche Antworten. /api/, /healthz, API-Doku und fremde Hosts gehen direkt durch.
 self.addEventListener('fetch', (event) => {
   const req = event.request;
   if (req.method !== 'GET') return;
@@ -83,14 +90,13 @@ self.addEventListener('fetch', (event) => {
   event.respondWith(
     fetch(req)
       .then((res) => {
+        if (res.status >= 500) return fromCache(req).then((hit) => hit || res);
         if (res.ok && res.type === 'basic') {
           const copy = res.clone();
           caches.open(CACHE).then((cache) => cache.put(req, copy)).catch(() => {});
         }
         return res;
       })
-      .catch(() => caches.match(req, { ignoreSearch: true })
-        .then((hit) => hit || (req.mode === 'navigate' ? caches.match('/index.html') : undefined))
-        .then((hit) => hit || Response.error())),
+      .catch(() => fromCache(req).then((hit) => hit || Response.error())),
   );
 });

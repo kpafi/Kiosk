@@ -153,7 +153,7 @@ def test_probe_does_not_read_env_credentials():
 
 def test_deploy_does_not_print_password():
     script = (ROOT / "deploy" / "deploy.sh").read_text(encoding="utf-8")
-    assert "Passwort steht in $DEST/.env" in script
+    assert "Passwort steht in $1/.env" in script
     assert not re.search(r"echo[^\n]*\$pw", script)
 
 
@@ -408,3 +408,397 @@ def test_compose_image_tag_and_init():
 def test_dockerfile_healthcheck_start_period():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "--start-period=180s" in dockerfile
+
+
+# ---- backup.sh: root fasst das Datenverzeichnis des Containers nicht an --------------------
+
+def _backup_snippet() -> str:
+    script = (ROOT / "deploy" / "backup.sh").read_text(encoding="utf-8")
+    m = re.search(r"<<'PY'\n(.*?)\nPY\n", script, re.S)
+    assert m, "Python-Stück in backup.sh nicht gefunden"
+    return m.group(1)
+
+
+def test_backup_root_part_never_opens_sqlite_or_chowns():
+    snippet = _backup_snippet()
+    dump_start = snippet.index('DUMP = r"""')
+    dump_end = snippet.index('"""', dump_start + len('DUMP = r"""'))
+    root_part = snippet[:dump_start] + snippet[dump_end + 3:]
+    assert "sqlite3" not in root_part and "os.chown" not in snippet and "shutil.chown" not in snippet
+    assert "sqlite3.connect" in snippet[dump_start:dump_end]
+    assert "O_NOFOLLOW" in root_part and "extra_groups" in root_part and '"-I"' in root_part
+
+
+def test_backup_as_root_runs_sqlite_as_container_user(tmp_path):
+    """Als root startet das Skript den SQLite-Teil mit uid/gid des Containers und ohne Zusatzgruppen
+    (hier simuliert: geteuid() == 0, Popen mitgeschnitten, der Wechsel selbst entfällt)."""
+    import json
+    import os
+    _make_db(tmp_path)
+    snippet = tmp_path / "backup.py"
+    snippet.write_text(_backup_snippet(), encoding="utf-8")
+    wrapper = f"""
+import json, os, subprocess, sys
+calls = []
+real = subprocess.Popen
+class Spy(real):
+    def __init__(self, args, **kw):
+        calls.append({{k: kw.pop(k, None) for k in ("user", "group", "extra_groups")}})
+        super().__init__(args, **kw)
+subprocess.Popen = Spy
+os.geteuid = lambda: 0
+sys.argv = ["-", {str(tmp_path / "data" / "kiosk.db")!r}, {str(tmp_path / "backups")!r}, "7", "daily"]
+try:
+    exec(compile(open({str(snippet)!r}).read(), "backup", "exec"), {{"__name__": "__main__"}})
+finally:
+    print("CALLS=" + json.dumps(calls))
+"""
+    env = {**os.environ, "KIOSK_BACKUP_UID": "4242"}
+    env.pop("KIOSK_BACKUP_GID", None)
+    r = subprocess.run([sys.executable, "-c", wrapper], env=env, text=True, capture_output=True)
+    assert r.returncode == 0, r.stderr
+    calls = json.loads(r.stdout.split("CALLS=")[1])
+    assert calls == [{"user": 4242, "group": 4242, "extra_groups": []}]
+    assert list((tmp_path / "backups").glob("kiosk-*.db.gz"))
+    # Ohne Angabe: Besitzer des Datenverzeichnisses (auf der Box 10100, während des Umzugs noch 1000).
+    env.pop("KIOSK_BACKUP_UID")
+    r = subprocess.run([sys.executable, "-c", wrapper], env=env, text=True, capture_output=True)
+    assert r.returncode == 0, r.stderr
+    data = (tmp_path / "data").stat()
+    assert json.loads(r.stdout.split("CALLS=")[1]) == [
+        {"user": data.st_uid, "group": data.st_gid, "extra_groups": []}]
+    # Gehört das Datenverzeichnis root, läuft nichts als root (simuliert: lstat meldet uid 0).
+    root_owned = wrapper.replace("os.geteuid = lambda: 0", f"""os.geteuid = lambda: 0
+_lstat = os.lstat
+def _fake_lstat(p, *a, **kw):
+    st = _lstat(p, *a, **kw)
+    if str(p) == {str(tmp_path / "data")!r}:
+        return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 0, 0, st.st_size,
+                               int(st.st_atime), int(st.st_mtime), int(st.st_ctime)))
+    return st
+os.lstat = _fake_lstat""")
+    r = subprocess.run([sys.executable, "-c", root_owned], env=env, text=True, capture_output=True)
+    assert r.returncode != 0 and "gehört root" in r.stderr
+    assert json.loads(r.stdout.split("CALLS=")[1]) == []
+
+
+def test_backup_does_not_follow_secret_symlink(tmp_path):
+    _make_db(tmp_path)
+    outside = tmp_path / "fremd.txt"
+    outside.write_text("geheim-von-root")
+    (tmp_path / "data" / "secret.key").symlink_to(outside)
+    r = _run_backup(tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "nicht kopiert" in r.stderr
+    assert not (tmp_path / "backups" / "secret.key").exists()
+
+
+def test_backup_does_not_copy_hardlinked_secret(tmp_path):
+    import os
+    _make_db(tmp_path)
+    outside = tmp_path / "fremd.txt"
+    outside.write_text("geheim-von-root")
+    os.link(outside, tmp_path / "data" / "secret.key")
+    r = _run_backup(tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert not (tmp_path / "backups" / "secret.key").exists()
+
+
+def test_backup_refuses_symlinked_database(tmp_path):
+    _make_db(tmp_path)
+    data = tmp_path / "data"
+    (data / "kiosk.db").rename(tmp_path / "echt.db")
+    (data / "kiosk.db").symlink_to(tmp_path / "echt.db")
+    r = _run_backup(tmp_path)
+    assert r.returncode != 0 and "keine einfache Datei" in r.stderr
+
+
+def test_backup_work_copy_is_removed(tmp_path):
+    import os
+    import time
+    _make_db(tmp_path)
+    data = tmp_path / "data"
+    stale = data / ".backup-alt"
+    stale.mkdir()
+    (stale / "kopie.db").write_bytes(b"halb")
+    os.utime(stale, (time.time() - 7200, time.time() - 7200))
+    fresh = data / ".backup-laeuft"
+    fresh.mkdir()
+    r = _run_backup(tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert sorted(p.name for p in data.iterdir() if p.name.startswith(".backup-")) == [".backup-laeuft"]
+
+
+# ---- deploy.sh: Besitzer und Rechte ------------------------------------------------------
+
+def test_rsync_sets_root_owner_and_modes():
+    script = (ROOT / "deploy" / "deploy.sh").read_text(encoding="utf-8")
+    assert "rsync -az --delete --itemize-changes --chown=root:root --chmod=D755,F644" in script
+    # Wird auf dem Server nichts direkt ausgeführt, reicht F644: backup.sh installiert install -m 700.
+    assert "install -m 700 $DEST/deploy/backup.sh $DEST/bin/backup.sh" in script
+    assert script.index("== Besitzer und Rechte (Code)") < script.index("backup.sh predeploy")
+
+
+def _heredoc(tag: str) -> str:
+    script = (ROOT / "deploy" / "deploy.sh").read_text(encoding="utf-8")
+    m = re.search(rf"<<'{tag}'[^\n]*\n(.*?)\n{tag}\n", script, re.S)
+    assert m, f"Stück {tag} in deploy.sh nicht gefunden"
+    return m.group(1)
+
+
+def _fake_env(tmp_path, *, getent: str | None = None, docker_extra: str = ""):
+    """PATH mit chown-, docker-, getent- und setpriv-Attrappen (find ist das echte /usr/bin/find,
+    nicht ein Alias der eigenen Shell); Aufrufe landen in tmp_path/log."""
+    import os
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir(exist_ok=True)
+    log = tmp_path / "log"
+    log.write_text("")
+    (bin_dir / "chown").write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "chown $*" >> "{log}"\n')
+    (bin_dir / "docker").write_text(
+        f'#!/usr/bin/env bash\n{docker_extra}\nprintf "%s\\n" "docker $* (in $PWD)" >> "{log}"\n')
+    (bin_dir / "getent").write_text(
+        "#!/usr/bin/env bash\n" + (f'echo "{getent}:x:10100:"\n' if getent else "exit 2\n"))
+    if not (bin_dir / "find").exists():
+        (bin_dir / "find").symlink_to("/usr/bin/find")
+    # setpriv: Aufruf mitschreiben, dann den Befehl nach den Optionen ausführen (ohne Wechsel).
+    (bin_dir / "setpriv").write_text(
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "setpriv $*" >> "{log}"\n'
+        'while [ "${1#--}" != "$1" ]; do shift; done\nexec "$@"\n')
+    for f in bin_dir.iterdir():
+        if not f.is_symlink():
+            f.chmod(0o755)
+    return {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}, log
+
+
+def _run_with_fake_tools(tmp_path, snippet: str, dest, cwd=None, *, expect_rc=0, **fake):
+    """Führt ein Stück mit den Attrappen aus (_fake_env); gibt die mitgeschriebenen Aufrufe zurück.
+    `cwd`: Arbeitsverzeichnis beim Start, wird vorher unzugänglich gemacht (wie /root für uid 10100)."""
+    env, log = _fake_env(tmp_path, **fake)
+    cmd = ["bash", "-s", "--", str(dest)]
+    if cwd is not None:
+        cwd.mkdir()
+        cmd = ["bash", "-c", 'cd "$1" && chmod 000 . && exec bash -s -- "$2"', "-", str(cwd), str(dest)]
+    try:
+        r = subprocess.run(cmd, input=snippet, env=env, text=True, capture_output=True)
+    finally:
+        if cwd is not None:
+            cwd.chmod(0o700)
+    assert r.returncode == expect_rc, r.stdout + r.stderr
+    _run_with_fake_tools.last = r
+    return log.read_text().splitlines()
+
+
+def _make_dest(tmp_path):
+    dest = tmp_path / "kiosk"
+    for rel in ("app/main.py", "deploy/backup.sh", "bin/backup.sh", "data/kiosk.db", "data/kiosk.db-wal",
+                "data/secret.key", "data/sub/x"):
+        (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+        (dest / rel).write_text("x")
+    (dest / "app" / "main.py").chmod(0o664)
+    (dest / "data").chmod(0o775)
+    (dest / "data" / "kiosk.db").chmod(0o644)
+    return dest
+
+
+def test_code_permissions_step_leaves_data_alone(tmp_path):
+    dest = _make_dest(tmp_path)
+    calls = _run_with_fake_tools(tmp_path, _heredoc("PERMS"), dest)
+    chowned = [c for c in calls if c.startswith("chown -h root:root")]
+    assert chowned and all(f"{dest}/data" not in c for c in chowned)          # data/ bleibt außen vor
+    assert f"{dest}/app/main.py" in " ".join(chowned)
+    assert not [c for c in calls if "data" in c and not c.startswith("chown -h")]
+    assert oct((dest / "app" / "main.py").stat().st_mode & 0o777) == "0o644"   # go-w
+    # Der alte Container läuft noch: data/ unverändert
+    assert oct((dest / "data").stat().st_mode & 0o777) == "0o775"
+    assert oct((dest / "data" / "kiosk.db").stat().st_mode & 0o777) == "0o644"
+
+
+def test_start_step_moves_data_to_uid_10100_then_starts(tmp_path):
+    dest = _make_dest(tmp_path)
+    # Startet wie die SSH-Sitzung in einem Verzeichnis, das uid 10100 nicht betreten darf (/root):
+    # ohne "cd /" bräche find dort ab und nichts würde gestartet.
+    calls = _run_with_fake_tools(tmp_path, _heredoc("START"), dest, cwd=tmp_path / "root-home")
+    assert calls[0] == f"chown -R 10100:10100 {dest}/data"
+    # Start im selben Aufruf, erst nach dem Umstellen
+    assert calls[-1] == f"docker compose up -d --no-build --remove-orphans (in {dest})"
+    assert any(c.startswith("setpriv --reuid=10100 --regid=10100 --clear-groups find") for c in calls)
+    assert not any("1000:1000" in c or "=1000 " in c for c in calls)
+    assert oct((dest / "data").stat().st_mode & 0o777) == "0o700"
+    for name in ("kiosk.db", "kiosk.db-wal", "secret.key"):
+        assert oct((dest / "data" / name).stat().st_mode & 0o777) == "0o600", name
+    assert oct((dest / "data" / "sub" / "x").stat().st_mode & 0o777) != "0o600"   # nur oberste Ebene
+
+
+def test_data_moves_to_10100_only_right_before_the_new_container():
+    """Bauen und Pre-Deploy-Backup laufen noch mit dem alten Container (uid 1000) und dessen data/;
+    umgestellt wird erst nach dem Backup, im Bereich mit Rückweg, direkt vor dem Start."""
+    script = (ROOT / "deploy" / "deploy.sh").read_text(encoding="utf-8")
+    start = script.index("<<'START'")
+    assert script.index("backup.sh predeploy") < script.index("trap rollback_hint ERR") < start
+    block = _heredoc("START")
+    assert block.index("cd /\n") < block.index("setpriv") < block.index("docker compose up")
+    assert script.count("docker compose up -d --no-build --remove-orphans") == 1   # nur hier
+    # Eigener Hinweis bei Fehlern in diesem Schritt: keine Datenbank zurückspielen.
+    after = script[start:]
+    assert after.index("start_hint") < after.index("== Warten auf /healthz")
+    hint = script.split("start_hint() {")[1].split("MSG\n}")[0]
+    assert "Keine Datenbank-Wiederherstellung nötig" in hint and "docker compose up -d --no-build" in hint
+    rollback = script.split("rollback_hint() {")[1].split("MSG\n}")[0]
+    assert "chown -R 10100:10100 $DEST/data" in rollback
+    # Wiederherstellen schreibt nur als 10100 und legt die Datei neu an (kein Symlink wird verfolgt).
+    assert "setpriv --reuid=10100 --regid=10100 --clear-groups" in rollback and "rm -f kiosk.db" in rollback
+    assert "> $DEST/data/kiosk.db" not in rollback
+    assert "1000:1000" not in script
+
+
+def test_container_runs_as_dedicated_uid():
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "groupadd -g 10100 kiosk && useradd -u 10100 -g kiosk" in dockerfile and "USER kiosk" in dockerfile
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    # Auch ein älteres Image (uid 1000) läuft nach dem Zurückrollen als 10100.
+    assert 'user: "10100:10100"' in compose
+
+
+# ---- START: robust, mit Backup-Lock, ohne fremde uid 10100 -------------------------------
+
+def test_start_block_is_parsed_whole_and_ignores_hangup():
+    block = _heredoc("START")
+    assert block.startswith("{\n") and block.rstrip().endswith("}")
+    assert "trap '' HUP PIPE INT" in block and 'exec 3>&1 >"$log" 2>&1' in block
+    assert block.index("flock -w 300 9") < block.index("chown -R 10100") < block.index("docker compose up")
+    assert block.index("getent") < block.index("chown -R 10100")
+
+
+def test_start_holds_backup_lock_until_compose_up(tmp_path):
+    dest = _make_dest(tmp_path)
+    lock = dest / "backups" / ".backup.lock"
+    calls = _run_with_fake_tools(
+        tmp_path, _heredoc("START"), dest,
+        docker_extra=f'flock -n "{lock}" true && echo "LOCK FREI" >> "{tmp_path}/log" || echo "LOCK GEHALTEN" >> "{tmp_path}/log"')
+    assert "LOCK GEHALTEN" in calls and "LOCK FREI" not in calls
+    assert "data/ gehört 10100:10100" in _run_with_fake_tools.last.stdout   # Log am Ende an SSH
+
+
+def test_start_waits_for_running_backup_and_changes_nothing(tmp_path):
+    import fcntl
+    dest = _make_dest(tmp_path)
+    (dest / "backups").mkdir()
+    with open(dest / "backups" / ".backup.lock", "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        calls = _run_with_fake_tools(tmp_path, _heredoc("START").replace("flock -w 300", "flock -w 1"), dest,
+                                     expect_rc=42)
+    assert calls == [] and "Lock" in _run_with_fake_tools.last.stdout
+    assert oct((dest / "data").stat().st_mode & 0o777) == "0o775"
+
+
+def test_start_refuses_if_10100_belongs_to_someone_else(tmp_path):
+    dest = _make_dest(tmp_path)
+    calls = _run_with_fake_tools(tmp_path, _heredoc("START"), dest, expect_rc=42, getent="fremd")
+    assert calls == [] and "fremd" in _run_with_fake_tools.last.stdout
+    script = (ROOT / "deploy" / "deploy.sh").read_text(encoding="utf-8")
+    after = script.split("<<'START' || rc=$?")[1].split("\nSTART\n", 1)[1]
+    assert after.index('if [ "$rc" = 42 ]; then\n  old_keeps_running') < after.index("start_hint")
+
+
+def test_start_survives_dropped_connection(tmp_path):
+    """SSH bricht ab (stdout weg, SIGHUP, Strg-C): chown und compose up laufen trotzdem zu Ende."""
+    import os
+    import signal
+    import time
+    dest = _make_dest(tmp_path)
+    env, log = _fake_env(tmp_path, docker_extra="sleep 1")
+    p = subprocess.Popen(["bash", "-s", "--", str(dest)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, env=env, start_new_session=True)
+    p.stdin.write(_heredoc("START").encode())
+    p.stdin.close()
+    p.stdout.close()
+    p.stderr.close()
+    time.sleep(0.5)
+    for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGPIPE):
+        os.killpg(p.pid, sig)
+    assert p.wait(timeout=20) == 0
+    calls = log.read_text().splitlines()
+    assert calls[0].startswith("chown -R 10100:10100") and calls[-1].startswith("docker compose up")
+    assert "data/ gehört 10100:10100" in (dest / "backups" / "deploy-start.log").read_text()
+    assert oct((dest / "data" / "kiosk.db").stat().st_mode & 0o777) == "0o600"
+
+
+# ---- .env: KIOSK_FETCH_DENY_IPS ergänzen --------------------------------------------------
+
+DENY = "203.0.113.10,2001:db8:1234:5678::/64"
+
+
+def _run_env(tmp_path, dest):
+    env, log = _fake_env(tmp_path)
+    return subprocess.run(["bash", "-s", "--", str(dest), DENY], input=_heredoc("ENV"), env=env, text=True,
+                          capture_output=True)
+
+
+def test_env_step_creates_env_with_deny_list(tmp_path):
+    import stat
+    dest = tmp_path / "kiosk"
+    dest.mkdir()
+    r = _run_env(tmp_path, dest)
+    assert r.returncode == 0, r.stderr
+    text = (dest / ".env").read_text()
+    pw = text.split("KIOSK_PASSWORD=")[1].split("\n")[0]
+    assert len(pw) >= 20 and pw not in r.stdout + r.stderr      # Passwort nie ausgegeben
+    assert text.endswith(f"KIOSK_FETCH_DENY_IPS={DENY}\n")
+    assert stat.S_IMODE((dest / ".env").stat().st_mode) == 0o600
+    assert f"chown root:root .env" in (tmp_path / "log").read_text()
+
+
+def test_env_step_adds_deny_list_once_and_keeps_existing_value(tmp_path):
+    import stat
+    dest = tmp_path / "kiosk"
+    dest.mkdir()
+    (dest / ".env").write_text("KIOSK_PASSWORD=geheim-geheim-geheim")   # ohne Zeilenende
+    (dest / ".env").chmod(0o644)
+    for _ in range(2):   # idempotent
+        assert _run_env(tmp_path, dest).returncode == 0
+    assert (dest / ".env").read_text() == f"KIOSK_PASSWORD=geheim-geheim-geheim\nKIOSK_FETCH_DENY_IPS={DENY}\n"
+    assert stat.S_IMODE((dest / ".env").stat().st_mode) == 0o600
+    (dest / ".env").write_text("KIOSK_PASSWORD=x\nKIOSK_FETCH_DENY_IPS=203.0.113.1\n")
+    r = _run_env(tmp_path, dest)
+    assert r.returncode == 0 and (dest / ".env").read_text() == "KIOSK_PASSWORD=x\nKIOSK_FETCH_DENY_IPS=203.0.113.1\n"
+    assert "geheim" not in r.stdout
+
+
+def test_deny_list_value_defined_once_at_top():
+    script = (ROOT / "deploy" / "deploy.sh").read_text(encoding="utf-8")
+    assert script.count(DENY) == 1 and script.index(f'FETCH_DENY_IPS="{DENY}"') < script.index("== Code nach")
+    assert 'bash -s -- "$DEST" "$FETCH_DENY_IPS" <<\'ENV\'' in script
+
+
+def test_rsync_skips_development_files():
+    script = (ROOT / "deploy" / "deploy.sh").read_text(encoding="utf-8")
+    for path in ("/.claude/", "/design/", "/docs/", "/tests/", "/pytest.ini", "/requirements-dev.txt"):
+        assert f"--exclude {path}" in script, path
+    perms = _heredoc("PERMS")
+    assert '"$dest/tests"' in perms and '"$dest/docs"' in perms
+    # Was Build und Betrieb brauchen, bleibt drin.
+    for needed in ("app/", "static/", "sources.yaml", "requirements.txt", "deploy/", "Dockerfile"):
+        assert f"--exclude /{needed}" not in script and f"--exclude {needed}" not in script
+
+
+def test_backup_gives_up_when_database_stays_locked(tmp_path):
+    import os
+    import sqlite3
+    import time
+    _make_db(tmp_path)
+    holder = sqlite3.connect(tmp_path / "data" / "kiosk.db", isolation_level=None)
+    holder.execute("BEGIN EXCLUSIVE")   # wie ein Container, der die Datenbank nicht mehr freigibt
+    try:
+        env = {**os.environ, "KIOSK_DB": str(tmp_path / "data" / "kiosk.db"),
+               "KIOSK_BACKUP_DIR": str(tmp_path / "backups"), "KIOSK_BACKUP_TIMEOUT": "1"}
+        t0 = time.monotonic()
+        r = subprocess.run(["bash", str(ROOT / "deploy" / "backup.sh"), "predeploy"], env=env, text=True,
+                           capture_output=True, timeout=30)
+        assert time.monotonic() - t0 < 10
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert r.returncode != 0 and "nach 1 s abgebrochen" in r.stderr
+    assert "FEHLER: Kiosk-Backup (predeploy) fehlgeschlagen" in r.stderr
+    assert not list((tmp_path / "backups").glob("kiosk-*"))

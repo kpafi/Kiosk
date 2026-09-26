@@ -1,5 +1,5 @@
 // Liste (E2Liste, E2Leer): Kopf, Filterchips, Tagesgruppen, Lade-Pille, Leerzustand.
-import { h, replace, toast } from '../ui/dom.js';
+import { h, isDesktop, replace, toast } from '../ui/dom.js';
 import { dots, pencil, search } from '../ui/icons.js';
 import { iconButton } from '../ui/header.js';
 import { chip } from '../ui/chips.js';
@@ -87,12 +87,16 @@ export function listView(route) {
   state.ctx = pid ? { type: 'profile', id: Number(pid) || pid } : { type: 'all' };
   state.nextCtx = ctxParams();
 
+  // false nach destroy(): späte Antworten (Status, Laden) dürfen dann weder den globalen Zustand
+  // (listItems, Wasserstand) noch die Adresse ändern.
+  let alive = true;
+
   // Profil gibt es nicht (mehr): zurück zu ALLE. Erst nach dem Aufbau umleiten (nicht mitten im Routing).
   let gone = false;
   function profileGone() {
-    if (gone) return;
+    if (gone || !alive) return;
     gone = true;
-    setTimeout(() => { toast('Profil gibt es nicht mehr'); replaceHash('#/'); }, 0);
+    setTimeout(() => { if (alive) { toast('Profil gibt es nicht mehr'); replaceHash('#/'); } }, 0);
   }
   if (pid && state.profiles && !profile) profileGone();
 
@@ -105,11 +109,11 @@ export function listView(route) {
     empty: buildEmpty,
   });
   function withGoneCheck(load) {
-    return async (cursor) => {
+    return async (cursor, isStale) => {
       try {
-        return await load(cursor);
+        return await load(cursor, isStale);
       } catch (err) {
-        if (pid && err.status === 404) { profileGone(); return { items: [], next: null }; }
+        if (pid && err.status === 404 && !isStale()) { profileGone(); return { items: [], next: null }; }
         throw err;
       }
     };
@@ -147,6 +151,7 @@ export function listView(route) {
   }
 
   function rebuildFeed() {
+    if (!alive) return;
     feed.destroy();
     feed = makeFeed();
     feedHolder.replaceChildren(feed.el);
@@ -171,11 +176,19 @@ export function listView(route) {
     }
     if (profile) actions.push(h('a', { class: 'pill', href: `#/profile/${profile.id}`, text: 'Profil erweitern' }));
     else if (isAdmin()) {
-      // Sammellauf starten darf nur der Admin.
-      actions.push(h('button', {
+      // Sammellauf starten darf nur der Admin. Knopf aus, solange die Anfrage läuft.
+      const refreshBtn = h('button', {
         type: 'button', class: 'pill', text: 'Jetzt abrufen',
-        on: { click: async () => { try { await api('refresh', { method: 'POST' }); } catch { /* läuft schon */ } poll(); } },
-      }));
+        on: {
+          click: async () => {
+            refreshBtn.disabled = true;
+            try { await api('refresh', { method: 'POST' }); } catch { /* läuft schon */ }
+            refreshBtn.disabled = false;
+            poll();
+          },
+        },
+      });
+      actions.push(refreshBtn);
     }
     return emptyState({ text, actions });
   }
@@ -183,22 +196,38 @@ export function listView(route) {
   // Sammellauf beobachten: Pille zeigen, nach Ende Liste (falls oben) und Leiste neu laden.
   let wasRunning = !!(state.status && state.status.fetcher && state.status.fetcher.running);
   let timer = 0;
+  // Höchstens eine Abfrage zugleich (Zeitgeber und „Jetzt abrufen“); ein Aufruf währenddessen
+  // wird danach nachgeholt (die laufende Antwort kann vor dem Start des Sammellaufs liegen).
+  let polling = false;
+  let pollAgain = false;
   function renderStatus() {
     replace(statusSlot, statusPill());
   }
   async function poll() {
+    if (!alive) return;
+    if (polling) { pollAgain = true; return; }
     clearTimeout(timer);
-    try { await loadStatus(); } catch { /* offline */ }
-    const running = !!(state.status && state.status.fetcher && state.status.fetcher.running);
-    renderStatus();
-    if (wasRunning && !running) {
-      loadBar();
-      const scroller = document.getElementById('view');
-      const top = Math.max(window.scrollY, scroller.scrollTop);
-      if (top < 80) rebuildFeed();
+    polling = true;
+    try {
+      try { await loadStatus(); } catch { /* offline */ }
+      if (!alive) return;   // Ansicht inzwischen ersetzt: keine neue Schleife, kein Neuaufbau
+      const running = !!(state.status && state.status.fetcher && state.status.fetcher.running);
+      renderStatus();
+      if (wasRunning && !running) {
+        loadBar().catch(() => {});
+        // Handy mit offenem Artikel: Die Liste ist ausgeblendet und scrollY gehört dem Artikel;
+        // ein Neuaufbau verlöre die Lage in der Liste. Dann nicht neu laden.
+        const hidden = !isDesktop() && document.getElementById('shell').dataset.layout === 'article';
+        const scroller = document.getElementById('view');
+        const top = Math.max(window.scrollY, scroller.scrollTop);
+        if (!hidden && top < 80) rebuildFeed();
+      }
+      wasRunning = running;
+      timer = setTimeout(poll, running ? 5000 : 60000);
+    } finally {
+      polling = false;
+      if (pollAgain) { pollAgain = false; poll(); }
     }
-    wasRunning = running;
-    timer = setTimeout(poll, running ? 5000 : 60000);
   }
 
   const feedHolder = h('div', { class: 'feed-holder' }, feed.el);
@@ -229,6 +258,7 @@ export function listView(route) {
     bar: true,
     title: profile ? profile.name : 'Kiosk',
     destroy() {
+      alive = false;
       clearTimeout(timer);
       feed.destroy();
       offs.forEach((off) => off());

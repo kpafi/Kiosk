@@ -6,7 +6,7 @@ let current = null;
 
 /**
  * Öffnet ein Blatt. build(panel) füllt das Panel; onClose wird beim Schließen gerufen
- * (Escape, Tippen auf das Overlay, closeSheet()).
+ * (Escape, Tippen auf das Overlay, closeSheet()). Gibt das Panel zurück (für rebuildSheet).
  */
 export function openSheet(build, { label = 'Blatt', tall = false, onClose } = {}) {
   closeSheet({ silent: true });
@@ -25,10 +25,10 @@ export function openSheet(build, { label = 'Blatt', tall = false, onClose } = {}
   return panel;
 }
 
-/** Inhalt eines offenen Blatts neu aufbauen. */
-export function rebuildSheet(build) {
-  if (!current) return;
-  const { panel } = current;
+/** Inhalt des Blatts `panel` (Rückgabe von openSheet) neu aufbauen. Ist inzwischen ein anderes
+ *  Blatt offen oder keins mehr (späte Antwort nach dem Schließen), passiert nichts. */
+export function rebuildSheet(build, panel) {
+  if (!current || !panel || current.panel !== panel) return;
   const scroll = panel.scrollTop;
   panel.replaceChildren();
   build(panel);
@@ -40,8 +40,9 @@ export function rebuildSheet(build) {
   }
 }
 
-export function isSheetOpen() {
-  return !!current;
+/** Ist ein Blatt offen? Mit `panel`: ist genau dieses Blatt noch offen? */
+export function isSheetOpen(panel) {
+  return !!current && (!panel || current.panel === panel);
 }
 
 export function closeSheet({ silent = false } = {}) {

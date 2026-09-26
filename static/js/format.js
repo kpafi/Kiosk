@@ -235,14 +235,21 @@ function siteOf(host) {
   return labels.slice(-n).join('.');
 }
 
-function fuzzySame(a, b) {
-  const [pathA, queryA = ''] = a.full.split('?');
-  const [pathB, queryB = ''] = b.full.split('?');
-  if (queryA !== queryB) return false;
-  const sa = pathA.split('/'), sb = pathB.split('/');
-  if (sa.length !== sb.length || sa.length < 2 || siteOf(sa[0]) !== siteOf(sb[0])) return false;   // [0] = Host
-  const stemA = sa.pop().replace(VARIANT_RE, ''), stemB = sb.pop().replace(VARIANT_RE, '');
-  if (stemA !== stemB || stemA.length < IMAGE_BASE_MIN) return false;
+/** Teile eines Schlüssels für den unscharfen Vergleich, oder null (kann nie unscharf gleich sein).
+ *  bucket fasst zusammen, was gleich sein muss (Website, Segmentzahl, Dateiname, Query): Nur
+ *  Schlüssel mit gleichem bucket müssen Segment für Segment verglichen werden. */
+function fuzzyParts(key) {
+  const [path, query = ''] = key.full.split('?');
+  const segs = path.split('/');
+  if (segs.length < 2) return null;
+  const stem = segs.pop().replace(VARIANT_RE, '');
+  if (stem.length < IMAGE_BASE_MIN) return null;
+  return { segs, stem, bucket: JSON.stringify([siteOf(segs[0]), segs.length, stem, query]) };   // [0] = Host
+}
+
+/** Unscharfer Vergleich zweier fuzzyParts mit gleichem bucket. */
+function fuzzyMatch(a, b) {
+  const sa = a.segs, sb = b.segs;
   let differs = false, onlyNumbers = true;
   for (let i = 1; i < sa.length; i++) {
     if (sa[i] === sb[i]) continue;
@@ -253,8 +260,13 @@ function fuzzySame(a, b) {
   // Nur Zahlen-Ordner verschieden (2025/10 statt 2026/09), Dateiname ohne Ziffern („screenshot“) und
   // kein gemeinsames Pfadsegment mit Ziffern (Bild-ID wie taz /picture/8763231/948/): eher ein
   // anderes Bild gleichen Namens als eine andere Größe.
-  if (differs && onlyNumbers && !/\d/.test(stemA)) return sa.some((seg, i) => i > 0 && seg === sb[i] && /\d/.test(seg));
+  if (differs && onlyNumbers && !/\d/.test(a.stem)) return sa.some((seg, i) => i > 0 && seg === sb[i] && /\d/.test(seg));
   return true;
+}
+
+function fuzzySame(a, b) {
+  const pa = fuzzyParts(a), pb = fuzzyParts(b);
+  return !!pa && !!pb && pa.bucket === pb.bucket && fuzzyMatch(pa, pb);
 }
 
 /** true, wenn beide URLs dasselbe Bild (ggf. in anderer Größe) zeigen: gleicher Schlüssel oder unscharf gleich. */
@@ -262,6 +274,34 @@ export function sameImage(a, b) {
   const ka = imageKey(a), kb = imageKey(b);
   if (!ka.full || !kb.full) return false;
   return ka.full === kb.full || fuzzySame(ka, kb);
+}
+
+// Unscharf nur mit den ersten 50 Bildern desselben buckets vergleichen. Bewusster Tausch: Erst ab dem
+// 51. verschiedenen Bild mit gleicher Website, Segmentzahl und gleichem Dateinamen (nur bei feindlichem
+// HTML) kann eine Größen-Variante stehen bleiben; dafür bleibt die Laufzeit linear.
+const SEEN_BUCKET_MAX = 50;
+
+/** Merkliste für „schon gezeigt?“: seen(url) ist true, wenn ein früher gemerktes Bild laut sameImage
+ *  dasselbe zeigt; sonst wird url gemerkt. Wie ein Vergleich mit allen früheren, aber jeder Schlüssel
+ *  wird nur einmal berechnet, gleiche Schlüssel über ein Set, unscharf nur innerhalb des buckets
+ *  (höchstens SEEN_BUCKET_MAX Einträge): lineare Laufzeit auch bei Tausenden Bildern. */
+export function imageSeen() {
+  const exact = new Set();
+  const buckets = new Map();
+  return (url) => {
+    const key = imageKey(url);
+    if (!key.full) return false;
+    if (exact.has(key.full)) return true;
+    const parts = fuzzyParts(key);
+    const list = parts ? buckets.get(parts.bucket) : null;
+    if (list && list.some((other) => fuzzyMatch(other, parts))) return true;
+    exact.add(key.full);
+    if (parts) {
+      if (!list) buckets.set(parts.bucket, [parts]);
+      else if (list.length < SEEN_BUCKET_MAX) list.push(parts);
+    }
+    return false;
+  };
 }
 
 // Kleines Bild laut URL (Breite < 200 px; _w120, w_64 in Bild-Diensten, /80x80/, width=, dimensions=): Autorenfoto, Wappen, Symbol. Wird nie als Duplikat

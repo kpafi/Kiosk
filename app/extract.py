@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 import re
+from collections import Counter
 from dataclasses import dataclass, replace
 from html.parser import HTMLParser
 from urllib.parse import unquote, urljoin, urlparse
@@ -14,6 +15,12 @@ import trafilatura
 PAYWALL_RE = re.compile(r"""isaccessibleforfree["']?\s*[:=]\s*["']?false""", re.I)
 PAYWALL_SCAN_CHARS = 200_000
 MIN_FULL_CHARS = 600
+# Obergrenzen für den gespeicherten Text: So viele Zeichen bereinigtes HTML (danach endet der
+# Text am nächsten Element der obersten Ebene, Status "partial") und so viele Bilder (weitere
+# fallen weg). Echte Artikel liegen weit darunter; eine feindliche Seite soll weder Datenbank
+# noch Leseansicht (Bildvergleich im Browser) überfordern.
+MAX_BODY_HTML = 500_000
+MAX_IMAGES = 100
 
 ALLOWED_TAGS = {
     "p", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "blockquote",
@@ -62,12 +69,47 @@ def is_paywalled(page_text: str) -> bool:
 
 
 class _Sanitizer(HTMLParser):
-    def __init__(self, base_url: str):
+    """Whitelist-Bereinigung. Mit `max_chars` endet die Ausgabe am ersten Element der obersten
+    Ebene nach dieser Länge (spätestens bei der doppelten Länge, dann mit geschlossenen Tags);
+    `truncated` sagt, ob gekürzt wurde. Mit `max_images` fallen weitere <img> weg."""
+
+    def __init__(self, base_url: str, max_chars: int | None = None, max_images: int | None = None):
         super().__init__(convert_charrefs=True)
         self.base = base_url
         self.out: list[str] = []
         self.text: list[str] = []
         self._drop_depth = 0
+        self.max_chars, self.max_images = max_chars, max_images
+        self.truncated = False
+        self._size = 0
+        self._images = 0
+        self._open: list[str] = []   # offene erlaubte Tags (ohne Void-Tags)
+        # Wie oft jeder Name in _open steht: "tag in self._open" wäre bei vielen nie geschlossenen
+        # Tags quadratisch (40 000 offene <p> kosteten Sekunden).
+        self._open_count: Counter[str] = Counter()
+
+    def _emit(self, piece: str) -> None:
+        self.out.append(piece)
+        self._size += len(piece)
+
+    def _full(self) -> bool:
+        """True, sobald die Ausgabe (hier) enden soll; schließt bei der harten Grenze offene Tags."""
+        if self.truncated:
+            return True
+        if self.max_chars is None or self._size <= self.max_chars:
+            return False
+        if self._open and self._size <= 2 * self.max_chars:
+            return False  # mitten in einem Element: erst an dessen Ende aufhören
+        self._truncate()
+        return True
+
+    def _truncate(self) -> None:
+        """Ab hier nichts mehr ausgeben; offene Tags schließen."""
+        for tag in reversed(self._open):
+            self.out.append(f"</{tag}>")
+        self._open.clear()
+        self._open_count.clear()
+        self.truncated = True
 
     def _safe_url(self, raw: str | None) -> str | None:
         if not raw:
@@ -82,6 +124,8 @@ class _Sanitizer(HTMLParser):
             self.text.append(" ")
 
     def handle_starttag(self, tag, attrs):
+        if self._full():
+            return
         self._break(tag)
         if tag in DROP_WITH_CONTENT:
             self._drop_depth += 1
@@ -103,32 +147,64 @@ class _Sanitizer(HTMLParser):
         if tag == "a":
             kept.append(' target="_blank" rel="noopener noreferrer"')
         if tag == "img":
+            if self.max_images is not None and self._images >= self.max_images:
+                return
+            self._images += 1
             kept.append(' loading="lazy"')
-        self.out.append(f"<{tag}{''.join(kept)}>")
+        elif tag not in VOID_TAGS:
+            self._open.append(tag)
+            self._open_count[tag] += 1
+        self._emit(f"<{tag}{''.join(kept)}>")
 
     def handle_startendtag(self, tag, attrs):
         # <svg/> oder <iframe/> haben keinen Inhalt: nicht den Drop-Zähler erhöhen,
         # sonst verschwindet der restliche Artikel.
-        if tag in DROP_WITH_CONTENT:
+        if tag in DROP_WITH_CONTENT or self._full():
             return
         self.handle_starttag(tag, attrs)
         # Erlaubte Nicht-Void-Tags wie <a/> sofort schließen, sonst bleibt der Tag offen.
         if not self._drop_depth and tag in ALLOWED_TAGS and tag not in VOID_TAGS:
-            self.out.append(f"</{tag}>")
+            self.handle_endtag(tag)
 
     def handle_endtag(self, tag):
+        if self.truncated:
+            return
         self._break(tag)
         if tag in DROP_WITH_CONTENT:
             self._drop_depth = max(0, self._drop_depth - 1)
             return
         if self._drop_depth or tag not in ALLOWED_TAGS or tag in VOID_TAGS:
             return
-        self.out.append(f"</{tag}>")
+        if self._open_count[tag]:  # bis zu diesem Tag schließen (dazwischen offen gebliebene gelten als zu)
+            while True:
+                closed = self._open.pop()
+                self._open_count[closed] -= 1
+                if closed == tag:
+                    break
+        elif self.max_chars is not None and self._size > self.max_chars:
+            return  # verwaistes End-Tag über der Grenze: würde die Ausgabe sonst beliebig verlängern
+        self._emit(f"</{tag}>")
 
     def handle_data(self, data):
-        if self._drop_depth:
+        if self._drop_depth or self._full():
             return
-        self.out.append(html.escape(data, quote=False))
+        escaped = html.escape(data, quote=False)
+        if self.max_chars is not None and self._size + len(escaped) > 2 * self.max_chars:
+            # Ein einziger riesiger Textknoten ginge sonst an beiden Grenzen vorbei (die greifen nur
+            # zwischen Knoten): bis zur Grenze behalten, möglichst an einem Leerzeichen und nie
+            # mitten in einer Entität (&amp;), dann Schluss.
+            keep = max(0, self.max_chars - self._size)
+            space = escaped.rfind(" ", 0, keep)
+            cut = space if space > keep * 0.9 else keep
+            amp = escaped.rfind("&", 0, cut)
+            if amp != -1 and ";" not in escaped[amp:cut]:
+                cut = amp
+            piece = escaped[:cut]
+            self._emit(piece)
+            self.text.append(html.unescape(piece))
+            self._truncate()
+            return
+        self._emit(escaped)
         self.text.append(data)
 
 
@@ -140,8 +216,16 @@ def _normalize_ws(text: str) -> str:
 
 
 def sanitize(fragment: str, base_url: str) -> tuple[str, str]:
-    """Bereinigt HTML auf eine Whitelist und liefert (html, reiner Text)."""
-    s = _Sanitizer(base_url)
+    """Bereinigt HTML auf eine Whitelist und liefert (html, reiner Text); Obergrenzen wie
+    sanitize_limited."""
+    clean, text, _ = sanitize_limited(fragment, base_url)
+    return clean, text
+
+
+def sanitize_limited(fragment: str, base_url: str) -> tuple[str, str, bool]:
+    """Wie sanitize, mit den Obergrenzen MAX_BODY_HTML und MAX_IMAGES; liefert zusätzlich, ob
+    der Text gekürzt wurde."""
+    s = _Sanitizer(base_url, max_chars=MAX_BODY_HTML, max_images=MAX_IMAGES)
     s.feed(fragment)
     s.close()
     body = _EMPTY_P_RE.sub("", "".join(s.out))
@@ -155,7 +239,7 @@ def sanitize(fragment: str, base_url: str) -> tuple[str, str]:
     cleaned = _EMPTY_P_RE.sub("", _drop_duplicate_images(cleaned))
     if cleaned != body:   # entfernte Absätze und Bildunterschriften ändern auch den reinen Text
         text = html_to_text(cleaned)
-    return cleaned.strip(), text
+    return cleaned.strip(), text, s.truncated
 
 
 # ---- Bild-Schlüssel: dasselbe Bild in anderer Größe erkennen ----
@@ -384,10 +468,10 @@ def extract(page: bytes, url: str) -> Extraction:
     if not body:
         return Extraction("empty", None, None, 0, paywalled, image_url, author)
 
-    clean, text = sanitize(body, url)
+    clean, text, truncated = sanitize_limited(body, url)
     if not text:
         return Extraction("empty", None, None, 0, paywalled, image_url, author)
-    status = "partial" if (paywalled or len(text) < MIN_FULL_CHARS) else "full"
+    status = "partial" if (paywalled or truncated or len(text) < MIN_FULL_CHARS) else "full"
     return Extraction(status, clean, text, len(text), paywalled, image_url, author)
 
 

@@ -4,7 +4,7 @@ import { arrowRight, back, bookmark, checkCheck, external, star } from '../ui/ic
 import { iconButton } from '../ui/header.js';
 import { markOpenRow } from '../ui/row.js';
 import {
-  articleTime, cleanText, isSmallImageUrl, listTime, readMinutes, sameImage,
+  articleTime, cleanText, imageSeen, isSmallImageUrl, listTime, readMinutes, sameImage,
 } from '../format.js';
 import { api } from '../api.js';
 import {
@@ -162,7 +162,7 @@ function previousImage(img) {
  *  Kleine Bilder (Wappen, Autorenfotos) wiederholen sich absichtlich und bleiben, außer dasselbe Bild
  *  steht direkt davor in anderer Größe (Spiegel: Autorenfoto in 96 und 72 px). */
 function dropDuplicateImages(frag) {
-  const seen = [];
+  const seen = imageSeen();   // lineare Laufzeit, auch bei Tausenden Bildern (feindliches HTML)
   for (const img of [...frag.querySelectorAll('img')]) {
     const src = img.getAttribute('src');
     if (isSmallImageUrl(src)) {
@@ -171,8 +171,7 @@ function dropDuplicateImages(frag) {
       if (prevSrc && prevSrc !== src && sameImage(prevSrc, src)) removeImage(img);
       continue;
     }
-    if (seen.some((s) => sameImage(s, src))) removeImage(img);
-    else seen.push(src);
+    if (seen(src)) removeImage(img);
   }
 }
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import secrets
@@ -19,6 +20,8 @@ MIN_PASSWORD_LEN = 12
 USERNAME_RE = re.compile(r"[a-z0-9._-]{2,32}")
 # Zeitzone, in der ein Tag für die Ungelesen-Zähler um 00:00 beginnt (KIOSK_TZ).
 DEFAULT_TZ = "Europe/Berlin"
+# Mindestlänge des Secrets für die Session-Cookies (KIOSK_SECRET oder secret.key).
+MIN_SECRET_LEN = 32
 
 
 @dataclass(frozen=True)
@@ -38,6 +41,8 @@ class Settings:
     disable_fetcher: bool
     admin_user: str = "admin"   # KIOSK_ADMIN_USER: Name des Admins beim Bootstrap
     tz: str = DEFAULT_TZ        # KIOSK_TZ: Zeitzone für den Tagesbeginn der Zähler
+    # KIOSK_FETCH_DENY_IPS: zusätzlich gesperrte Ziel-Netze für Feed- und Artikelabrufe
+    fetch_deny_ips: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = ()
 
 
 def _int(name: str, default: int, lo: int | None = None, hi: int | None = None) -> int:
@@ -68,6 +73,79 @@ def _tz(name: str, default: str) -> str:
     except (ZoneInfoNotFoundError, ValueError, OSError):
         raise RuntimeError(f"{name} ist keine bekannte Zeitzone: {raw!r} (z. B. Europe/Berlin)") from None
     return raw
+
+
+def fetch_deny_networks(name: str = "KIOSK_FETCH_DENY_IPS") -> tuple:
+    """Kommagetrennte IPs oder Netze (CIDR) aus der Umgebung; ungültig: RuntimeError."""
+    nets = []
+    for part in os.environ.get(name, "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            raise RuntimeError(f"{name}: keine gültige IP-Adresse bzw. kein Netz (CIDR): {part!r}") from None
+    return tuple(nets)
+
+
+def _remove_stale_secret_temps(data_dir: Path) -> None:
+    """Entfernt Hilfsdateien .secret.key.<pid>.<zufall> eines abgebrochenen Starts (Absturz zwischen
+    link() und unlink()). Sonst bliebe secret.key mit zwei harten Links liegen, und backup.sh
+    kopiert sie dann nicht mehr. Nur Dateien von Prozessen, die es nicht mehr gibt, oder mit der
+    eigenen PID (im Container bekommt die App nach einem Neustart oft dieselbe)."""
+    for tmp in data_dir.glob(".secret.key.*"):
+        parts = tmp.name.split(".")   # ["", "secret", "key", "<pid>", "<zufall>"]
+        if len(parts) != 5 or not parts[3].isdigit():
+            continue
+        pid = int(parts[3])
+        if pid != os.getpid():
+            try:
+                os.kill(pid, 0)
+                continue  # läuft noch: legt gerade selbst ein Secret an
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                continue  # gehört einem anderen Benutzer und läuft
+        tmp.unlink(missing_ok=True)
+
+
+def _load_secret(data_dir: Path) -> str:
+    """KIOSK_SECRET oder der Inhalt von <data_dir>/secret.key; fehlt beides, wird die Datei mit einem
+    neuen Secret angelegt. Kürzer als MIN_SECRET_LEN: RuntimeError."""
+    secret = os.environ.get("KIOSK_SECRET", "").strip()
+    if secret:
+        if len(secret) < MIN_SECRET_LEN:
+            raise RuntimeError(f"KIOSK_SECRET muss mindestens {MIN_SECRET_LEN} Zeichen lang sein")
+        return secret
+    secret_file = data_dir / "secret.key"
+    _remove_stale_secret_temps(data_dir)
+    if not secret_file.exists():
+        new = secrets.token_urlsafe(48)
+        # Erst vollständig in eine eigene Datei schreiben, dann per link() unter den endgültigen
+        # Namen: Eine leere oder halbe secret.key (Absturz, voller Datenträger) kann so nie
+        # entstehen, und eine vorhandene Datei wird nie überschrieben (link scheitert dann).
+        # O_EXCL + Modus beim Anlegen: nie, auch nicht kurz, für andere lesbar (die umask kann
+        # Rechte nur wegnehmen).
+        tmp = data_dir / f".secret.key.{os.getpid()}.{secrets.token_hex(4)}"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(new)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.link(tmp, secret_file)
+            except FileExistsError:
+                pass  # gleichzeitig von einem anderen Prozess angelegt: dessen Secret gilt
+        finally:
+            tmp.unlink(missing_ok=True)
+    secret = secret_file.read_text().strip()
+    if len(secret) < MIN_SECRET_LEN:
+        raise RuntimeError(
+            f"{secret_file} ist leer oder kürzer als {MIN_SECRET_LEN} Zeichen. Datei löschen (beim "
+            "nächsten Start entsteht ein neues Secret, alle Sitzungen enden) oder KIOSK_SECRET setzen")
+    return secret
 
 
 def docs_enabled() -> bool:
@@ -102,23 +180,7 @@ def load_settings() -> Settings:
     data_dir = Path(os.environ.get("KIOSK_DATA_DIR", root / "data")).resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    secret = os.environ.get("KIOSK_SECRET", "").strip()
-    if not secret:
-        secret_file = data_dir / "secret.key"
-        if secret_file.exists():
-            secret = secret_file.read_text().strip()
-        else:
-            secret = secrets.token_urlsafe(48)
-            # O_EXCL + Modus beim Anlegen: Die Datei ist nie, auch nicht kurz, für andere lesbar
-            # (die umask kann Rechte nur wegnehmen), und eine vorhandene Datei wird nie überschrieben.
-            try:
-                fd = os.open(secret_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            except FileExistsError:  # gleichzeitig von einem anderen Prozess angelegt
-                secret = secret_file.read_text().strip()
-            else:
-                with os.fdopen(fd, "w") as f:
-                    f.write(secret)
-
+    secret = _load_secret(data_dir)
     password = bootstrap_password()
     admin_user = admin_username()
 
@@ -140,4 +202,5 @@ def load_settings() -> Settings:
         disable_fetcher=_bool("KIOSK_DISABLE_FETCHER", False),
         admin_user=admin_user,
         tz=_tz("KIOSK_TZ", DEFAULT_TZ),
+        fetch_deny_ips=fetch_deny_networks(),
     )

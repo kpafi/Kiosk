@@ -6,6 +6,7 @@ Quelle/Land/Profil, Zwischenspeicher der Profil-Zähler).
 """
 from __future__ import annotations
 
+import logging
 import time
 from typing import Annotated, Any, Literal
 
@@ -13,12 +14,24 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi import Path as PathParam
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints
 
+from . import db as db_mod
+from .db import QueryTimeout
 from .state import state
+
+log = logging.getLogger("kiosk.api")
 
 MAX_ID = 2**63 - 1
 MAX_SOURCE_IDS = 200
 UNREAD_CAP = 5000          # Profil-Zähler werden hier gedeckelt
 UNREAD_TTL = 60.0          # Sekunden, so lange gilt ein berechneter Profil-Zähler
+# Alle Profil-Zähler einer Anfrage (/api/profiles, /api/bar) zusammen höchstens so viele Sekunden;
+# was danach noch fehlt, kommt als unread null. Ein Profil, dessen Zählung allein das Zeitlimit
+# einer Abfrage (db.READ_TIME_LIMIT) sprengt, wird SLOW_PROFILE_TTL lang gar nicht mehr gezählt (null).
+PROFILE_COUNT_BUDGET = 3.0
+SLOW_PROFILE_TTL = 600.0
+# Höchstens so viele Profile pro Benutzer: Jedes kostet bei /api/profiles und /api/bar eine
+# Volltext-Zählung (bis zu 20 Begriffe).
+MAX_PROFILES = 50
 
 SETTINGS_DEFAULTS: dict[str, Any] = {
     "theme": "dark", "text_size": "m", "mark_read_on_open": True,
@@ -109,39 +122,73 @@ def article_scope(user_id: int, sources: list[str], countries: set[str], profile
     return scope, terms
 
 
-# (Benutzer-ID, Profil-ID) -> (Zeitpunkt, Ende des letzten Sammellaufs, Tagesbeginn, Zahl)
-_unread_cache: dict[tuple[int, int], tuple[float, Any, str, int]] = {}
+# (Benutzer-ID, Profil-ID) -> (Zeitpunkt, Ende des letzten Sammellaufs, Tagesbeginn, Zahl);
+# Zahl None: Zählung zu teuer (Zeitlimit), gilt SLOW_PROFILE_TTL lang.
+_unread_cache: dict[tuple[int, int], tuple[float, Any, str, int | None]] = {}
 
 
-def invalidate_unread(user_id: int | None = None) -> None:
+def invalidate_unread(user_id: int | None = None, *, profile_id: int | None = None) -> None:
     """Profil-Zähler verwerfen: die eines Benutzers (sein Lesestand hat sich geändert) oder alle
-    (Quellen umgeschaltet, Start)."""
+    (Quellen umgeschaltet, Start). Die Markierung „zu teuer“ bleibt dabei (am Lesestand liegt es
+    nicht), außer für das geänderte Profil `profile_id`."""
     if user_id is None:
         _unread_cache.clear()
         return
-    for key in [k for k in _unread_cache if k[0] == user_id]:
+    for key in [k for k, v in _unread_cache.items()
+                if k[0] == user_id and (v[3] is not None or k[1] == profile_id)]:
         del _unread_cache[key]
 
 
-def profile_unread(user_id: int, profile: dict[str, Any], sources: list[str]) -> int:
+class CountBudget:
+    """Gemeinsames Zeitbudget der Profil-Zähler einer Anfrage (PROFILE_COUNT_BUDGET Sekunden)."""
+
+    def __init__(self, seconds: float | None = None):
+        self.deadline = time.monotonic() + (PROFILE_COUNT_BUDGET if seconds is None else seconds)
+
+    def remaining(self) -> float:
+        return self.deadline - time.monotonic()
+
+
+def profile_unread(user_id: int, profile: dict[str, Any], sources: list[str],
+                   budget: CountBudget | None = None) -> int | None:
     """Ungelesene, Paywall-freie Artikel von heute im Profil (höchstens UNREAD_CAP), höchstens alle
-    60 s neu berechnet; ein beendeter Sammellauf oder ein neuer Tag macht den Wert sofort ungültig."""
+    60 s neu berechnet; ein beendeter Sammellauf oder ein neuer Tag macht den Wert sofort ungültig.
+
+    None („nicht gezählt“): Das Zeitbudget der Anfrage ist verbraucht (nicht gespeichert, die nächste
+    Anfrage versucht es wieder) oder die Zählung allein überschritt db.READ_TIME_LIMIT (dann
+    SLOW_PROFILE_TTL lang kein neuer Versuch)."""
     run = state.fetcher.state.get("last_finished")
     day = state.db.today_start()
     key = (user_id, profile["id"])
     hit = _unread_cache.get(key)
     now = time.monotonic()
-    if hit and now - hit[0] < UNREAD_TTL and hit[1] == run and hit[2] == day:
+    if hit and hit[3] is None and now - hit[0] < SLOW_PROFILE_TTL:
+        return None
+    if hit and hit[3] is not None and now - hit[0] < UNREAD_TTL and hit[1] == run and hit[2] == day:
         return hit[3]
-    n = state.db.count_articles(user_id, cap=UNREAD_CAP, sources=sources, terms=profile["terms"] or None,
-                                unread=True, free_only=True, since=day)
+    budget = budget or CountBudget()
+    left = budget.remaining()
+    if left <= 0:
+        return None
+    limit = min(db_mod.READ_TIME_LIMIT, left)
+    try:
+        n = state.db.count_articles(user_id, cap=UNREAD_CAP, sources=sources, terms=profile["terms"] or None,
+                                    unread=True, free_only=True, since=day, time_limit=limit)
+    except QueryTimeout:
+        if limit < db_mod.READ_TIME_LIMIT:
+            return None  # nur das Restbudget war zu knapp: beim nächsten Mal wieder versuchen
+        # Zu teures Profil: nicht zählen, statt Profilliste und Leiste scheitern zu lassen.
+        log.warning("Zähler für Profil %s (Benutzer %s) abgebrochen: Zeitlimit", profile["id"], user_id)
+        _unread_cache[key] = (now, run, day, None)
+        return None
     _unread_cache[key] = (now, run, day, n)
     return n
 
 
-def _profile_view(user_id: int, profile: dict[str, Any]) -> dict[str, Any]:
+def _profile_view(user_id: int, profile: dict[str, Any], budget: CountBudget | None = None) -> dict[str, Any]:
     sources = effective_sources(profile)
-    return {**profile, "source_count": len(sources), "unread": profile_unread(user_id, profile, sources)}
+    return {**profile, "source_count": len(sources),
+            "unread": profile_unread(user_id, profile, sources, budget)}
 
 
 def _check_reorder(ids: list, known: set) -> None:
@@ -194,11 +241,14 @@ def _clean_fields(body: BaseModel) -> dict[str, Any]:
 
 @router.get("/profiles")
 async def list_profiles(user: User):
-    return [_profile_view(user["id"], p) for p in state.db.list_profiles(user["id"])]
+    budget = CountBudget()   # eines für alle Profile der Liste
+    return [_profile_view(user["id"], p, budget) for p in state.db.list_profiles(user["id"])]
 
 
 @router.post("/profiles", status_code=201)
 async def create_profile(body: ProfileIn, user: User):
+    if len(state.db.list_profiles(user["id"])) >= MAX_PROFILES:
+        raise HTTPException(409, f"Höchstens {MAX_PROFILES} Profile möglich, bitte erst eines löschen")
     fields = _clean_fields(body)
     pid = state.db.create_profile(user["id"], name=body.name, sources=fields.get("sources", body.sources),
                                   terms=fields.get("terms", []), in_bar=body.in_bar)
@@ -228,7 +278,7 @@ def _profile_or_404(user_id: int, profile_id: int) -> dict[str, Any]:
 async def patch_profile(body: ProfilePatch, user: User, profile_id: int = PathParam(ge=1, le=MAX_ID)):
     _profile_or_404(user["id"], profile_id)
     state.db.update_profile(user["id"], profile_id, _clean_fields(body))
-    invalidate_unread(user["id"])
+    invalidate_unread(user["id"], profile_id=profile_id)
     return _profile_view(user["id"], state.db.get_profile(user["id"], profile_id))
 
 
@@ -237,7 +287,7 @@ async def delete_profile(user: User, profile_id: int = PathParam(ge=1, le=MAX_ID
     if _profile_or_404(user["id"], profile_id)["builtin"]:
         raise HTTPException(409, "Vorgegebene Profile lassen sich nicht löschen")
     state.db.delete_profile(user["id"], profile_id)
-    invalidate_unread(user["id"])
+    invalidate_unread(user["id"], profile_id=profile_id)
     return Response(status_code=204)
 
 
@@ -307,11 +357,12 @@ def _bar(user_id: int) -> dict[str, Any]:
         if f["in_bar"] and src is not None:
             entries[f"source:{src.id}"] = {"type": "source", "id": src.id, "key": f"source:{src.id}",
                                            "label": src.short, "unread": unread.get(src.id, 0)}
+    budget = CountBudget()   # eines für alle Profile der Leiste
     for p in state.db.list_profiles(user_id):
         if p["in_bar"]:
             entries[f"profile:{p['id']}"] = {"type": "profile", "id": p["id"], "key": f"profile:{p['id']}",
                                              "label": p["name"].upper(),
-                                             "unread": profile_unread(user_id, p, effective_sources(p))}
+                                             "unread": profile_unread(user_id, p, effective_sources(p), budget)}
     ordered = [entries.pop(k) for k in ui_settings(user_id)["bar_order"] if k in entries]
     total = state.db.article_counts(user_id, enabled_sources())["unread"]
     return {"items": [{"type": "all", "key": "all", "label": "ALLE", "unread": total},

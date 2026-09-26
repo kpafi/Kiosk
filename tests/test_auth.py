@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 import app.auth as auth_mod
 from app.auth import (MAX_ATTEMPTS, MAX_USER_ATTEMPTS, PLAIN_COOKIE_NAME, SECURE_COOKIE_NAME, Auth, hash_password,
                       normalize_username, verify_password)
@@ -191,3 +193,83 @@ def test_docs_flag(monkeypatch):
     assert docs_enabled() is False
     monkeypatch.setenv("KIOSK_DOCS", "1")
     assert docs_enabled() is True
+
+
+@pytest.mark.parametrize("ip,key", [
+    ("203.0.113.7", "203.0.113.7"),
+    ("2001:db8:1:2:aaaa::1", "2001:db8:1:2::/64"),
+    ("2001:db8:1:2:ffff:ffff:ffff:ffff", "2001:db8:1:2::/64"),
+    ("::ffff:203.0.113.7", "203.0.113.7"),
+    ("testclient", "testclient"),
+])
+def test_ip_key_groups_ipv6_by_64(ip, key):
+    from app.auth import ip_key
+    assert ip_key(ip) == key
+
+
+@pytest.mark.parametrize("secret", ["kurz", "x" * 31])
+def test_short_kiosk_secret_is_rejected(tmp_path, monkeypatch, secret):
+    from app.config import load_settings
+    monkeypatch.setenv("KIOSK_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("KIOSK_PASSWORD", raising=False)
+    monkeypatch.setenv("KIOSK_SECRET", secret)
+    with pytest.raises(RuntimeError, match="KIOSK_SECRET muss mindestens 32 Zeichen"):
+        load_settings()
+    monkeypatch.setenv("KIOSK_SECRET", "x" * 32)
+    assert load_settings().secret == "x" * 32
+
+
+@pytest.mark.parametrize("content", ["", "\n", "zu-kurz"])
+def test_empty_or_short_secret_file_is_rejected(tmp_path, monkeypatch, content):
+    from app.config import load_settings
+    monkeypatch.setenv("KIOSK_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("KIOSK_PASSWORD", raising=False)
+    monkeypatch.delenv("KIOSK_SECRET", raising=False)
+    (tmp_path / "secret.key").write_text(content)
+    with pytest.raises(RuntimeError, match="secret.key ist leer oder kürzer als 32"):
+        load_settings()
+
+
+def test_secret_file_is_written_atomically(tmp_path, monkeypatch):
+    """Scheitert das Schreiben, bleibt keine (leere) secret.key und keine Hilfsdatei zurück."""
+    import os
+
+    from app.config import load_settings
+    monkeypatch.setenv("KIOSK_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("KIOSK_PASSWORD", raising=False)
+    monkeypatch.delenv("KIOSK_SECRET", raising=False)
+
+    def full_disk(fd):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "fsync", full_disk)
+    with pytest.raises(OSError):
+        load_settings()
+    assert list(tmp_path.iterdir()) == []
+    monkeypatch.undo()
+    monkeypatch.setenv("KIOSK_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("KIOSK_PASSWORD", raising=False)
+    monkeypatch.delenv("KIOSK_SECRET", raising=False)
+    secret = load_settings().secret
+    assert [p.name for p in tmp_path.iterdir()] == ["secret.key"] and len(secret) >= 32
+
+
+def test_stale_secret_temp_link_is_removed(tmp_path, monkeypatch):
+    """Absturz zwischen link() und unlink(): Beim nächsten Start verschwindet die Hilfsdatei, damit
+    secret.key wieder nur einen harten Link hat (backup.sh kopiert sonst nicht)."""
+    import os
+
+    from app.config import load_settings
+    monkeypatch.setenv("KIOSK_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("KIOSK_PASSWORD", raising=False)
+    monkeypatch.delenv("KIOSK_SECRET", raising=False)
+    (tmp_path / "secret.key").write_text("s" * 64)
+    own = tmp_path / f".secret.key.{os.getpid()}.abcd1234"      # eigene PID aus einem früheren Leben
+    os.link(tmp_path / "secret.key", own)
+    dead = tmp_path / ".secret.key.99999999.deadbeef"            # Prozess gibt es nicht
+    dead.write_text("x")
+    alive = tmp_path / f".secret.key.{os.getppid()}.cafe0000"     # läuft noch: bleibt
+    alive.write_text("x")
+    assert load_settings().secret == "s" * 64
+    assert not own.exists() and not dead.exists() and alive.exists()
+    assert os.stat(tmp_path / "secret.key").st_nlink == 1

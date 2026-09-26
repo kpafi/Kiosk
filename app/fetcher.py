@@ -4,9 +4,11 @@ from __future__ import annotations
 import asyncio
 import calendar
 import concurrent.futures
+import contextvars
 import multiprocessing
 import io
 import logging
+import math
 import time
 import weakref
 import zlib
@@ -22,9 +24,9 @@ import feedparser
 import httpx
 
 from .config import Settings
-from .db import Database, utcnow
+from .db import Database, QueryTimeout, request_time_limit, utcnow
 from .extract import drop_title_echo, extract, is_placeholder, is_small_image_url, safe_http_url, strip_html
-from .netguard import BlockedURL, ResolveError, check_url, server_addr_blocked
+from .netguard import BlockedURL, ResolveError, check_url, server_addr_blocked, set_deny_networks
 from .sources import Catalog, Source
 
 log = logging.getLogger("kiosk.fetcher")
@@ -35,11 +37,20 @@ EXTRACT_BATCH = 60
 EXTRACT_MAX_PER_CYCLE = 900
 PER_DOMAIN_DELAY = 0.4
 IMAGE_TYPES = ("image/",)
-FEED_MAX_BYTES = 10 * 1024 * 1024
+# Eingangsgrenzen; die Ausgabe begrenzen FEED_MAX_ENTRIES und extract.MAX_BODY_HTML, beides wird im
+# Worker-Prozess mit Zeitlimit verarbeitet.
+FEED_MAX_BYTES = 5 * 1024 * 1024
 ARTICLE_MAX_BYTES = 5 * 1024 * 1024
+# Ein feindlicher Feed mit Zehntausenden winziger Einträge: nur die ersten FEED_MAX_ENTRIES zählen,
+# und je Quelle und Lauf kommen höchstens FEED_MAX_NEW neue Artikel dazu (der Rest beim nächsten Lauf).
+FEED_MAX_ENTRIES = 300
+FEED_MAX_NEW = 150
+FEED_PARSE_TIMEOUT = 30     # Sekunden für feedparser im Worker-Prozess
 TOTAL_TIMEOUT = 45          # Sekunden pro Abruf inkl. Umleitungen, unabhängig von httpx-Timeouts
 OVERALL_TIMEOUT = 60        # Sekunden für _get insgesamt, inkl. zweitem Versuch mit anderem User-Agent
 PRIORITY_CONCURRENCY = 2    # gleichzeitige Extraktionen auf Anforderung (API)
+PRIORITY_QUEUE_MAX = 20     # höchstens so viele Extraktionen auf Anforderung laufen oder warten
+RETRY_MIN_INTERVAL = 120    # Sekunden: ?retry=true startet frühestens so lange nach dem letzten Versuch neu
 DOMAIN_STATE_TTL = 3600     # Sekunden, nach denen ungenutzte Domain-Einträge verworfen werden
 MAX_REDIRECTS = 5
 REDIRECT_CODES = (301, 302, 303, 307, 308)
@@ -57,6 +68,11 @@ UNSUPPORTED_ENCODINGS = {"br", "zstd", "compress", "x-compress"}
 
 class FetchError(Exception):
     """Abruf gescheitert (Größenlimit, zu viele Umleitungen ...). Gilt als vorübergehend."""
+
+
+class TooLarge(FetchError):
+    """Antwort größer als erlaubt. Für eine Artikelseite endgültig: Die Seite wird beim nächsten
+    Versuch nicht kleiner."""
 
 
 class UnsupportedEncoding(Exception):
@@ -118,7 +134,7 @@ def _decoder(header: str):
 
 
 class ExtractTimeout(Exception):
-    """Die Extraktion im Worker-Prozess hat EXTRACT_TIMEOUT überschritten."""
+    """Ein Auftrag im Worker-Prozess (Extraktion, Feed-Parsing) hat sein Zeitlimit überschritten."""
 
 
 class PoolDiscarded(Exception):
@@ -154,12 +170,15 @@ class Fetched:
 
 
 def parse_retry_after(raw: str | None) -> float | None:
-    """Retry-After als Sekunden (Zahl oder HTTP-Datum), begrenzt auf MAX_RETRY_AFTER."""
+    """Retry-After als Sekunden (Zahl oder HTTP-Datum), begrenzt auf MAX_RETRY_AFTER. "nan" und
+    "inf" (float() nimmt beides an) gelten als ungültig."""
     if not raw:
         return None
     raw = raw.strip()
     try:
         seconds = float(raw)
+        if not math.isfinite(seconds):
+            return None
     except ValueError:
         try:
             when = parsedate_to_datetime(raw)
@@ -171,15 +190,33 @@ def parse_retry_after(raw: str | None) -> float | None:
     return min(max(seconds, 0.0), MAX_RETRY_AFTER)
 
 
-def _entry_datetime(entry: Any) -> str:
+def http_token(value: str | None) -> str | None:
+    """Kopfzeilenwert (ETag, Last-Modified) nur aus druckbarem ASCII, sonst None. httpx kann
+    andere Zeichen nicht senden (UnicodeEncodeError vor der Anfrage)."""
+    if not value or len(value) > 500 or not all(" " <= ch <= "~" for ch in value):
+        return None
+    return value
+
+
+def _entry_timestamp(entry: Any) -> int | None:
+    """Zeitpunkt des Eintrags (Unix-Sekunden) aus dem ersten brauchbaren Datum, sonst None."""
     for key in ("published_parsed", "updated_parsed", "created_parsed"):
         st = entry.get(key)
         if st:
             try:
-                return datetime.fromtimestamp(calendar.timegm(st), tz=timezone.utc).replace(microsecond=0).isoformat()
-            except (OverflowError, ValueError):
+                ts = calendar.timegm(st)
+                datetime.fromtimestamp(ts, tz=timezone.utc)  # außerhalb des darstellbaren Bereichs?
+                return ts
+            except (OverflowError, ValueError, OSError):
                 continue
-    return utcnow()
+    return None
+
+
+def _entry_datetime(entry: Any) -> str:
+    ts = _entry_timestamp(entry)
+    if ts is None:
+        return utcnow()
+    return datetime.fromtimestamp(ts, tz=timezone.utc).replace(microsecond=0).isoformat()
 
 
 def _entry_image(entry: Any) -> str | None:
@@ -215,13 +252,21 @@ def _entry_author(entry: Any) -> str | None:
 
 
 def parse_feed(source: Source, raw: bytes) -> list[dict[str, Any]]:
+    """Einträge eines Feeds als Zeilen für upsert_articles, höchstens die ersten FEED_MAX_ENTRIES.
+    Läuft im Worker-Prozess (Fetcher._fetch_feed): feedparser braucht für einen feindlichen Feed
+    viel Speicher und Zeit."""
     # Als Datei-Objekt übergeben: Bei bytes/str versucht feedparser zuerst, den Inhalt als
     # Dateipfad oder URL zu öffnen (ein Body "/proc/self/environ" würde gelesen).
     parsed = feedparser.parse(io.BytesIO(raw))
     now = utcnow()
     rows: list[dict[str, Any]] = []
+    # Neueste zuerst, bevor gekürzt wird: Manche Feeds führen die ältesten Einträge oben. Einträge
+    # ohne Datum kommen ans Ende, sonst bleibt die Reihenfolge des Feeds (sort ist stabil).
+    stamps = [_entry_timestamp(e) for e in parsed.entries]
+    order = sorted(range(len(stamps)), key=lambda i: math.inf if stamps[i] is None else -stamps[i])
+    entries = [parsed.entries[i] for i in order]
     # Einträge mit Datum in der Zukunft würden sonst dauerhaft oben kleben.
-    for e in parsed.entries:
+    for e in entries[:FEED_MAX_ENTRIES]:
         link = (e.get("link") or "").strip()
         if not link.startswith(("http://", "https://")):
             continue
@@ -258,6 +303,10 @@ class Fetcher:
         self._priority_sem = asyncio.Semaphore(PRIORITY_CONCURRENCY)
         # Artikel-ID -> laufende Extraktion; verhindert doppelte Abrufe und doppelt gezählte Versuche.
         self._inflight: dict[int, asyncio.Task] = {}
+        # Extraktionen auf Anforderung: wie viele laufen oder warten (Grenze PRIORITY_QUEUE_MAX) und
+        # wann die letzte je Artikel endete (monotone Zeit, für RETRY_MIN_INTERVAL).
+        self._ondemand_count = 0
+        self._ondemand_done: dict[int, float] = {}
         self._client: httpx.AsyncClient | None = None
         self._wake = asyncio.Event()
         # Extraktion (trafilatura/lxml) in eigenen Prozessen: Ein Thread ließe sich bei einer
@@ -270,6 +319,12 @@ class Fetcher:
         # Wegen Zeitüberschreitung von uns verworfene Pools; die dadurch abgebrochenen Aufträge
         # der Nachbarn zählen nicht als Versuch.
         self._discarded: weakref.WeakSet = weakref.WeakSet()
+        # Artikel, deren Extraktion schon einmal mit einem gestorbenen Worker endete. Wer schuld war,
+        # ist nicht bekannt (z. B. ein Feed, der den Speicher sprengte): Beim ersten Mal wird ohne
+        # Zählung neu eingeplant, erst ein zweiter Absturz mit demselben Artikel zählt als Versuch.
+        self._crash_suspects: set[int] = set()
+        # Zusätzlich gesperrte Ziele (KIOSK_FETCH_DENY_IPS) gelten für alle Abrufe dieses Prozesses.
+        set_deny_networks(settings.fetch_deny_ips)
 
     # ---- lifecycle ---------------------------------------------------
 
@@ -305,20 +360,25 @@ class Fetcher:
             self._pool = None
 
     def _extraction_pool(self) -> concurrent.futures.ProcessPoolExecutor:
-        """Der Prozess-Pool für die Extraktion; wird beim ersten Bedarf angelegt.
+        """Der Prozess-Pool für Extraktion und Feed-Parsing; wird beim ersten Bedarf angelegt.
 
         Startmethode ist bewusst "forkserver" statt des Linux-Standards "fork": uvicorn hat zu
-        diesem Zeitpunkt schon Threads (to_thread für feedparser, httpx), und fork() in einem
-        Prozess mit Threads kann im Kind gehaltene Locks (Logging, malloc) einfrieren. Der
-        Forkserver wird einmal sauber per exec gestartet, die Worker forken von ihm. Die Worker
-        führen nur die Modulfunktion extract() mit bytes und str aus und fassen weder Datenbank
-        noch Event-Loop an. Sie starten beim ersten Auftrag, laufen im selben Container
-        (pids_limit, mem_limit) und brauchen /dev/shm für die Semaphoren von multiprocessing.
+        diesem Zeitpunkt schon Threads (asyncio.to_thread, httpx), und fork() in einem Prozess
+        mit Threads kann im Kind gehaltene Locks (Logging, malloc) einfrieren. Der Forkserver
+        wird einmal sauber per exec gestartet, die Worker forken von ihm. Die Worker führen nur
+        die Modulfunktionen extract() und parse_feed() mit bytes, str und Source aus und fassen
+        weder Datenbank noch Event-Loop an. Sie starten beim ersten Auftrag, laufen im selben
+        Container (pids_limit, mem_limit) und brauchen /dev/shm für die Semaphoren von multiprocessing.
         max_tasks_per_child ersetzt jeden Worker nach EXTRACT_TASKS_PER_CHILD Aufträgen durch
         einen frischen Prozess (begrenzt schleichend wachsenden Speicher; mit forkserver erlaubt).
         """
         if self._pool is None:
             ctx = multiprocessing.get_context("forkserver")
+            # Der Forkserver lädt die Module der Aufträge (extract, parse_feed: trafilatura, lxml,
+            # feedparser) einmal vorab; jeder neue Worker (alle EXTRACT_TASKS_PER_CHILD Aufträge)
+            # forkt sie fertig geladen, statt sie erneut zu importieren. Wirkt nur, bevor der
+            # Forkserver startet (erster Auftrag); Importfehler ignoriert multiprocessing dabei.
+            ctx.set_forkserver_preload(["app.fetcher"])
             self._pool = concurrent.futures.ProcessPoolExecutor(
                 max_workers=EXTRACT_WORKERS, mp_context=ctx, max_tasks_per_child=EXTRACT_TASKS_PER_CHILD)
         return self._pool
@@ -331,27 +391,32 @@ class Fetcher:
             _discard_pool(pool)
 
     async def _run_extract(self, page: bytes, url: str):
-        """Führt extract() im Prozess-Pool aus, höchstens EXTRACT_TIMEOUT Sekunden reine Laufzeit.
+        """Führt extract() im Prozess-Pool aus, höchstens EXTRACT_TIMEOUT Sekunden reine Laufzeit."""
+        # extract wird zur Laufzeit aus dem Modul gelesen (in Tests austauschbar); an den Worker
+        # geht nur eine Referenz auf die Modulfunktion plus bytes und str (picklebar).
+        return await self._run_in_pool(extract, page, url, timeout=EXTRACT_TIMEOUT, what="Extraktion")
+
+    async def _run_in_pool(self, fn, *args, timeout: float, what: str):
+        """Führt fn(*args) im Prozess-Pool aus, höchstens `timeout` Sekunden reine Laufzeit.
 
         Wartet zuerst auf einen freien Worker-Platz (_pool_sem), erst danach läuft das Zeitlimit.
         Überschreitet ein Auftrag das Limit, wird der Pool verworfen (ExtractTimeout); die übrigen
         laufenden Aufträge dieses Pools enden dann mit PoolDiscarded (zählt nicht als Versuch).
+        `what` benennt den Auftrag in den Fehlermeldungen.
         """
         async with self._pool_sem:
             pool = self._extraction_pool()
             loop = asyncio.get_running_loop()
-            # extract wird zur Laufzeit aus dem Modul gelesen (in Tests austauschbar); an den Worker
-            # geht nur eine Referenz auf die Modulfunktion plus bytes und str (picklebar).
             try:
                 # submit wirft BrokenProcessPool sofort, wenn ein Worker schon vorher gestorben ist.
-                future = loop.run_in_executor(pool, extract, page, url)
-                return await asyncio.wait_for(future, timeout=EXTRACT_TIMEOUT)
+                future = loop.run_in_executor(pool, fn, *args)
+                return await asyncio.wait_for(future, timeout=timeout)
             except asyncio.TimeoutError:
                 # Nur hier verwerfen wir einen gesunden Pool selbst; stirbt ein Worker von allein
                 # (z. B. Speicher), wissen wir nicht, welcher Auftrag schuld war, und alle zählen.
                 self._discarded.add(pool)
                 self._replace_pool(pool)
-                raise ExtractTimeout("Extraktion Zeitüberschreitung") from None
+                raise ExtractTimeout(f"{what} Zeitüberschreitung") from None
             except asyncio.CancelledError:
                 # Abgebrochen wurde nur der Pool-Auftrag (shutdown mit cancel_futures), nicht diese
                 # Aufgabe selbst: wie ein abgebrochener Pool behandeln, nie als CancelledError
@@ -360,12 +425,12 @@ class Fetcher:
                 if task is not None and task.cancelling():
                     raise
                 if pool in self._discarded:
-                    raise PoolDiscarded("Extraktion unterbrochen (Pool neu gestartet)") from None
+                    raise PoolDiscarded(f"{what} unterbrochen (Pool neu gestartet)") from None
                 self._replace_pool(pool)
                 raise BrokenProcessPool("Pool-Auftrag abgebrochen") from None
             except BrokenProcessPool:
                 if pool in self._discarded:
-                    raise PoolDiscarded("Extraktion unterbrochen (Pool neu gestartet)") from None
+                    raise PoolDiscarded(f"{what} unterbrochen (Pool neu gestartet)") from None
                 self._replace_pool(pool)
                 raise
 
@@ -397,8 +462,12 @@ class Fetcher:
             self._prune_domains()
             self.state.update(running=True, last_started=utcnow())
             try:
-                new = await self._fetch_all_feeds()
-                extracted = await self._extract_pending()
+                try:
+                    new = await self._fetch_all_feeds()
+                    extracted = await self._extract_pending()
+                except Exception:
+                    self.db.purge(self.settings.retention_days)  # aufräumen auch nach einem Fehler davor
+                    raise
                 purged = self.db.purge(self.settings.retention_days)
                 self.state.update(last_new=new, last_extracted=extracted, last_purged=purged)
                 self.state["runs"] += 1
@@ -469,7 +538,7 @@ class Fetcher:
                         continue
                     declared = r.headers.get("content-length", "")
                     if declared.isdigit() and int(declared) > max_bytes:
-                        raise FetchError(f"Antwort zu groß ({int(declared)} Bytes, Limit {max_bytes})")
+                        raise TooLarge(f"Antwort zu groß ({int(declared)} Bytes, Limit {max_bytes})")
                     return Fetched(r.status_code, r.headers, await _read_limited(r, max_bytes), str(r.url))
             raise FetchError(f"Zu viele Umleitungen (> {MAX_REDIRECTS})")
 
@@ -495,9 +564,11 @@ class Fetcher:
         state = self.db.source_states().get(src.id)
         headers: dict[str, str] = {"Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, */*;q=0.8"}
         if state is not None:
-            if state["etag"]:
+            # Gespeicherte Validatoren nur senden, wenn sie reines ASCII sind (ältere Datenbanken
+            # können andere enthalten; httpx würde an ihnen bei jedem Abruf scheitern).
+            if http_token(state["etag"]):
                 headers["If-None-Match"] = state["etag"]
-            if state["last_modified"]:
+            if http_token(state["last_modified"]):
                 headers["If-Modified-Since"] = state["last_modified"]
         r = await self._get(src.feed, headers=headers, max_bytes=FEED_MAX_BYTES)
         if r.status_code == 304:
@@ -506,7 +577,10 @@ class Fetcher:
         if r.status_code != 200:
             self.db.record_fetch(src.id, ok=False, error=f"HTTP {r.status_code}")
             return 0
-        rows = await asyncio.to_thread(parse_feed, src, r.content)
+        # Im Worker-Prozess mit Zeitlimit: Ein feindlicher Feed kostet dort Speicher und Zeit, nicht
+        # in der App (deren Speicher bliebe fragmentiert). Fehler landen in _fetch_all_feeds.
+        rows = await self._run_in_pool(parse_feed, src, r.content, timeout=FEED_PARSE_TIMEOUT,
+                                       what="Feed-Parsing")
         if not rows:
             self.db.record_fetch(src.id, ok=False, error="Feed enthält keine Einträge")
             return 0
@@ -514,11 +588,12 @@ class Fetcher:
         # sonst würden sie bei jedem Lauf neu eingefügt, extrahiert und wieder gelöscht.
         cutoff = (datetime.now(timezone.utc) - timedelta(days=self.settings.retention_days)).isoformat()
         rows = [row for row in rows if row["published_at"] >= cutoff]
-        new = self.db.upsert_articles(rows)
-        self.db.record_fetch(
-            src.id, ok=True, new_count=new,
-            etag=r.headers.get("etag"), last_modified=r.headers.get("last-modified"),
-        )
+        new = self.db.upsert_articles(rows, max_new=FEED_MAX_NEW)
+        # Grenze erreicht: Validatoren nicht speichern, sonst hielte ein 304 die übrigen Einträge
+        # zurück; der nächste Abruf geht ohne Bedingung und holt sie.
+        validators = (None, None) if new >= FEED_MAX_NEW else (
+            http_token(r.headers.get("etag")), http_token(r.headers.get("last-modified")))
+        self.db.record_fetch(src.id, ok=True, new_count=new, validators=validators)
         return new
 
     # ---- extraction ----------------------------------------------------
@@ -546,7 +621,11 @@ class Fetcher:
     def _spawn(self, article_id: int, coro) -> asyncio.Task:
         """Startet eine Extraktion als Task und trägt sie in _inflight ein. Der Eintrag wird nur
         entfernt, solange er noch zu genau diesem Task gehört."""
-        task = asyncio.create_task(coro)
+        # Ohne die Frist einer API-Anfrage (request_time_limit), aus der start_extraction kommt:
+        # Lesen im Sammler/Extraktor ist Hintergrundarbeit.
+        ctx = contextvars.copy_context()
+        ctx.run(request_time_limit.set, None)
+        task = asyncio.create_task(coro, context=ctx)
         self._inflight[article_id] = task
 
         def _done(t: asyncio.Task) -> None:
@@ -556,24 +635,15 @@ class Fetcher:
         task.add_done_callback(_done)
         return task
 
-    async def extract_article(self, article_id: int, url: str, *, priority: bool = False) -> None:
-        """Lädt eine Artikelseite und speichert den bereinigten Volltext.
+    async def extract_article(self, article_id: int, url: str) -> None:
+        """Hintergrund-Extraktion: lädt eine Artikelseite und speichert den bereinigten Volltext.
 
-        Läuft für diese ID schon eine Extraktion, startet keine zweite: Abrufe auf Anforderung
-        (priority=True, API) warten auf deren Ende, Hintergrund-Abrufe überspringen den Artikel.
-        Hintergrund-Abrufe tragen sich erst in _inflight ein, wenn sie ihren Platz in der
-        Hintergrund-Grenze haben; ein Abruf auf Anforderung hängt sich also nie an einen Artikel,
-        der noch in der Warteschlange des Hintergrundlaufs steht, sondern startet sofort unter
-        seiner eigenen kleinen Grenze.
+        Läuft für diese ID schon eine Extraktion (z. B. auf Anforderung, start_extraction), wird
+        der Artikel übersprungen. Hintergrund-Abrufe tragen sich erst in _inflight ein, wenn sie
+        ihren Platz in der Hintergrund-Grenze haben; ein Abruf auf Anforderung hängt sich also nie
+        an einen Artikel, der noch in der Warteschlange des Hintergrundlaufs steht, sondern startet
+        sofort unter seiner eigenen kleinen Grenze.
         """
-        if priority:
-            task = self._inflight.get(article_id)
-            if task is None:
-                task = self._spawn(article_id, self._extract_priority(article_id, url))
-            # shield: Bricht der Aufrufer ab (z. B. Browser schließt die Verbindung), läuft der
-            # Abruf trotzdem zu Ende und sein Ergebnis wird gespeichert.
-            await asyncio.shield(task)
-            return
         async with self._extract_sem:
             # Zwischen Prüfung und Eintrag liegt kein await: keine doppelte Extraktion.
             if article_id in self._inflight:
@@ -588,11 +658,34 @@ class Fetcher:
         """True, solange für diese ID eine Extraktion läuft."""
         return article_id in self._inflight
 
-    def start_extraction(self, article_id: int, url: str) -> None:
+    def start_extraction(self, article_id: int, url: str, *, retry: bool = False) -> bool:
         """Startet eine Extraktion auf Anforderung im Hintergrund, ohne auf sie zu warten
-        (Leseansicht fragt per Polling nach). Läuft schon eine, passiert nichts."""
-        if article_id not in self._inflight:
-            self._spawn(article_id, self._extract_priority(article_id, url))
+        (Leseansicht fragt per Polling nach). Gibt zurück, ob jetzt eine läuft.
+
+        Läuft schon eine, passiert nichts (True). Keine neue (False), wenn schon PRIORITY_QUEUE_MAX
+        Abrufe auf Anforderung laufen oder warten, oder bei `retry` (erneuter Versuch für einen
+        abgeschlossenen Artikel), wenn der letzte Abruf auf Anforderung keine RETRY_MIN_INTERVAL
+        Sekunden zurückliegt: Wiederholtes Abfragen soll keine Abrufe stapeln."""
+        if article_id in self._inflight:
+            return True
+        now = time.monotonic()
+        if retry and now - self._ondemand_done.get(article_id, -math.inf) < RETRY_MIN_INTERVAL:
+            return False
+        if self._ondemand_count >= PRIORITY_QUEUE_MAX:
+            return False
+        self._ondemand_count += 1
+        task = self._spawn(article_id, self._extract_priority(article_id, url))
+
+        def _finished(_t: asyncio.Task) -> None:
+            self._ondemand_count -= 1
+            done = time.monotonic()
+            if len(self._ondemand_done) >= 1000:  # nur die jüngsten Einträge zählen noch
+                for aid in [a for a, t in self._ondemand_done.items() if done - t >= RETRY_MIN_INTERVAL]:
+                    del self._ondemand_done[aid]
+            self._ondemand_done[article_id] = done
+
+        task.add_done_callback(_finished)
+        return True
 
     async def _extract_priority(self, article_id: int, url: str) -> None:
         async with self._priority_sem:
@@ -608,12 +701,29 @@ class Fetcher:
         log.info("Extraktion %s (%s): %s -> %s", article_id, url, error, status)
 
     async def _extract(self, article_id: int, url: str) -> None:
+        """Ein Extraktionsversuch. Geht dabei unerwartet etwas schief (auch in der Buchführung,
+        z. B. beim Speichern eines Fehlers), zählt das als vorübergehender Fehlschlag: Sonst bliebe
+        der Artikel 'pending' und fällig und würde in jedem Lauf erneut geholt."""
+        try:
+            await self._extract_once(article_id, url)
+        except QueryTimeout:
+            # Nur möglich, wenn doch eine Frist galt (Hintergrund läuft ohne): kein Fehler des
+            # Artikels, zählt nicht als Versuch.
+            log.warning("Extraktion %s (%s): Datenbankabfrage abgebrochen, später erneut", article_id, url)
+        except Exception as e:  # noqa: BLE001  (CancelledError ist keine Exception)
+            log.exception("Extraktion %s (%s) unerwartet gescheitert", article_id, url)
+            try:
+                self.db.schedule_retry(article_id, f"Interner Fehler: {type(e).__name__}: {e}")
+            except Exception:  # noqa: BLE001
+                log.exception("Extraktion %s: Fehlschlag ließ sich nicht speichern", article_id)
+
+    async def _extract_once(self, article_id: int, url: str) -> None:
         try:
             r = await self._get(url, max_bytes=ARTICLE_MAX_BYTES)
         except BlockedURL as e:
             self._fail(article_id, f"Ziel blockiert: {e}")
             return
-        except UnsupportedEncoding as e:
+        except (UnsupportedEncoding, TooLarge) as e:
             self._fail(article_id, str(e))
             return
         except (httpx.InvalidURL, httpx.UnsupportedProtocol, ValueError) as e:
@@ -652,20 +762,31 @@ class Fetcher:
             log.info("Extraktion %s (%s): %s, erneut eingeplant", article_id, url, e)
             return
         except BrokenProcessPool as e:
-            # Worker gestorben (z. B. Speicher) oder wegen eines hängenden Nachbarn beendet.
-            self._retry(article_id, url, f"Extraktion abgebrochen: {type(e).__name__}")
+            # Worker gestorben (z. B. Speicher, auch durch einen Nachbarauftrag wie einen feindlichen
+            # Feed): beim ersten Mal ohne Zählung neu einplanen, siehe _crash_suspects.
+            if article_id in self._crash_suspects:
+                self._crash_suspects.discard(article_id)
+                self._retry(article_id, url, f"Extraktion abgebrochen: {type(e).__name__}")
+            else:
+                if len(self._crash_suspects) >= 1000:
+                    self._crash_suspects.clear()
+                self._crash_suspects.add(article_id)
+                self.db.requeue(article_id, "Extraktion abgebrochen (Worker gestorben), erneut eingeplant")
+                log.info("Extraktion %s (%s): Worker gestorben, erneut eingeplant", article_id, url)
             return
         except Exception as e:  # noqa: BLE001
             log.warning("Extraktion %s (%s): %s", article_id, url, e)
             self._fail(article_id, f"{type(e).__name__}: {e}")
             return
         row = self.db.get_article(article_id)
-        result = drop_title_echo(result, row["title"] if row else None)
+        # Im Thread: arbeitet auf bis zu MAX_BODY_HTML Zeichen HTML und soll die Event-Loop nicht aufhalten.
+        result = await asyncio.to_thread(drop_title_echo, result, row["title"] if row else None)
         # Feed-Bild nur als kleine Vorschau (Guardian ?width=140), die Seite nennt ein großes: das
         # große wird Titelbild. Nur beim ersten Holen des Textes; schon geholte Artikel bleiben, wie sie sind.
         feed_image = row["image_url"] if row and row["extracted_at"] is None else None
         replace_image = bool(feed_image and is_small_image_url(feed_image)
                              and result.image_url and not is_small_image_url(result.image_url))
+        self._crash_suspects.discard(article_id)
         self.db.store_extraction(
             article_id, status=result.status, body_html=result.body_html, body_text=result.body_text,
             body_len=result.body_len, paywalled=result.paywalled, image_url=result.image_url,
@@ -680,7 +801,7 @@ async def _read_limited(r: httpx.Response, max_bytes: int) -> bytes:
         # Nur bei vorgefertigten Antworten ohne Netzwerk (MockTransport in Tests): Der Inhalt liegt
         # schon vollständig im Speicher, es bleibt die Größenprüfung.
         if len(r.content) > max_bytes:
-            raise FetchError(f"Antwort zu groß (über {max_bytes} Bytes)")
+            raise TooLarge(f"Antwort zu groß (über {max_bytes} Bytes)")
         return r.content
     if r.status_code in (204, 304):
         return b""  # nie ein Body, auch wenn Content-Encoding gesetzt ist
@@ -692,13 +813,13 @@ async def _read_limited(r: httpx.Response, max_bytes: int) -> bytes:
         nonlocal total
         total += len(data)
         if total > max_bytes:
-            raise FetchError(f"Antwort zu groß (über {max_bytes} Bytes)")
+            raise TooLarge(f"Antwort zu groß (über {max_bytes} Bytes)")
         chunks.append(data)
 
     async for chunk in r.aiter_raw():
         raw_total += len(chunk)
         if raw_total > max_bytes:
-            raise FetchError(f"Antwort zu groß (über {max_bytes} Bytes)")
+            raise TooLarge(f"Antwort zu groß (über {max_bytes} Bytes)")
         if decoder is None:
             add(chunk)
             continue

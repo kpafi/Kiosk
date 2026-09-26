@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
+import time as _time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, time, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Iterator
@@ -53,12 +56,20 @@ CREATE TABLE IF NOT EXISTS articles (
     UNIQUE (source_id, guid)
 );
 CREATE INDEX IF NOT EXISTS idx_articles_published ON articles (published_at DESC, id DESC);
-CREATE INDEX IF NOT EXISTS idx_articles_source ON articles (source_id, published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_articles_status ON articles (text_status);
+-- Je Quelle nach Zeit, mit paywalled: deckt die Zähler je Quelle (source_counts,
+-- unread_free_by_source) ganz ab. Ohne paywalled im Index liest SQLite jede Artikelzeile samt
+-- Volltext, um die Spalte zu erreichen. Ersetzt idx_articles_source (source_id, published_at DESC),
+-- neben dem der Planer den neuen Index für source_counts nicht nahm. SCHEMA läuft bei jedem Start:
+-- bestehende Datenbanken bekommen den Tausch so ohne neue Schema-Version.
+DROP INDEX IF EXISTS idx_articles_source;
+CREATE INDEX IF NOT EXISTS idx_articles_source_counts ON articles (source_id, published_at, paywalled);
 
 -- Bereits gesehene Feed-Einträge. Bleiben nach dem Löschen der Artikel (purge) länger erhalten,
 -- damit Einträge ohne Datum (published_at = Zeitpunkt des ersten Abrufs) nicht nach Ablauf der
--- Aufbewahrungsfrist als "neu" wieder auftauchen.
+-- Aufbewahrungsfrist als "neu" wieder auftauchen. first_seen heißt nur noch aus historischen
+-- Gründen so: upsert_articles frischt es auf (höchstens einmal täglich), solange der Eintrag im
+-- Feed steht; purge löscht also nur Einträge, die seit 2x Aufbewahrungsfrist nicht mehr kamen.
 CREATE TABLE IF NOT EXISTS seen_guids (
     source_id  TEXT NOT NULL,
     guid       TEXT NOT NULL,
@@ -181,10 +192,31 @@ FTS_DDL = (
 RETRY_BACKOFF = (timedelta(hours=1), timedelta(hours=4), timedelta(hours=12))
 MAX_RETRY_DELAY = timedelta(hours=12)
 
+# Höchstlaufzeit einer einzelnen Leseabfrage (q/one) in Sekunden, während einer API-Anfrage: Alle
+# Abfragen laufen auf der einen Event-Loop, eine teure Suche oder ein Profil voller Begriffe würde
+# sonst alle anderen Anfragen blockieren. Die Frist gilt nur, wo request_time_limit gesetzt ist
+# (Middleware in main.py für /api/); Hintergrundarbeit (Sammler, Extraktion, purge, Migration) und
+# schreibende Transaktionen (tx) haben keine.
+READ_TIME_LIMIT = 2.0
+request_time_limit: ContextVar[float | None] = ContextVar("kiosk_request_time_limit", default=None)
+_FROM_CONTEXT: Any = object()   # time_limit nicht angegeben: request_time_limit gilt
+PROGRESS_STEPS = 10_000     # SQLite-VM-Schritte zwischen zwei Blicken auf die Uhr
+# Suche: höchstens so viele Wörter (der Rest zählt nicht); Präfix-Suche erst ab PREFIX_MIN_LEN
+# Zeichen, ein Präfix wie "a*" müsste die Trefferlisten Tausender Begriffe zusammenführen.
+SEARCH_MAX_WORDS = 8
+PREFIX_MIN_LEN = 3
+# Wortzeichen wie im FTS-Tokenizer unicode61 (Buchstaben und Ziffern, kein Unterstrich).
+_TOKEN_RE = re.compile(r"[^\W_]+")
+# seen_guids.first_seen wird bei erneutem Auftauchen höchstens so oft aufgefrischt.
+SEEN_REFRESH = timedelta(days=1)
+
 # Lesestand des Benutzers aus user_articles (Alias ua, per LEFT JOIN; ohne Zeile: 0).
 FLAG_COLS = ("COALESCE(ua.read, 0) AS read, COALESCE(ua.starred, 0) AS starred, "
              "COALESCE(ua.later, 0) AS later")
 USER_JOIN = "LEFT JOIN user_articles ua ON ua.article_id = a.id AND ua.user_id = ?"
+# Zähler je Quelle nur aus dem Index (siehe SCHEMA): Der Planer wählt ihn nicht immer von selbst
+# (z. B. ohne Aufbewahrungsgrenze), und jede Artikelzeile samt Volltext zu lesen kostet viel.
+COUNT_INDEX = "INDEXED BY idx_articles_source_counts"
 
 ARTICLE_LIST_COLS = ", ".join(
     f"a.{c}" for c in (
@@ -225,6 +257,10 @@ class MigrationError(RuntimeError):
     """Die Datenbank lässt sich ohne weitere Angaben nicht migrieren (z. B. fehlt der Admin)."""
 
 
+class QueryTimeout(Exception):
+    """Eine Leseabfrage lief länger als erlaubt (READ_TIME_LIMIT) und wurde abgebrochen."""
+
+
 class Database:
     """Eine Verbindung, ein Lock. Für eine Handvoll Benutzer völlig ausreichend.
 
@@ -247,6 +283,11 @@ class Database:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=5000")
+        # Zeitlimit für Leseabfragen (siehe _time_limit): Der Handler bricht ab, sobald die Frist
+        # der laufenden Abfrage verstrichen ist; ohne Frist (tx, Migration) nie.
+        self._deadline: float | None = None
+        self._timed_out = False
+        self._conn.set_progress_handler(self._progress, PROGRESS_STEPS)
         try:
             with self._lock:
                 self._conn.executescript(SCHEMA)  # executescript verwaltet die Transaktion selbst
@@ -386,12 +427,42 @@ class Database:
                 self._conn.execute("ROLLBACK")
                 raise
 
-    def q(self, sql: str, params: tuple | dict = ()) -> list[sqlite3.Row]:
-        with self._lock:
+    def _progress(self) -> int:
+        if self._deadline is not None and _time.monotonic() > self._deadline:
+            self._timed_out = True
+            return 1  # SQLite bricht die Abfrage mit "interrupted" ab
+        return 0
+
+    @contextmanager
+    def _time_limit(self, seconds: float | None) -> Iterator[None]:
+        """Frist für genau eine Abfrage; bei Überschreitung QueryTimeout. Innerhalb einer offenen
+        Transaktion (tx) und mit seconds=None gilt keine Frist. Aufrufer hält self._lock."""
+        if seconds is None or self._conn.in_transaction:
+            yield
+            return
+        self._deadline, self._timed_out = _time.monotonic() + seconds, False
+        try:
+            yield
+        except sqlite3.OperationalError as e:
+            if self._timed_out:
+                raise QueryTimeout(f"Abfrage nach {seconds:g} s abgebrochen") from e
+            raise
+        finally:
+            self._deadline = None
+
+    def q(self, sql: str, params: tuple | dict = (), *,
+          time_limit: float | None = _FROM_CONTEXT) -> list[sqlite3.Row]:
+        """Leseabfrage; Frist `time_limit` Sekunden (None = keine), ohne Angabe die der laufenden
+        API-Anfrage (request_time_limit)."""
+        limit = request_time_limit.get() if time_limit is _FROM_CONTEXT else time_limit
+        with self._lock, self._time_limit(limit):
             return self._conn.execute(sql, params).fetchall()
 
-    def one(self, sql: str, params: tuple | dict = ()) -> sqlite3.Row | None:
-        with self._lock:
+    def one(self, sql: str, params: tuple | dict = (), *,
+            time_limit: float | None = _FROM_CONTEXT) -> sqlite3.Row | None:
+        """Wie q, nur die erste Zeile."""
+        limit = request_time_limit.get() if time_limit is _FROM_CONTEXT else time_limit
+        with self._lock, self._time_limit(limit):
             return self._conn.execute(sql, params).fetchone()
 
     def close(self) -> None:
@@ -419,20 +490,29 @@ class Database:
         return [r["id"] for r in self.q("SELECT id FROM source_state WHERE enabled=1")]
 
     def record_fetch(self, sid: str, *, ok: bool, error: str | None = None,
-                     etag: str | None = None, last_modified: str | None = None,
+                     validators: tuple[str | None, str | None] | None = None,
                      new_count: int = 0) -> None:
+        """Ergebnis eines Feed-Abrufs. `validators` = (ETag, Last-Modified) einer 200-Antwort
+        ersetzt die gespeicherten (None löscht den Wert); ohne Angabe (304) bleiben sie. Ein
+        Fehlschlag löscht beide: Ein unbrauchbarer Validator soll eine Quelle nicht dauerhaft
+        blockieren, der nächste Abruf geht dann ohne Bedingung."""
         now = utcnow()
         with self.tx() as c:
-            if ok:
+            if ok and validators is not None:
                 c.execute(
                     "UPDATE source_state SET last_fetch_at=?, last_ok_at=?, last_error=NULL, "
-                    "etag=COALESCE(?, etag), last_modified=COALESCE(?, last_modified), last_new=? WHERE id=?",
-                    (now, now, etag, last_modified, new_count, sid),
+                    "etag=?, last_modified=?, last_new=? WHERE id=?",
+                    (now, now, *validators, new_count, sid),
+                )
+            elif ok:
+                c.execute(
+                    "UPDATE source_state SET last_fetch_at=?, last_ok_at=?, last_error=NULL, last_new=? "
+                    "WHERE id=?", (now, now, new_count, sid),
                 )
             else:
                 c.execute(
-                    "UPDATE source_state SET last_fetch_at=?, last_error=? WHERE id=?",
-                    (now, (error or "unbekannter Fehler")[:500], sid),
+                    "UPDATE source_state SET last_fetch_at=?, last_error=?, etag=NULL, last_modified=NULL "
+                    "WHERE id=?", (now, (error or "unbekannter Fehler")[:500], sid),
                 )
 
     def source_counts(self, user_id: int) -> dict[str, dict[str, int]]:
@@ -446,27 +526,37 @@ class Database:
             "SELECT a.source_id, SUM(a.paywalled=0) AS total, "
             "SUM(COALESCE(ua.read, 0)=0 AND a.paywalled=0 AND a.published_at >= ?) AS unread, "
             "SUM(COALESCE(ua.read, 0)=0 AND a.paywalled=0) AS unread_all "
-            f"FROM articles a {USER_JOIN} {cond}GROUP BY a.source_id", (self.today_start(), user_id, *params)
+            f"FROM articles a {COUNT_INDEX} {USER_JOIN} {cond}GROUP BY a.source_id",
+            (self.today_start(), user_id, *params)
         )
         return {r["source_id"]: {"total": r["total"], "unread": r["unread"], "unread_all": r["unread_all"]}
                 for r in rows}
 
     # ---- articles ------------------------------------------------------
 
-    def upsert_articles(self, rows: list[dict[str, Any]]) -> int:
+    def upsert_articles(self, rows: list[dict[str, Any]], max_new: int | None = None) -> int:
         """Fügt neue Artikel ein, ignoriert bekannte. Gibt die Zahl der neuen zurück.
 
         Bekannt ist ein Eintrag, wenn (source_id, guid) in seen_guids steht, auch wenn der Artikel
-        selbst schon gelöscht wurde.
+        selbst schon gelöscht wurde. Taucht ein bekannter Eintrag wieder auf, wird sein
+        first_seen aufgefrischt (höchstens einmal pro SEEN_REFRESH), damit purge ihn nicht vergisst,
+        solange er im Feed steht (sonst käme ein Eintrag ohne Datum nach 2x Aufbewahrungsfrist als
+        „neu“ zurück). Mit `max_new` höchstens so viele neue Artikel; die übrigen Einträge bleiben
+        ungesehen und kommen beim nächsten Abruf dran.
         """
         new = 0
+        refresh_before = _iso(datetime.now(timezone.utc) - SEEN_REFRESH)
         with self.tx() as c:
             for r in rows:
+                if max_new is not None and new >= max_new:
+                    break
                 seen = c.execute(
                     "INSERT OR IGNORE INTO seen_guids (source_id, guid, first_seen) VALUES (?,?,?)",
                     (r["source_id"], r["guid"], r["fetched_at"]),
                 )
                 if seen.rowcount == 0:
+                    c.execute("UPDATE seen_guids SET first_seen=? WHERE source_id=? AND guid=? AND first_seen < ?",
+                              (r["fetched_at"], r["source_id"], r["guid"], refresh_before))
                     continue
                 cur = c.execute(
                     "INSERT OR IGNORE INTO articles (source_id, guid, url, title, summary, author, "
@@ -636,8 +726,9 @@ class Database:
     def count_articles(self, user_id: int, *, cap: int, sources: list[str] | None = None, query: str | None = None,
                        unread: bool = False, starred: bool = False, free_only: bool = False,
                        later: bool = False, terms: list[str] | None = None,
-                       since: str | None = None) -> int:
-        """Anzahl passender Artikel, höchstens `cap` (zählt nie mehr Zeilen als nötig)."""
+                       since: str | None = None, time_limit: float | None = _FROM_CONTEXT) -> int:
+        """Anzahl passender Artikel, höchstens `cap` (zählt nie mehr Zeilen als nötig). `time_limit`
+        wie bei q."""
         where, params = _article_filter(sources=sources, unread=unread, starred=starred,
                                         free_only=free_only, later=later, terms=terms, since=since,
                                         cutoff=self.retention_cutoff())
@@ -646,7 +737,7 @@ class Database:
             params.append(_fts_query(query))
         sql = (f"SELECT COUNT(*) AS n FROM (SELECT 1 FROM articles a {USER_JOIN} "
                + (("WHERE " + " AND ".join(where)) if where else "") + " LIMIT ?)")
-        return self.one(sql, (user_id, *params, cap))["n"]
+        return self.one(sql, (user_id, *params, cap), time_limit=time_limit)["n"]
 
     def get_article(self, article_id: int, user_id: int | None = None) -> sqlite3.Row | None:
         """Artikel mit Volltext; read/starred/later von `user_id` (ohne Benutzer alle 0). Für einen
@@ -724,7 +815,7 @@ class Database:
         """Ungelesene Artikel ohne Paywall je Quelle, nur von heute (Zähler der Leiste)."""
         where, params = _article_filter(sources=None, unread=True, starred=False, free_only=True,
                                         since=self.today_start(), cutoff=self.retention_cutoff())
-        rows = self.q(f"SELECT a.source_id, COUNT(*) AS n FROM articles a {USER_JOIN} "
+        rows = self.q(f"SELECT a.source_id, COUNT(*) AS n FROM articles a {COUNT_INDEX} {USER_JOIN} "
                       f"WHERE {' AND '.join(where)} GROUP BY a.source_id", (user_id, *params))
         return {r["source_id"]: r["n"] for r in rows}
 
@@ -752,7 +843,7 @@ class Database:
             "SUM(a.text_status='partial') AS partial, SUM(a.text_status='failed') AS failed, "
             "SUM(a.paywalled=1) AS paywalled, COALESCE(SUM(a.body_len),0) AS body_bytes, "
             f"MIN(a.published_at) AS oldest, MAX(a.published_at) AS newest FROM articles a {USER_JOIN}",
-            (user_id,)
+            (user_id,), time_limit=None,  # nur für den Admin; liest bewusst die ganze Tabelle
         )
         size = 0
         for suffix in ("", "-wal"):
@@ -1011,9 +1102,18 @@ def _article_filter(*, sources: list[str] | None, unread: bool, starred: bool, f
     return where, params
 
 
+def _phrase(text: str) -> str:
+    """Text als FTS5-Phrase (Anführungszeichen verdoppelt); mit Präfix-Stern nur, wenn das letzte
+    Wort mindestens PREFIX_MIN_LEN Zeichen hat, kürzere Wörter zählen exakt."""
+    tokens = _TOKEN_RE.findall(text)
+    star = "*" if tokens and len(tokens[-1]) >= PREFIX_MIN_LEN else ""
+    return '"' + text.replace('"', '""') + '"' + star
+
+
 def _terms_query(terms: list[str]) -> str:
-    """Profil-Begriffe als FTS5-Abfrage: jeder Begriff als Phrase mit Präfix, ODER-verknüpft."""
-    return " OR ".join('"' + t.replace('"', '""') + '"*' for t in terms)
+    """Profil-Begriffe als FTS5-Abfrage: jeder Begriff als Phrase (mit Präfix, siehe _phrase),
+    ODER-verknüpft."""
+    return " OR ".join(_phrase(t) for t in terms)
 
 
 def _has_text(c: sqlite3.Connection, article_id: int) -> bool:
@@ -1025,13 +1125,14 @@ def _has_text(c: sqlite3.Connection, article_id: int) -> bool:
 
 
 def _fts_query(raw: str) -> str:
-    """Macht aus freier Eingabe eine sichere FTS5-Abfrage: jedes Wort als Präfix, UND-verknüpft.
+    """Macht aus freier Eingabe eine sichere FTS5-Abfrage: jedes Wort als Phrase, UND-verknüpft,
+    höchstens SEARCH_MAX_WORDS Wörter; Präfix-Suche nur ab PREFIX_MIN_LEN Zeichen (siehe _phrase).
 
     Jedes Wort wird als FTS5-String in doppelte Anführungszeichen gesetzt; eingebettete
     Anführungszeichen werden dabei verdoppelt.
     """
     words = [w.strip('"\'*()^:-') for w in raw.split()]
-    words = [w for w in words if w]
+    words = [w for w in words if w][:SEARCH_MAX_WORDS]
     if not words:
         return '""'
-    return " AND ".join('"' + w.replace('"', '""') + '"*' for w in words)
+    return " AND ".join(_phrase(w) for w in words)

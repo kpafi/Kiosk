@@ -392,3 +392,72 @@ def test_sanitize_keeps_caption_only_figures_of_other_images():
     assert out.count("<img") == 1 and out.count("<figure>") == 2
     assert "Grafik folgt" in out and "Zwei" not in out
     assert text == "Anfang Eins Grafik folgt Ende"
+
+
+# ---- Obergrenzen für feindliche Seiten ------------------------------------------------
+
+def test_long_body_is_cut_at_top_level_element(monkeypatch):
+    import app.extract as extract_mod
+    monkeypatch.setattr(extract_mod, "MAX_BODY_HTML", 2000)
+    body = "".join(f"<p>Absatz {i} " + "x" * 80 + "</p>" for i in range(200))
+    out, text, truncated = extract_mod.sanitize_limited(body, BASE)
+    assert truncated and 2000 < len(out) < 2200
+    assert out.count("<p>") == out.count("</p>") and out.endswith("</p>")
+    assert "Absatz 199" not in text and text.startswith("Absatz 0")
+    _, _, short = extract_mod.sanitize_limited("<p>kurz</p>", BASE)
+    assert short is False
+
+
+def test_single_huge_element_is_closed_at_hard_limit(monkeypatch):
+    import app.extract as extract_mod
+    monkeypatch.setattr(extract_mod, "MAX_BODY_HTML", 1000)
+    body = "<table><tbody>" + ("<tr><td><p>" + "y" * 50 + "</p></td></tr>") * 500 + "</tbody></table><p>Ende</p>"
+    out, _, truncated = extract_mod.sanitize_limited(body, BASE)
+    assert truncated and len(out) <= 2200
+    for tag in ("table", "tbody", "tr", "td", "p"):
+        assert out.count(f"<{tag}>") == out.count(f"</{tag}>"), tag
+    assert "Ende" not in out
+    # Verwaiste End-Tags verlängern die Ausgabe über der Grenze nicht mehr.
+    out, _, _ = extract_mod.sanitize_limited("<p>" + "z" * 1500 + "</p>" + "</td></tr>" * 5000, BASE)
+    assert len(out) < 2200
+
+
+def test_images_are_capped():
+    from app.extract import MAX_IMAGES
+    body = "".join(f'<p><img src="/bild-nummer-{i}.jpg"></p>' for i in range(MAX_IMAGES + 50))
+    out, _ = sanitize(body, BASE)
+    assert out.count("<img") == MAX_IMAGES
+
+
+def test_truncated_extraction_is_partial(monkeypatch):
+    import app.extract as extract_mod
+    monkeypatch.setattr(extract_mod, "MAX_BODY_HTML", 3000)
+    page = ("<html><head><title>T</title></head><body><article><h1>Titel</h1>"
+            + "".join(f"<p>Absatz {i}: ein ganz normaler Satz mit genug Text für die Extraktion.</p>" for i in range(400))
+            + "</article></body></html>").encode()
+    res = extract_mod.extract(page, BASE)
+    assert res.status == "partial" and len(res.body_html) < 3500 and res.body_len > 600
+
+
+def test_many_unclosed_tags_stay_linear():
+    import time
+    from app.extract import sanitize_limited
+    body = "<p>" + "<b>x" * 40_000 + "</i>" * 20_000 + "</p>"
+    t0 = time.monotonic()
+    out, _, _ = sanitize_limited(body, BASE)
+    assert time.monotonic() - t0 < 3
+    assert out.startswith("<p><b>x")
+
+
+@pytest.mark.parametrize("filler", ["a", "wort ", "&<>"])
+def test_single_huge_text_node_is_cut(filler):
+    from app.extract import MAX_BODY_HTML, sanitize_limited
+    body = "<p>" + filler * (4_000_000 // len(filler)) + "</p><p>danach</p>"
+    out, text, truncated = sanitize_limited(body, BASE)
+    # Ein Textknoten wird an der Grenze geschnitten; zerfällt der Text in viele Knoten ("<>" teilt
+    # ihn), greift wie bei jedem langen Element die harte Grenze (doppelte Länge).
+    assert truncated and len(out) <= (MAX_BODY_HTML if filler != "&<>" else 2 * MAX_BODY_HTML) + 20
+    assert out.startswith("<p>") and out.endswith("</p>") and out.count("<p>") == out.count("</p>") == 1
+    assert "danach" not in out and len(text) > MAX_BODY_HTML // 10
+    import re
+    assert not re.search(r"&[a-z]*</p>$", out)   # keine angeschnittene Entität

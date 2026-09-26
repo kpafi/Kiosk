@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
 import os
 import re
 import time
@@ -33,6 +34,10 @@ GLOBAL_WINDOW_SECONDS = 60
 _PAYLOAD_RE = re.compile(r"u:([0-9]{1,18}):([0-9]{1,18}):([0-9a-f]{16})")
 
 LOGIN_ERROR = "Benutzername oder Passwort falsch"
+# Gemeinsamer Zähler der Login-Bremse für alle Namen, die nicht den Regeln entsprechen (enthält "?",
+# kann also kein gültiger Name sein): Solche Namen können nie ein Konto treffen und sollen die
+# Zähler echter Namen nicht aus der begrenzten Liste verdrängen.
+INVALID_NAME_KEY = "?ungueltig"
 
 # scrypt-Parameter für neue Hashes (ca. 16 MiB Speicher, einige 10 ms pro Hash).
 SCRYPT_N = 2**14
@@ -45,6 +50,20 @@ def normalize_username(raw: str) -> str | None:
     """Kleingeschriebener Benutzername oder None, wenn er nicht den Regeln entspricht."""
     name = raw.strip().lower()
     return name if USERNAME_RE.fullmatch(name) else None
+
+
+def ip_key(ip: str) -> str:
+    """Schlüssel der Login-Bremse je Adresse: IPv4 einzeln, IPv6 je /64-Netz (ein Anschluss hat
+    meist ein ganzes /64 und könnte sonst mit jedem Versuch eine neue Adresse nehmen)."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped:
+            return str(addr.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{addr}/64", strict=False))
+    return str(addr)
 
 
 def _b64(data: bytes) -> str:

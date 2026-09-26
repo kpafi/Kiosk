@@ -3,9 +3,33 @@
 Gleicher Server wie secure-chat und MailDigest (203.0.113.10, SSH-Alias `kiosk-server`).
 
 - Code liegt unter `/opt/kiosk`, Daten (SQLite, Secret) unter `/opt/kiosk/data`, Passwort in `/opt/kiosk/.env`.
+- Besitzer und Rechte (setzt jeder Deploy idempotent): Code und Konfiguration gehören `root:root` und sind
+  für andere nicht schreibbar (rsync mit `--chown=root:root --chmod=D755,F644`, danach `chown`/`chmod go-w`
+  über alles außer `data/`). `data/` gehört dem Container, Modus 700; `kiosk.db*` und `secret.key` 600
+  (dieses `chmod` läuft per `setpriv` als 10100, damit root keinem Symlink aus dem Container folgt). Die
+  App selbst legt Dateien mit umask 077 an.
+- Eigene uid/gid 10100 (`kiosk`): `USER` im Dockerfile und `user: "10100:10100"` in `docker-compose.yml`.
+  Die uid 1000 gehört auf der Box `maildigest` (dessen Container läuft ebenfalls als 1000), frühere
+  Kiosk-Versionen liefen auch so. deploy.sh stellt `data/` idempotent erst direkt vor dem Start des neuen
+  Containers auf `10100:10100` um (Schritt „Datenverzeichnis für uid 10100 und Container starten“, nach
+  Bauen und Pre-Deploy-Backup; bis dahin läuft der alte Container unverändert weiter). Umstellen und
+  `docker compose up` laufen in einem einzigen SSH-Aufruf, damit ein Verbindungsabbruch dazwischen nicht
+  den alten Container (uid 1000) vor einem data/ stehen lässt, das er nicht mehr lesen darf. Das Skript
+  auf der Box wird ganz gelesen, bevor es läuft, ignoriert HUP/PIPE/INT (bricht die Verbindung ab, läuft
+  es zu Ende) und schreibt nach `/opt/kiosk/backups/deploy-start.log`. Es hält dabei das Lock von
+  `backup.sh` (wartet bis zu 300 s auf ein laufendes Backup) und bricht vorher ohne Änderung ab (Exit 42,
+  „Alter Container läuft weiter“), wenn uid oder gid 10100 auf dem Host schon einem Benutzer bzw. einer
+  Gruppe gehört (`getent`). Zurückrollen: Weil
+  `docker-compose.yml` den Benutzer setzt, läuft auch ein älteres Image (`kiosk:good`, `kiosk:previous`,
+  gebaut noch mit uid 1000) als 10100 und kann `data/` schreiben; `data/` also nie auf 1000 zurückstellen.
+  Nur wer von Hand ein Image ohne dieses Compose-File startet, muss `--user 10100:10100` angeben.
 - Container `kiosk` lauscht nur auf `127.0.0.1:8100`. Caddy terminiert HTTPS unter `kiosk.example.org`.
 - Deploy: `bash deploy/deploy.sh` aus dem Repo-Root. Beim ersten Lauf wird ein Passwort erzeugt und in
-  `/opt/kiosk/.env` abgelegt (nicht im Terminal ausgegeben). Ablauf: Code per rsync, Backup-Skript und Cron
+  `/opt/kiosk/.env` abgelegt (nicht im Terminal ausgegeben). Fehlt `KIOSK_FETCH_DENY_IPS` in der `.env`,
+  trägt jeder Deploy den Wert von `FETCH_DENY_IPS` oben in `deploy.sh` ein (die Adressen der Box); ein
+  vorhandener Wert bleibt unverändert. Hochgeladen wird nur, was Build und Betrieb brauchen (ohne
+  `tests/`, `docs/`, `design/`, `.claude/`, `pytest.ini`, `requirements-dev.txt`); Reste früherer Deploys
+  davon löscht der Rechte-Schritt. Ablauf: Code per rsync, Backup-Skript und Cron
   installieren, Image als `kiosk:candidate` bauen (mit Build-Zeitstempel, sichtbar in `/api/status` als
   `build`), Pre-Deploy-Backup der Datenbank (gibt auch die Zahl der Artikel aus), Container mit
   `kiosk:candidate` starten, bis zu 300 s auf `/healthz` warten
@@ -31,8 +55,11 @@ Gleicher Server wie secure-chat und MailDigest (203.0.113.10, SSH-Alias `kiosk-s
   gibt es noch kein `kiosk:good`, ein älteres `kiosk:previous` bleibt dann unverändert.
 - Scheitert das Bauen oder das Pre-Deploy-Backup, bricht das Skript mit `Alter Container läuft weiter,
   nichts zu tun` ab: Bis dahin ist am laufenden Container nichts verändert.
-- Scheitert ein Schritt ab dem Start des neuen Containers (`docker compose up`, `/healthz`, Caddy oder die
-  Prüfung über Caddy), bricht das Skript ab und gibt die Befehle zum Zurückrollen aus (Ziel `kiosk:good`, ohne dieses
+- Scheitert das Umstellen von `data/` oder `docker compose up` selbst, gibt das Skript einen eigenen
+  Hinweis aus: keine Datenbank-Wiederherstellung nötig (das Schema ist noch nicht migriert),
+  `docker compose down`, `docker tag kiosk:good kiosk:latest`, `chown -R 10100:10100 /opt/kiosk/data`,
+  `docker compose up -d --no-build` (das ältere Image läuft über `user:` in `docker-compose.yml` als 10100).
+- Scheitert ein Schritt danach (`/healthz`, Caddy oder die Prüfung über Caddy), bricht das Skript ab und gibt die Befehle zum Zurückrollen aus (Ziel `kiosk:good`, ohne dieses
   die ID des vorher laufenden Images, dazu der Name des Pre-Deploy-Backups); der neue Container läuft dann weiter.
 - Zurückrollen nach einem gescheiterten Deploy: `cd /opt/kiosk && docker compose down && docker tag kiosk:good kiosk:latest`
   (`kiosk:latest` ist dann ohnehin noch der alte Stand; das Umtaggen schadet nicht), dann ggf. die Datenbank
@@ -41,8 +68,10 @@ Gleicher Server wie secure-chat und MailDigest (203.0.113.10, SSH-Alias `kiosk-s
   `cd /opt/kiosk && docker compose down && docker tag kiosk:previous kiosk:latest`. Wurde das Schema schon
   migriert, das Pre-Deploy-Backup dieses Deploys zurückspielen: jüngste Datei
   `/opt/kiosk/backups/kiosk-predeploy-<UTC-Zeitstempel>.db.gz` (`ls -1t /opt/kiosk/backups/kiosk-predeploy-*.db.gz | head -1`)
-  entpacken: `gunzip -c <Datei> > /opt/kiosk/data/kiosk.db`, dann `data/kiosk.db-wal` und `data/kiosk.db-shm`
-  löschen, `chown 1000:1000 /opt/kiosk/data/kiosk.db`. Dann `docker compose up -d --no-build`.
+  bei gestopptem Container entpacken:
+  `cd / && gunzip -c <Datei> | setpriv --reuid=10100 --regid=10100 --clear-groups sh -c 'cd /opt/kiosk/data && rm -f kiosk.db kiosk.db-wal kiosk.db-shm && umask 077 && cat > kiosk.db'`
+  (geschrieben wird nur als 10100 und in eine neu angelegte Datei: root folgt so keinem Symlink, den ein
+  kompromittierter Container in `data/` gelegt haben könnte; `cd /`, weil 10100 `/root` nicht betreten darf). Dann `docker compose up -d --no-build`.
   (Ältere Sicherungen ohne `.gz` direkt kopieren.)
 - Benutzer verwalten vom Laptop aus: `bash deploy/user.sh <befehl> ...` führt per SSH
   `docker compose exec -T kiosk python -m app.users <befehl> ...` im laufenden Container aus
@@ -66,19 +95,31 @@ Gleicher Server wie secure-chat und MailDigest (203.0.113.10, SSH-Alias `kiosk-s
 - Backup: `deploy/backup.sh` wird nach `/opt/kiosk/bin/backup.sh` installiert und läuft täglich um 03:30 als root
   (`/etc/cron.d/kiosk-backup`, Ausgabe im Journal unter `kiosk-backup`) sowie vor jedem Deploy. Es nutzt die
   Online-Backup-API von SQLite (auch bei laufendem Container konsistent), prüft die Kopie mit `quick_check`
-  und komprimiert sie mit gzip: täglich `/opt/kiosk/backups/kiosk-<UTC-Zeitstempel>.db.gz` (Modus 600, die
+  und komprimiert sie mit gzip. Den SQLite-Teil führt das Skript nicht als root aus, sondern in einem
+  eigenen Prozess als Besitzer des Datenverzeichnisses (uid/gid von `data/` selbst, also 10100, während
+  der Umstellung noch 1000; überschreibbar mit `KIOSK_BACKUP_UID`/`KIOSK_BACKUP_GID`, gehört `data/` root,
+  bricht es ab statt als root zu laufen). Das ist sicher: Der Container kann `data/` weder ersetzen noch
+  einem anderen Benutzer übertragen. Die Arbeitskopie liegt kurz als
+  `data/.backup-*` im Datenverzeichnis, root schreibt nur die komprimierte Sicherung. So folgt root keinem
+  Symlink, den ein kompromittierter Container im Datenverzeichnis anlegt. Ergebnis: täglich `/opt/kiosk/backups/kiosk-<UTC-Zeitstempel>.db.gz` (Modus 600, die
   neuesten 7 bleiben) und vor jedem Deploy `/opt/kiosk/backups/kiosk-predeploy-<UTC-Zeitstempel>.db.gz` (eigene
   Rotation, die neuesten 3 bleiben; tägliche Läufe löschen sie nicht). Alte unkomprimierte `.db`-Sicherungen
   zählen bei der Rotation mit und laufen so aus. Reste abgebrochener Läufe (`*.part`, älter als eine Stunde)
   werden beim nächsten Lauf gelöscht. Nie zwei Läufe gleichzeitig (`flock` auf `/opt/kiosk/backups/.backup.lock`):
   Ein täglicher Lauf wird dann mit Exit 0 und einer Meldung übersprungen, einer vor dem Deploy wartet bis zu
-  300 s (`KIOSK_BACKUP_LOCK_WAIT`) und bricht sonst mit Fehler ab. `secret.key` wird einmalig daneben gelegt. Von Hand:
+  300 s (`KIOSK_BACKUP_LOCK_WAIT`) und bricht sonst mit Fehler ab. Die Sicherung selbst darf höchstens
+  600 s dauern (`KIOSK_BACKUP_TIMEOUT`), sonst wird sie abgebrochen (z. B. wenn die Datenbank dauerhaft
+  gesperrt ist). `secret.key` wird einmalig daneben gelegt
+  (nur als einfache Datei, nie über einen Symlink). Von Hand:
   `/opt/kiosk/bin/backup.sh` bzw. `/opt/kiosk/bin/backup.sh predeploy`.
 - Fehlgeschlagene Backups: Das Skript meldet `FEHLER: Kiosk-Backup (<Modus>) fehlgeschlagen` und endet mit
   Exit-Code ungleich 0; der Cron-Eintrag schreibt dann zusätzlich `backup failed` mit Priorität `user.err`
   ins Journal: `journalctl -t kiosk-backup -p err`.
-- Wiederherstellen: Container stoppen (`docker compose down`), `gunzip -c <Sicherung>.db.gz > /opt/kiosk/data/kiosk.db`,
-  `kiosk.db-wal`/`kiosk.db-shm` löschen, `chown 1000:1000 /opt/kiosk/data/kiosk.db`, `docker compose up -d --no-build`.
+- Wiederherstellen: Container stoppen (`docker compose down`), dann
+  `cd / && gunzip -c <Sicherung>.db.gz | setpriv --reuid=10100 --regid=10100 --clear-groups sh -c 'cd /opt/kiosk/data && rm -f kiosk.db kiosk.db-wal kiosk.db-shm && umask 077 && cat > kiosk.db'`
+  (geschrieben wird nur als 10100 und in eine neu angelegte Datei: root folgt so keinem Symlink, den ein
+  kompromittierter Container in `data/` gelegt haben könnte; `cd /`, weil 10100 `/root` nicht betreten darf),
+  danach `docker compose up -d --no-build`.
 - Wachhund: Hängt die Sammler-Schleife (kein Lauf fertig seit 3 Intervallen + 10 min, oder ein Lauf dauert
   länger als 3 h) oder ist sie beendet, beendet sich die App nach spätestens einer Minute selbst (Exit-Code 3)
   und Docker startet den Container neu (`restart: unless-stopped`). Sichtbar in `docker logs kiosk` als

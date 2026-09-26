@@ -1,7 +1,7 @@
 // Profile und Lieblingszeitungen (E2Profile) als Blatt; Sortieren; Zeitung hinzufügen.
 import { append, h, hint, toast } from '../ui/dom.js';
 import { icon, back, chevronRight, close as closeIcon, plus, search as searchIcon } from '../ui/icons.js';
-import { closeSheet, openSheet, rebuildSheet, sheetGrip } from '../ui/sheet.js';
+import { closeSheet, isSheetOpen, openSheet, rebuildSheet, sheetGrip } from '../ui/sheet.js';
 import { toggle } from '../ui/toggle.js';
 import { api } from '../api.js';
 import {
@@ -53,7 +53,7 @@ export function openProfiles(route) {
   const refresh = async () => {
     await Promise.allSettled([loadProfiles(), loadFavorites(), loadBar()]);
     emit('profiles');
-    rebuildSheet(build);
+    rebuildSheet(build, panel);
   };
 
   function head(title, ...right) {
@@ -110,7 +110,7 @@ export function openProfiles(route) {
       sheetGrip(),
       head('PROFILE',
         h('span', { class: 't-caption', text: 'In der Leiste' }),
-        h('button', { type: 'button', class: 'btn-sm', text: 'Sortieren', on: { click: () => { mode = 'sort'; rebuildSheet(build); } } }),
+        h('button', { type: 'button', class: 'btn-sm', text: 'Sortieren', on: { click: () => { mode = 'sort'; rebuildSheet(build, panel); } } }),
         closeBtn()),
       profiles ? profiles.map(profileRow) : hint('Profile konnten nicht geladen werden.'),
       h('a', { class: 'pill pill--block', href: '#/profile/neu', style: { marginTop: '4px' } },
@@ -121,7 +121,7 @@ export function openProfiles(route) {
         : hint('Lieblingszeitungen konnten nicht geladen werden.'),
       h('button', {
         type: 'button', class: 'pill pill--block', style: { marginTop: '4px' }, disabled: !favorites,
-        on: { click: () => { mode = 'pick'; query = ''; rebuildSheet(build); panel.querySelector('input')?.focus(); } },
+        on: { click: () => { mode = 'pick'; query = ''; rebuildSheet(build, panel); panel.querySelector('input')?.focus(); } },
       }, plus(20), h('span', { text: 'Zeitung hinzufügen' })));
   }
 
@@ -135,7 +135,7 @@ export function openProfiles(route) {
       try {
         const res = await api('bar', { method: 'PATCH', body: { order: items.map(barKey) } });
         if (res && res.items) { state.bar = res.items; emit('bar'); } else await loadBar();
-        rebuildSheet(build);
+        rebuildSheet(build, panel);
       } catch (err) { fail(err); }
     };
     const saveProfiles = async (list) => {
@@ -166,7 +166,7 @@ export function openProfiles(route) {
     append(panel,
       sheetGrip(),
       head('SORTIEREN',
-        h('button', { type: 'button', class: 'btn-sm is-on', text: 'Fertig', on: { click: () => { mode = 'main'; rebuildSheet(build); } } }),
+        h('button', { type: 'button', class: 'btn-sm is-on', text: 'Fertig', on: { click: () => { mode = 'main'; rebuildSheet(build, panel); } } }),
         closeBtn()),
       h('div', { class: 'sheet-head sheet-head--sub' }, h('h2', { class: 't-section', text: 'LEISTE' })),
       bar.length
@@ -219,7 +219,7 @@ export function openProfiles(route) {
       sheetGrip(),
       h('div', { class: 'sheet-head' },
         h('button', {
-          type: 'button', class: 'icon-btn', 'aria-label': 'Zurück', on: { click: () => { mode = 'main'; rebuildSheet(build); } },
+          type: 'button', class: 'icon-btn', 'aria-label': 'Zurück', on: { click: () => { mode = 'main'; rebuildSheet(build, panel); } },
         }, back(20)),
         h('label', { class: 'search-field', style: { borderColor: 'var(--rule)' } }, searchIcon(20), input),
         closeBtn()),
@@ -238,7 +238,8 @@ export function openProfiles(route) {
     onClose: () => goBack(state.lastListHash),
   });
   Promise.allSettled([loadProfiles(), loadFavorites(), loadBar(), state.sources ? null : loadSources()]).then(() => {
-    rebuildSheet(build);
+    if (!isSheetOpen(panel)) return;
+    rebuildSheet(build, panel);
     if (scrollToFavorites) panel.querySelector('#zeitungen')?.scrollIntoView({ block: 'start' });
   });
 }

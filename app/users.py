@@ -253,4 +253,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    os.umask(0o077)  # wie die App: angelegte Datenbankdateien nur für den eigenen Benutzer
     sys.exit(main())

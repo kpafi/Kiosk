@@ -579,8 +579,9 @@ def test_huge_ids_are_client_errors(authed):
 def extract_calls(monkeypatch):
     calls = []
 
-    def fake(article_id, url):
+    def fake(article_id, url, *, retry=False):
         calls.append((article_id, True))
+        return True
 
     monkeypatch.setattr(state.fetcher, "start_extraction", fake)
     return calls
@@ -719,3 +720,129 @@ def test_font_and_manifest_content_types(client):
     assert r.status_code == 200 and r.headers["content-type"].startswith("font/woff2")
     r = client.get("/manifest.webmanifest")
     assert r.status_code == 200 and r.headers["content-type"].startswith("application/manifest+json")
+
+
+# ---- Login-Bremse: IPv6 je /64, ungültige Namen in einem Topf ------------------------
+
+def test_invalid_usernames_share_one_limiter_bucket(client, monkeypatch):
+    from app.auth import INVALID_NAME_KEY
+    keys = []
+    real = state.auth.reserve
+
+    def spy(ip, username):
+        keys.append(username)
+        return real(ip, username)
+
+    monkeypatch.setattr(state.auth, "reserve", spy)
+    for name in ("x", "Kein gültiger Name!", "ä" * 20, "a" * 40):
+        assert login(client, "falsch", name).status_code == 401
+    assert login(client, "falsch", " Anna ").status_code == 401
+    assert keys == [INVALID_NAME_KEY] * 4 + ["anna"]
+    assert set(state.auth._by_user.attempts) == {INVALID_NAME_KEY, "anna"}
+
+
+def test_ipv6_clients_are_limited_per_64(app_env):
+    headers = {"X-Forwarded-Proto": "https", "Origin": "https://testserver"}
+    with TestClient(_behind_proxy("172.19.0.1"), base_url="http://testserver") as c:
+        for i in range(8):  # jede Anfrage von einer anderen Adresse desselben /64
+            r = login(c, "falsch", f"x{i}", **headers, **{"X-Forwarded-For": f"2001:db8:1:2::{i + 1:x}"})
+            assert r.status_code == 401
+        assert login(c, **headers, **{"X-Forwarded-For": "2001:db8:1:2:ffff::9"}).status_code == 429
+        assert login(c, **headers, **{"X-Forwarded-For": "2001:db8:1:3::1"}).status_code == 204
+
+
+# ---- Zeitlimit für Abfragen -------------------------------------------------------------
+
+def test_slow_search_returns_503(authed, monkeypatch):
+    from app.db import QueryTimeout
+
+    def slow(*a, **kw):
+        raise QueryTimeout("Abfrage nach 2 s abgebrochen")
+
+    monkeypatch.setattr(state.db, "list_articles", slow)
+    r = authed.get("/api/articles", params={"q": "wahl"})
+    assert r.status_code == 503 and "Suche dauert zu lange" in r.json()["detail"]
+    r = authed.get("/api/articles")
+    assert r.status_code == 503 and "dauert zu lange" in r.json()["detail"]
+
+
+def test_query_timeout_anywhere_is_503(authed, monkeypatch):
+    from app.db import QueryTimeout
+
+    def slow(*a, **kw):
+        raise QueryTimeout("Abfrage nach 2 s abgebrochen")
+
+    monkeypatch.setattr(state.db, "source_counts", slow)
+    r = authed.get("/api/sources")
+    assert r.status_code == 503 and r.json() == {"detail": "Die Anfrage dauert zu lange, bitte später erneut versuchen"}
+
+
+def test_real_slow_query_is_aborted_in_request(authed, monkeypatch):
+    """Ende zu Ende: eine wirklich teure Abfrage wird von SQLite abgebrochen, die App antwortet 503."""
+    real_q = state.db.q
+    sql = ("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10000000000) "
+           "SELECT COUNT(*) AS c FROM n")
+    monkeypatch.setattr(state.db, "source_counts", lambda user_id: real_q(sql, time_limit=0.2))
+    t0 = time.monotonic()
+    assert authed.get("/api/sources").status_code == 503
+    assert time.monotonic() - t0 < 5
+    assert authed.get("/api/me").status_code == 200
+
+
+# ---- Dateirechte ------------------------------------------------------------------------
+
+def test_app_creates_private_files(app_env):
+    import os
+    import stat
+    before = os.umask(0o022)
+    try:
+        with TestClient(app, base_url=ORIGIN) as c:
+            assert login(c).status_code == 204
+            for name in ("kiosk.db", "kiosk.db-wal"):
+                assert stat.S_IMODE((app_env / name).stat().st_mode) & 0o077 == 0, name
+        assert os.umask(0o022) == 0o022   # nach dem Herunterfahren wieder die alte umask
+    finally:
+        os.umask(before)
+
+
+# ---- Abruf auf Anforderung gedeckelt -------------------------------------------------------
+
+def test_article_reports_not_extracting_when_start_refused(authed, monkeypatch):
+    _seed(1)
+    aid = state.db.one("SELECT id FROM articles")["id"]
+    calls = []
+
+    def refuse(article_id, url, *, retry=False):
+        calls.append(retry)
+        return False
+
+    monkeypatch.setattr(state.fetcher, "start_extraction", refuse)
+    body = authed.get(f"/api/articles/{aid}").json()
+    assert body["extracting"] is False and body["text_status"] == "pending"
+    state.db.store_extraction(aid, status="failed", body_html=None, body_len=0, paywalled=False, error="HTTP 404")
+    body = authed.get(f"/api/articles/{aid}", params={"retry": True}).json()
+    assert body["extracting"] is False and body["text_status"] == "failed"
+    assert calls == [False, True]   # retry nur für den erneuten Versuch eines fertigen Artikels
+
+
+def test_default_read_limit_applies_to_api_requests_only(authed, monkeypatch):
+    """Ohne ausdrückliche Frist gilt db.READ_TIME_LIMIT nur innerhalb einer API-Anfrage."""
+    monkeypatch.setattr(db_mod, "READ_TIME_LIMIT", 0.2)
+    real_q = state.db.q
+    sql = ("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?) "
+           "SELECT COUNT(*) AS c FROM n")
+    monkeypatch.setattr(state.db, "source_counts", lambda user_id: real_q(sql, (10**10,)))
+    assert authed.get("/api/sources").status_code == 503
+    # Außerhalb einer Anfrage (Sammler, Start) keine Frist: dieselbe Abfrage läuft durch.
+    assert real_q(sql, (3_000_000,))[0]["c"] == 3_000_000
+
+
+def test_query_timeout_in_middleware_is_503(authed, monkeypatch):
+    from app.db import QueryTimeout
+
+    def slow(user_id):
+        raise QueryTimeout("Abfrage nach 2 s abgebrochen")
+
+    monkeypatch.setattr(state.db, "get_user", slow)   # läuft in der Middleware (Cookie prüfen)
+    r = authed.get("/api/me")
+    assert r.status_code == 503 and "dauert zu lange" in r.json()["detail"]

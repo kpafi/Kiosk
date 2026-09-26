@@ -28,6 +28,14 @@ def make_fetcher(db, settings, handler) -> Fetcher:
     return f
 
 
+async def on_demand(f: Fetcher, article_id: int, url: str) -> None:
+    """Extraktion auf Anforderung wie über die API (start_extraction), wartet auf ihr Ende."""
+    assert f.start_extraction(article_id, url)
+    task = f._inflight.get(article_id)
+    if task is not None:
+        await asyncio.shield(task)
+
+
 @pytest.fixture(autouse=True)
 def no_delay(monkeypatch):
     monkeypatch.setattr(fetcher_mod, "PER_DOMAIN_DELAY", 0)
@@ -116,16 +124,19 @@ async def test_fetch_feed_conditional_and_retention(db, settings):
                               content=rss(item(1, date=recent), item(2, date=old)))
 
     f = make_fetcher(db, settings, handler)
-    assert await f._fetch_feed(SRC) == 1  # der 200 Tage alte Eintrag wird gar nicht angelegt
-    assert [r["guid"] for r in db.q("SELECT guid FROM articles")] == ["g1"]
-    st = db.source_states()["alpha"]
-    assert st["etag"] == '"v1"' and st["last_error"] is None
+    try:
+        assert await f._fetch_feed(SRC) == 1  # der 200 Tage alte Eintrag wird gar nicht angelegt
+        assert [r["guid"] for r in db.q("SELECT guid FROM articles")] == ["g1"]
+        st = db.source_states()["alpha"]
+        assert st["etag"] == '"v1"' and st["last_error"] is None
 
-    assert await f._fetch_feed(SRC) == 0
-    assert seen[1]["if-none-match"] == '"v1"'
-    assert seen[1]["if-modified-since"] == "Mon, 01 Sep 2026 10:00:00 GMT"
-    st = db.source_states()["alpha"]
-    assert st["last_error"] is None and st["last_new"] == 0 and st["etag"] == '"v1"'
+        assert await f._fetch_feed(SRC) == 0
+        assert seen[1]["if-none-match"] == '"v1"'
+        assert seen[1]["if-modified-since"] == "Mon, 01 Sep 2026 10:00:00 GMT"
+        st = db.source_states()["alpha"]
+        assert st["last_error"] is None and st["last_new"] == 0 and st["etag"] == '"v1"'
+    finally:
+        await f.close()  # parse_feed lief im Prozess-Pool
 
 
 # ---- Extraktion -------------------------------------------------------------
@@ -139,8 +150,7 @@ async def test_failed_retry_keeps_existing_text(db, settings):
     aid = _article(db)
     db.store_extraction(aid, status="partial", body_html="<p>Anfang</p>", body_text="Anfang",
                         body_len=6, paywalled=True)
-    await make_fetcher(db, settings, lambda r: httpx.Response(403)).extract_article(aid, f"{PUBLIC}/artikel",
-                                                                                     priority=True)
+    await on_demand(make_fetcher(db, settings, lambda r: httpx.Response(403)), aid, f"{PUBLIC}/artikel")
     row = db.get_article(aid)
     assert row["text_status"] == "partial" and row["body_text"] == "Anfang" and row["body_len"] == 6
     assert row["body_html"] == "<p>Anfang</p>" and row["text_error"] == "HTTP 403"
@@ -162,7 +172,7 @@ async def test_small_feed_image_is_replaced_by_page_image(db, settings, monkeypa
         return extract_mod.Extraction("full", "<p>Text</p>", "Text", 4, False, page_image, None)
 
     monkeypatch.setattr(f, "_run_extract", fake_extract)
-    await f.extract_article(aid, f"{PUBLIC}/artikel", priority=True)
+    await on_demand(f, aid, f"{PUBLIC}/artikel")
     assert db.get_article(aid)["image_url"] == expected
 
 
@@ -194,7 +204,7 @@ async def test_same_article_is_never_extracted_twice_concurrently(db, settings):
     f = make_fetcher(db, settings, handler)
     await asyncio.gather(
         f.extract_article(aid, f"{PUBLIC}/artikel"),
-        f.extract_article(aid, f"{PUBLIC}/artikel", priority=True),
+        on_demand(f, aid, f"{PUBLIC}/artikel"),
     )
     assert calls == ["/artikel"]
     assert db.get_article(aid)["attempts"] == 1
@@ -237,7 +247,7 @@ async def test_invalid_urls_fail_permanently(db, settings, url, handler_exc):
             raise handler_exc
         return httpx.Response(200)
 
-    await make_fetcher(db, settings, handler).extract_article(aid, url, priority=True)
+    await on_demand(make_fetcher(db, settings, handler), aid, url)
     row = db.get_article(aid)
     assert row["text_status"] == "failed" and row["attempts"] == 0, row["text_error"]
     assert row["text_error"].startswith("Ungültige URL")
@@ -343,7 +353,7 @@ async def test_priority_request_does_not_wait_behind_background_queue(db, settin
     await asyncio.sleep(0.05)
     assert calls == [urls[0]] and ids[target] not in f._inflight
     # Ohne Fix hinge der Abruf an der wartenden Hintergrund-Aufgabe (bis zum Timeout).
-    await asyncio.wait_for(f.extract_article(ids[target], target, priority=True), timeout=2)
+    await asyncio.wait_for(on_demand(f, ids[target], target), timeout=2)
     assert db.get_article(ids[target])["attempts"] == 1
     gate.set()
     await bg
@@ -357,7 +367,7 @@ async def test_stale_background_task_respects_due_time(db, settings):
     aid = _article(db)
     calls = []
     f = make_fetcher(db, settings, lambda r: calls.append(1) or httpx.Response(503))
-    await f.extract_article(aid, f"{PUBLIC}/artikel", priority=True)
+    await on_demand(f, aid, f"{PUBLIC}/artikel")
     row = db.get_article(aid)
     assert row["attempts"] == 1 and row["next_attempt_at"] > ago(seconds=0)
     await f.extract_article(aid, f"{PUBLIC}/artikel")  # aus einer älteren Liste, nicht mehr fällig
@@ -375,7 +385,7 @@ async def test_background_skips_while_priority_runs(db, settings):
         return httpx.Response(503)
 
     f = make_fetcher(db, settings, handler)
-    prio = asyncio.create_task(f.extract_article(aid, f"{PUBLIC}/artikel", priority=True))
+    prio = asyncio.create_task(on_demand(f, aid, f"{PUBLIC}/artikel"))
     await asyncio.sleep(0.02)
     await f.extract_article(aid, f"{PUBLIC}/artikel")  # kehrt sofort zurück, kein zweiter Abruf
     gate.set()
@@ -459,7 +469,7 @@ async def test_unsupported_encoding_fails_permanently(db, settings):
     aid = _article(db)
     f = make_fetcher(db, settings, lambda r: httpx.Response(
         200, headers={"content-type": "text/html", "content-encoding": "br"}, stream=RawStream(b"\x0b\x02\x80")))
-    await f.extract_article(aid, f"{PUBLIC}/artikel", priority=True)
+    await on_demand(f, aid, f"{PUBLIC}/artikel")
     row = db.get_article(aid)
     assert row["text_status"] == "failed" and "Content-Encoding" in row["text_error"]
 
@@ -518,11 +528,18 @@ async def test_truncated_compressed_body_is_transient_error(db, settings, encodi
 
 # ---- Extraktion im Prozess-Pool mit hartem Zeitlimit ----------------------------
 
-def _sleepy_extract(page, url):
-    """Läuft im Worker-Prozess: hängt deutlich länger als das Test-Zeitlimit."""
-    import os
+def _pidfile(token: str):
+    import tempfile
     from pathlib import Path
-    Path(os.environ["KIOSK_TEST_PIDFILE"]).write_text(str(os.getpid()))
+    return Path(tempfile.gettempdir()) / f"kiosk-test-{token}.pid"
+
+
+def _sleepy_extract(page, url):
+    """Läuft im Worker-Prozess: hängt deutlich länger als das Test-Zeitlimit. Schreibt seine PID
+    in die Datei zum letzten URL-Segment (die Umgebung der Worker stammt vom Forkserver, der
+    schon vor diesem Test gestartet sein kann)."""
+    import os
+    _pidfile(url.rsplit("/", 1)[-1]).write_text(str(os.getpid()))
     time.sleep(60)
 
 
@@ -539,11 +556,12 @@ ARTICLE_HTML = ("<html><head><title>T</title></head><body><article><h1>Titel</h1
                 + "</article></body></html>")
 
 
-async def test_hung_extraction_times_out_and_pool_is_recreated(db, settings, monkeypatch, tmp_path):
-    pidfile = tmp_path / "pid"
-    monkeypatch.setenv("KIOSK_TEST_PIDFILE", str(pidfile))
+async def test_hung_extraction_times_out_and_pool_is_recreated(db, settings, monkeypatch):
+    import uuid
+    token = uuid.uuid4().hex
+    pidfile = _pidfile(token)
     monkeypatch.setattr(fetcher_mod, "EXTRACT_TIMEOUT", 1.5)
-    db.upsert_articles([make_row("alpha", 1, ago(hours=1), url=f"{PUBLIC}/a/1")])
+    db.upsert_articles([make_row("alpha", 1, ago(hours=1), url=f"{PUBLIC}/a/{token}")])
     first = db.one("SELECT id FROM articles")["id"]
     f = make_fetcher(db, settings, lambda r: httpx.Response(
         200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
@@ -557,6 +575,7 @@ async def test_hung_extraction_times_out_and_pool_is_recreated(db, settings, mon
         assert row["text_error"] == "Extraktion Zeitüberschreitung"
         assert f._pool is None  # verworfen, wird beim nächsten Auftrag neu angelegt
         pid = int(pidfile.read_text())
+        pidfile.unlink()
         for _ in range(50):
             if _gone_or_zombie(pid):
                 break
@@ -588,12 +607,19 @@ async def test_broken_pool_is_transient_and_replaced(db, settings, monkeypatch):
         def shutdown(self, **kw):
             pass
 
-    broken = Broken()
-    f._pool = broken
+    # Erster Absturz: Schuld unbekannt (z. B. ein feindlicher Feed im selben Pool), ohne Zählung
+    # sofort wieder fällig.
+    f._pool = Broken()
+    await f.extract_article(aid, f"{PUBLIC}/artikel")
+    row = db.get_article(aid)
+    assert row["text_status"] == "pending" and row["attempts"] == 0 and row["next_attempt_at"] is None
+    assert "Worker gestorben" in row["text_error"] and f._pool is None
+    # Zweiter Absturz mit demselben Artikel: zählt als Versuch.
+    f._pool = Broken()
     await f.extract_article(aid, f"{PUBLIC}/artikel")
     row = db.get_article(aid)
     assert row["text_status"] == "pending" and row["attempts"] == 1 and "abgebrochen" in row["text_error"]
-    assert f._pool is None
+    assert f._pool is None and aid not in f._crash_suspects
 
 
 def _timed_extract(page, url):
@@ -635,7 +661,7 @@ async def test_hung_job_only_counts_for_itself(db, settings, monkeypatch):
         await asyncio.gather(*(f._run_extract(b"<p>x</p>", f"{PUBLIC}/d/0") for _ in range(2)))  # Pool warm
         hung = asyncio.create_task(f.extract_article(ids["hung"], urls["hung"]))
         await asyncio.sleep(0.8)
-        nb = asyncio.create_task(f.extract_article(ids["nb"], urls["nb"], priority=True))
+        nb = asyncio.create_task(on_demand(f, ids["nb"], urls["nb"]))
         await asyncio.sleep(0.1)
         waiting = [asyncio.create_task(f.extract_article(ids[k], urls[k])) for k in ("w1", "w2")]
         await asyncio.wait_for(asyncio.gather(hung, nb, *waiting), timeout=30)
@@ -670,17 +696,21 @@ async def test_cancelled_pool_future_is_not_a_cancelled_request(db, settings):
             pass
 
     f._pool = Cancelling()
-    await f.extract_article(aid, f"{PUBLIC}/artikel", priority=True)
+    await on_demand(f, aid, f"{PUBLIC}/artikel")
+    row = db.get_article(aid)
+    assert row["text_status"] == "pending" and row["attempts"] == 0 and "abgebrochen" in row["text_error"]
+    assert f._pool is None
+    f._pool = Cancelling()      # zweites Mal: zählt
+    await on_demand(f, aid, f"{PUBLIC}/artikel")
     row = db.get_article(aid)
     assert row["text_status"] == "pending" and row["attempts"] == 1 and "abgebrochen" in row["text_error"]
-    assert f._pool is None
 
     # Gehört der Pool zu den wegen Zeitüberschreitung verworfenen: ohne Zählung neu eingeplant.
     db.q("UPDATE articles SET next_attempt_at=NULL WHERE id=?", (aid,))
     pool = Cancelling()
     f._pool = pool
     f._discarded.add(pool)
-    await f.extract_article(aid, f"{PUBLIC}/artikel", priority=True)
+    await on_demand(f, aid, f"{PUBLIC}/artikel")
     row = db.get_article(aid)
     assert row["attempts"] == 1 and row["next_attempt_at"] is None
 
@@ -694,7 +724,7 @@ async def test_extract_pending_pages_past_articles_that_stay_pending(db, setting
     f = make_fetcher(db, settings, lambda r: httpx.Response(503))
     calls: list[int] = []
 
-    async def stays_pending(article_id, url, *, priority=False):
+    async def stays_pending(article_id, url):
         calls.append(article_id)  # nichts gespeichert: bleibt pending und fällig
 
     monkeypatch.setattr(f, "extract_article", stays_pending)
@@ -709,7 +739,7 @@ async def test_unexpected_extraction_error_does_not_abort_run(db, settings, monk
     f = make_fetcher(db, settings, lambda r: httpx.Response(503))
     calls: list[int] = []
 
-    async def flaky(article_id, url, *, priority=False):
+    async def flaky(article_id, url):
         calls.append(article_id)
         if article_id == ids[1]:
             raise RuntimeError("unerwartet")
@@ -722,3 +752,261 @@ async def test_unexpected_extraction_error_does_not_abort_run(db, settings, monk
     await f.run_once()
     assert sorted(calls) == sorted(ids)
     assert f.state["runs"] == 1 and f.state["last_purged"] == 1 and f.state["running"] is False
+
+
+# ---- Retry-After, Validatoren, feindliche Feeds -------------------------------------------
+
+@pytest.mark.parametrize("raw", ["nan", "NaN", "inf", "-inf", "infinity"])
+def test_retry_after_rejects_non_finite(raw):
+    assert fetcher_mod.parse_retry_after(raw) is None
+
+
+async def test_429_with_nan_retry_after_counts_attempt(db, settings):
+    aid = _article(db)
+    f = make_fetcher(db, settings, lambda r: httpx.Response(429, headers={"retry-after": "nan"}))
+    await f.extract_article(aid, f"{PUBLIC}/artikel")
+    row = db.get_article(aid)
+    assert row["text_status"] == "pending" and row["attempts"] == 1 and row["next_attempt_at"] > ago(seconds=0)
+
+
+async def test_unexpected_error_in_bookkeeping_still_counts_attempt(db, settings, monkeypatch):
+    aid = _article(db)
+    f = make_fetcher(db, settings, lambda r: httpx.Response(404))
+
+    def broken(*a, **kw):
+        raise RuntimeError("kaputt")
+
+    monkeypatch.setattr(db, "store_extraction", broken)
+    await f.extract_article(aid, f"{PUBLIC}/artikel")
+    row = db.get_article(aid)
+    assert row["attempts"] == 1 and row["next_attempt_at"] > ago(seconds=0)
+    assert row["text_error"].startswith("Interner Fehler: RuntimeError")
+    assert not db.is_due_pending(aid)   # nicht in jedem Lauf erneut
+
+
+def test_http_token():
+    assert fetcher_mod.http_token('W/"abc-123"') == 'W/"abc-123"'
+    for bad in ('"häßlich"', "a\nb", "x" * 501, "", None, "’tag’"):
+        assert fetcher_mod.http_token(bad) is None
+
+
+async def test_non_ascii_validators_are_not_stored_or_sent(db, settings):
+    seen = []
+
+    def handler(request):
+        seen.append(dict(request.headers))
+        return httpx.Response(200, headers=[(b"etag", '"ä-1"'.encode()), (b"last-modified", "Mon, 01 Sep 2026 10:00:00 GMT".encode())],
+                              content=rss(item(1, date=None)))
+
+    f = make_fetcher(db, settings, handler)
+    try:
+        await f._fetch_feed(SRC)
+        st = db.source_states()["alpha"]
+        assert st["etag"] is None and st["last_modified"] == "Mon, 01 Sep 2026 10:00:00 GMT"
+        # Ein älterer, schon gespeicherter kaputter Wert wird nicht gesendet (httpx würde scheitern).
+        db.q("UPDATE source_state SET etag=?, last_modified=? WHERE id='alpha'", ('"ö"', "Mo, 1 Sep 2026 ä"))
+        assert await f._fetch_feed(SRC) == 0
+        assert "if-none-match" not in seen[-1] and "if-modified-since" not in seen[-1]
+        assert db.source_states()["alpha"]["last_error"] is None
+    finally:
+        await f.close()
+
+
+async def test_failed_feed_fetch_clears_validators(db, settings):
+    db.record_fetch("alpha", ok=True, validators=('"v1"', "Mon, 01 Sep 2026 10:00:00 GMT"))
+    f = make_fetcher(db, settings, lambda r: httpx.Response(500))
+    await f._fetch_all_feeds()
+    st = db.source_states()["alpha"]
+    assert st["last_error"] == "HTTP 500" and st["etag"] is None and st["last_modified"] is None
+
+
+def test_parse_feed_caps_entries(monkeypatch):
+    monkeypatch.setattr(fetcher_mod, "FEED_MAX_ENTRIES", 5)
+    rows = parse_feed(SRC, rss(*(item(i) for i in range(40))))
+    assert [r["guid"] for r in rows] == [f"g{i}" for i in range(5)]
+
+
+async def test_fetch_feed_caps_new_articles_per_run(db, settings, monkeypatch):
+    monkeypatch.setattr(fetcher_mod, "FEED_MAX_NEW", 3)
+    recent = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    f = make_fetcher(db, settings, lambda r: httpx.Response(200, content=rss(*(item(i, date=recent) for i in range(8)))))
+    try:
+        assert await f._fetch_feed(SRC) == 3
+        assert await f._fetch_feed(SRC) == 3
+        assert await f._fetch_feed(SRC) == 2
+    finally:
+        await f.close()
+
+
+def test_feed_limits():
+    assert fetcher_mod.FEED_MAX_BYTES <= 5 * 1024 * 1024 and fetcher_mod.ARTICLE_MAX_BYTES <= 5 * 1024 * 1024
+    assert fetcher_mod.FEED_MAX_ENTRIES <= 300
+
+
+def _hanging_parse(source, raw):
+    """Läuft im Worker-Prozess: feedparser, der nicht fertig wird."""
+    time.sleep(60)
+
+
+async def test_feed_parsing_runs_in_worker_with_timeout(db, settings, monkeypatch):
+    monkeypatch.setattr(fetcher_mod, "parse_feed", _hanging_parse)
+    monkeypatch.setattr(fetcher_mod, "FEED_PARSE_TIMEOUT", 1)
+    f = make_fetcher(db, settings, lambda r: httpx.Response(200, content=rss(item(1))))
+    try:
+        assert await asyncio.wait_for(f._fetch_all_feeds(), timeout=20) == 0
+        assert db.source_states()["alpha"]["last_error"] == "ExtractTimeout: Feed-Parsing Zeitüberschreitung"
+        assert f._pool is None   # hängender Worker samt Pool verworfen
+    finally:
+        await f.close()
+
+
+# ---- Abruf auf Anforderung: gedeckelt ------------------------------------------------------
+
+async def test_on_demand_extractions_are_bounded(db, settings, monkeypatch):
+    monkeypatch.setattr(fetcher_mod, "PRIORITY_QUEUE_MAX", 3)
+    db.upsert_articles([make_row("alpha", i, ago(hours=i + 1), url=f"{PUBLIC}/a/{i}") for i in range(5)])
+    ids = [r["id"] for r in db.q("SELECT id FROM articles ORDER BY id")]
+    gate = asyncio.Event()
+
+    async def handler(request):
+        await gate.wait()
+        return httpx.Response(503)
+
+    f = make_fetcher(db, settings, handler)
+    assert [f.start_extraction(aid, f"{PUBLIC}/a/{i}") for i, aid in enumerate(ids)] == [True] * 3 + [False] * 2
+    assert f.start_extraction(ids[0], f"{PUBLIC}/a/0") is True   # läuft schon: kein zweiter Start
+    gate.set()
+    await asyncio.gather(*list(f._inflight.values()))
+    assert f._ondemand_count == 0 and f._inflight == {}
+    assert f.start_extraction(ids[3], f"{PUBLIC}/a/3") is True
+    await asyncio.gather(*list(f._inflight.values()))
+
+
+async def test_retry_waits_after_recent_on_demand_attempt(db, settings, monkeypatch):
+    aid = _article(db)
+    calls = []
+    f = make_fetcher(db, settings, lambda r: calls.append(1) or httpx.Response(404))
+    await on_demand(f, aid, f"{PUBLIC}/artikel")
+    assert db.get_article(aid)["text_status"] == "failed"
+    assert f.start_extraction(aid, f"{PUBLIC}/artikel", retry=True) is False
+    assert calls == [1]
+    monkeypatch.setattr(fetcher_mod, "RETRY_MIN_INTERVAL", 0)
+    assert f.start_extraction(aid, f"{PUBLIC}/artikel", retry=True) is True
+    await asyncio.gather(*list(f._inflight.values()))
+    assert calls == [1, 1]
+
+
+async def test_title_echo_is_removed_off_the_event_loop(db, settings, monkeypatch):
+    aid = _article(db)
+    threads = []
+    real = fetcher_mod.drop_title_echo
+
+    def spy(result, title):
+        threads.append(threading.current_thread() is threading.main_thread())
+        return real(result, title)
+
+    async def fake_extract(page, url):
+        return extract_mod.Extraction("full", "<p>Titel 1</p><p>Text</p>", "Titel 1 Text", 12, False, None, None)
+
+    monkeypatch.setattr(fetcher_mod, "drop_title_echo", spy)
+    f = make_fetcher(db, settings, lambda r: httpx.Response(200, headers={"content-type": "text/html"}, content=b"<p>x</p>"))
+    monkeypatch.setattr(f, "_run_extract", fake_extract)
+    await f._extract(aid, f"{PUBLIC}/artikel")
+    assert threads == [False]
+    assert db.get_article(aid)["body_html"] == "<p>Text</p>"
+
+
+def test_parse_feed_keeps_newest_entries_of_oldest_first_feed(monkeypatch):
+    monkeypatch.setattr(fetcher_mod, "FEED_MAX_ENTRIES", 3)
+    base = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    dated = [item(i, date=(base + timedelta(hours=i)).strftime("%a, %d %b %Y %H:%M:%S GMT")) for i in range(6)]
+    rows = parse_feed(SRC, rss(item(90, date=None), *dated))      # älteste zuerst, einer ohne Datum
+    assert [r["guid"] for r in rows] == ["g5", "g4", "g3"]
+    monkeypatch.setattr(fetcher_mod, "FEED_MAX_ENTRIES", 10)
+    rows = parse_feed(SRC, rss(item(90, date=None), item(91, date=None), *dated))
+    assert [r["guid"] for r in rows][-2:] == ["g90", "g91"]         # ohne Datum: hinten, Reihenfolge bleibt
+
+
+async def test_capped_fetch_does_not_store_validators(db, settings, monkeypatch):
+    monkeypatch.setattr(fetcher_mod, "FEED_MAX_NEW", 3)
+    recent = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers.get("if-none-match"))
+        if request.headers.get("if-none-match") == '"v1"':
+            return httpx.Response(304)
+        return httpx.Response(200, headers={"etag": '"v1"'}, content=rss(*(item(i, date=recent) for i in range(5))))
+
+    f = make_fetcher(db, settings, handler)
+    try:
+        assert await f._fetch_feed(SRC) == 3
+        assert db.source_states()["alpha"]["etag"] is None       # Grenze erreicht: ohne Bedingung weiter
+        assert await f._fetch_feed(SRC) == 2
+        assert db.source_states()["alpha"]["etag"] == '"v1"'
+        assert await f._fetch_feed(SRC) == 0
+        assert seen == [None, None, '"v1"']
+    finally:
+        await f.close()
+
+
+async def test_background_reads_have_no_time_limit_and_timeouts_do_not_count(db, settings, monkeypatch):
+    from app.db import QueryTimeout, request_time_limit
+    aid = _article(db)
+    f = make_fetcher(db, settings, lambda r: httpx.Response(404))
+    limits = []
+    real_store = db.store_extraction
+
+    def spy(*a, **kw):
+        limits.append(request_time_limit.get())
+        return real_store(*a, **kw)
+
+    monkeypatch.setattr(db, "store_extraction", spy)
+    token = request_time_limit.set(2.0)   # wie in einer API-Anfrage
+    try:
+        assert f.start_extraction(aid, f"{PUBLIC}/artikel")
+        task = f._inflight[aid]
+    finally:
+        request_time_limit.reset(token)
+    await task
+    # Die aus der Anfrage gestartete Extraktion liest ohne Frist.
+    assert limits == [None] and db.get_article(aid)["text_status"] == "failed"
+
+    # Käme doch ein QueryTimeout, zählt er nicht als Versuch.
+    db.upsert_articles([make_row("alpha", 2, ago(hours=1), url=f"{PUBLIC}/b")])
+    aid2 = db.one("SELECT id FROM articles WHERE guid='alpha-2'")["id"]
+
+    async def timeout(*a, **kw):
+        raise QueryTimeout("x")
+
+    monkeypatch.setattr(f, "_extract_once", timeout)
+    await f._extract(aid2, f"{PUBLIC}/b")
+    row = db.get_article(aid2)
+    assert row["attempts"] == 0 and row["text_status"] == "pending" and row["text_error"] is None
+
+
+async def test_purge_runs_even_if_a_phase_fails(db, settings, monkeypatch):
+    db.upsert_articles([make_row("alpha", 99, ago(days=200))])
+    f = make_fetcher(db, settings, lambda r: httpx.Response(503))
+
+    async def broken():
+        raise RuntimeError("kaputt")
+
+    monkeypatch.setattr(f, "_fetch_all_feeds", broken)
+    with pytest.raises(RuntimeError):
+        await f.run_once()
+    assert db.one("SELECT COUNT(*) AS n FROM articles")["n"] == 0
+
+
+def test_forkserver_preloads_job_modules(db, settings, monkeypatch):
+    import multiprocessing
+    calls = []
+    ctx = multiprocessing.get_context("forkserver")
+    monkeypatch.setattr(type(ctx), "set_forkserver_preload", lambda self, mods: calls.append(mods))
+    f = make_fetcher(db, settings, lambda r: httpx.Response(200))
+    pool = f._extraction_pool()
+    try:
+        assert calls == [["app.fetcher"]]
+        assert fetcher_mod.parse_feed.__module__ == "app.fetcher" and fetcher_mod.extract.__module__ == "app.extract"
+    finally:
+        pool.shutdown()

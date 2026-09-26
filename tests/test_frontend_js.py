@@ -110,3 +110,70 @@ console.log(JSON.stringify({ keys: input.urls.map((u) => fmt.imageKey(u, true)),
     assert [(k["full"], k["base"]) for k in got["loose"]] == [image_key(u, strict=False) for u in urls]
     assert got["small"] == [is_small_image_url(u) for u in urls]
     assert got["same"] == [[client, client] for *_, client in IMAGE_PAIRS]
+
+
+def test_image_seen_matches_naive_same_image_and_is_fast():
+    """imageSeen (Duplikat-Bilder im Artikeltext) entscheidet wie der frühere Vergleich jedes Bildes mit
+    allen gezeigten per sameImage, braucht bei Tausenden Bildern aber nur lineare Zeit."""
+    from tests.test_extract import IMAGE_PAIRS
+
+    urls = [u for a, b, *_ in IMAGE_PAIRS for u in (a, b)] + [
+        "https://nyt.example/2026/09/26/world/foto-grossesbild-superJumbo.jpg",
+        "https://nyt.example/2026/09/26/world/foto-grossesbild-articleLarge.jpg",
+        "https://taz.example/picture/8763231/948/screenshot.jpg",
+        "https://taz.example/picture/8763231/624/screenshot.jpg",
+        "https://a.example/2025/10/screenshot.png", "https://a.example/2026/09/screenshot.png", None]
+    script = """
+const fmt = await import(process.argv[1] + '/format.js');
+const urls = JSON.parse(process.argv[2]);
+const naive = (list) => { const seen = []; return list.map((u) => {
+  if (seen.some((s) => fmt.sameImage(s, u))) return true; seen.push(u); return false; }); };
+const fast = (list) => { const seen = fmt.imageSeen(); return list.map((u) => seen(u)); };
+let r = 7;   // feste Pseudo-Zufallsfolge: mehrere Reihenfolgen derselben URLs
+const rnd = () => { r = (r * 1103515245 + 12345) % 2147483648; return r / 2147483648; };
+const orders = [urls, [...urls].reverse()];
+for (let k = 0; k < 20; k++) orders.push([...urls].sort(() => rnd() - 0.5));
+const same = orders.map((o) => JSON.stringify(naive(o)) === JSON.stringify(fast(o)));
+// Feindlicher Text: 2000 Bilder, gleiche Website, gleicher Dateiname, verschiedene Ordner (alle
+// im selben Vergleichs-Eimer, keines gleich), dazu 1000 genaue Wiederholungen.
+const big = [];
+for (let i = 0; i < 2000; i++) big.push(`https://a.example/ordner${i}/gleichesbild.jpg`);
+for (let i = 0; i < 1000; i++) big.push(`https://a.example/ordner${i}/gleichesbild.jpg?w=${i}`);
+const small = big.slice(0, 300).concat(big.slice(2000, 2300));
+const t0 = performance.now();
+const res = fast(big);
+const ms = performance.now() - t0;
+console.log(JSON.stringify({ same, ms, dups: res.filter(Boolean).length,
+  smallSame: JSON.stringify(naive(small)) === JSON.stringify(fast(small)) }));
+"""
+    res = subprocess.run([NODE, "--input-type=module", "-e", script, str(JS.as_uri()), json.dumps(urls)],
+                         capture_output=True, text=True, timeout=60, env={"PATH": ""})
+    assert res.returncode == 0, res.stderr
+    got = json.loads(res.stdout)
+    assert all(got["same"]), got["same"]
+    assert got["smallSame"]
+    assert got["dups"] == 1000
+    assert got["ms"] < 1000, got["ms"]   # früher O(n²): mehrere Sekunden
+
+
+def test_articles_loader_skips_on_response_when_stale():
+    """Eine verspätete Antwort einer ersetzten Liste darf den Wasserstand (onResponse) nicht überschreiben."""
+    script = """
+globalThis.window = { matchMedia: () => ({ matches: false, addEventListener() {} }) };
+globalThis.location = { origin: 'http://kiosk.test' };
+globalThis.fetch = async () => new Response(JSON.stringify({ items: [{ id: 1 }], max_id: 7, next_before: 5 }),
+  { headers: { 'content-type': 'application/json' } });
+const { articlesLoader } = await import(process.argv[1] + '/ui/feed.js');
+const got = [];
+const load = articlesLoader({}, { onResponse: (res, cursor) => got.push([res.max_id, cursor]) });
+const stale = await load(null, () => true);
+await load(null, () => false);
+await load(3);
+console.log(JSON.stringify({ got, stale }));
+"""
+    res = subprocess.run([NODE, "--input-type=module", "-e", script, str(JS.as_uri())],
+                         capture_output=True, text=True, timeout=30, env={"PATH": ""})
+    assert res.returncode == 0, res.stderr
+    got = json.loads(res.stdout)
+    assert got["got"] == [[7, None], [7, 3]]
+    assert got["stale"] == {"items": [{"id": 1}], "next": 5}

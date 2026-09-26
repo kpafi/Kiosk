@@ -5,6 +5,10 @@ services:
     # dem Login-Test; ohne Variable (Neustart von Hand, Zurückrollen) gilt kiosk:latest.
     image: ${KIOSK_IMAGE:-kiosk:latest}
     container_name: kiosk
+    # Eigene uid/gid (wie USER im Dockerfile). Auch hier gesetzt, damit ein älteres Image (kiosk:good,
+    # kiosk:previous; dort noch uid 1000) nach dem Zurückrollen als 10100 läuft und das
+    # Datenverzeichnis (gehört 10100, deploy.sh) weiter schreiben kann.
+    user: "10100:10100"
     restart: unless-stopped
     # Kleiner init-Prozess als PID 1: sammelt verwaiste Prozesse ein (z. B. vom Pool getötete
     # Extraktions-Worker) und leitet Signale an uvicorn weiter.

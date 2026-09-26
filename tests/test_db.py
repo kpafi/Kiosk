@@ -413,7 +413,7 @@ def test_migration_v1_to_v6_in_one_pass(tmp_path):
 
     db = Database(path, admin=("chef", "geheim-und-lang"))
     try:
-        assert db.admin_created and db.get_meta("schema_version") == "6" == str(SCHEMA_VERSION)
+        assert db.admin_created and db.get_meta("schema_version") == "7" == str(SCHEMA_VERSION)
         admin = db.get_user_by_name("chef")
         assert admin["is_admin"] == 1 and admin["display_name"] == "Chef"
         assert V4_TABLES <= _tables(db) and {"users", "user_articles"} <= _tables(db)
@@ -430,6 +430,7 @@ def test_migration_v1_to_v6_in_one_pass(tmp_path):
     try:
         assert not db.admin_created and db.user_count() == 1
         assert len(db.list_profiles(admin["id"])) == 4
+        assert all(p["in_chips"] for p in db.list_profiles(admin["id"]))
         assert db.one("SELECT COUNT(*) AS n FROM user_articles")["n"] == 3
     finally:
         db.close()
@@ -452,6 +453,45 @@ def test_migration_v1_without_state_needs_no_admin(tmp_path):
         db.close()
 
 
+@pytest.mark.skipif(sqlite3.sqlite_version_info < (3, 35), reason="ALTER TABLE DROP COLUMN erst ab SQLite 3.35")
+def test_migration_v6_to_v7_adds_in_chips(tmp_path):
+    """v6 -> v7: profiles bekommt in_chips; bestehende Profile bleiben oben sichtbar (1), in_bar,
+    Reihenfolge und alles andere unverändert."""
+    path = tmp_path / "v6.db"
+    db = Database(path)
+    uid = db.create_user("anna", "x")
+    db.seed_profiles(uid, ["alpha"], None)
+    db.create_profile(uid, name="Eigenes", sources=None, terms=["Zins"], in_bar=True)
+    before = [{k: v for k, v in p.items() if k != "in_chips"} for p in db.list_profiles(uid)]
+    db.close()
+    # Stand v6 nachbauen: Spalte weg, Version zurück.
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE profiles DROP COLUMN in_chips")
+    conn.execute("UPDATE meta SET value='6' WHERE key='schema_version'")
+    conn.commit()
+    conn.close()
+
+    for _ in range(2):  # zweites Öffnen: nichts mehr zu tun
+        db = Database(path)
+        try:
+            assert db.get_meta("schema_version") == str(SCHEMA_VERSION)
+            profiles = db.list_profiles(uid)
+            assert [{k: v for k, v in p.items() if k != "in_chips"} for p in profiles] == before
+            assert all(p["in_chips"] is True for p in profiles)
+            db.update_profile(uid, profiles[0]["id"], {"in_chips": False})
+            assert db.get_profile(uid, profiles[0]["id"])["in_chips"] is False
+            db.update_profile(uid, profiles[0]["id"], {"in_chips": True})
+        finally:
+            db.close()
+
+
+def test_create_profile_in_chips(db):
+    pid = db.create_profile(UID, name="Unten", sources=None, terms=[], in_bar=True, in_chips=False)
+    assert db.get_profile(UID, pid)["in_chips"] is False
+    pid = db.create_profile(UID, name="Standard", sources=None, terms=[], in_bar=False)
+    assert db.get_profile(UID, pid)["in_chips"] is True
+
+
 def test_seed_profiles(db):
     assert db.seed_profiles(UID, ["alpha"], ["beta"]) is True
     assert db.seed_profiles(UID, ["x"], None) is False  # nur wenn leer
@@ -459,6 +499,7 @@ def test_seed_profiles(db):
     assert [(p["name"], p["builtin"], p["sources"], p["in_bar"], p["position"]) for p in profiles] == [
         ("Deutschland", "de", ["alpha"], True, 0), ("Weltweit", "world", None, False, 1),
         ("Wirtschaft", "business", ["beta"], True, 2), ("Militär", "military", None, False, 3)]
+    assert all(p["in_chips"] is True for p in profiles)  # alle oben bei den Filtern
     assert profiles[2]["terms"][:2] == ["Wirtschaft", "Konjunktur"] and "Börse" in profiles[2]["terms"]
     assert "Bundeswehr" in profiles[3]["terms"] and profiles[0]["terms"] == []
 

@@ -63,7 +63,9 @@ def test_builtin_profiles_are_seeded(authed):
     # Keine Wirtschaftsquelle im Testkatalog: alle Quellen, gefiltert über die Begriffe
     assert business["sources"] is None and "Inflation" in business["terms"] and business["in_bar"] is True
     assert military["in_bar"] is False and "NATO" in military["terms"]
-    assert set(de) >= {"id", "name", "builtin", "sources", "terms", "in_bar", "position", "source_count", "unread"}
+    assert set(de) >= {"id", "name", "builtin", "sources", "terms", "in_bar", "in_chips", "position",
+                       "source_count", "unread"}
+    assert all(p["in_chips"] is True for p in profiles)  # vorgegebene Profile oben bei den Filtern
 
 
 def test_seeding_happens_only_once(app_env):
@@ -217,13 +219,14 @@ def test_profile_crud_and_validation(authed):
     p = r.json()
     assert (p["name"], p["sources"], p["terms"], p["in_bar"], p["builtin"], p["position"]) == \
         ("Klima", ["alpha", "beta"], ["Klima", "Hitze"], True, None, 4)
-    assert p["source_count"] == 2 and p["unread"] == 0
+    assert p["source_count"] == 2 and p["unread"] == 0 and p["in_chips"] is True  # Standard: oben
     bad = [
         {"name": ""}, {"name": "x" * 41}, {"name": "x", "sources": ["gibtsnicht"]},
         {"name": "x", "sources": [f"s{i}" for i in range(201)]},
         {"name": "x", "terms": ['a"b']}, {"name": "x", "terms": ["t"] * 21}, {"name": "x", "terms": ["x" * 41]},
         {"name": "x", "terms": [""]}, {"name": "x", "in_bar": "ja"}, {"name": "x", "extra": 1},
-        {"name": "x", "sources": []},
+        {"name": "x", "sources": []}, {"name": "x", "in_chips": "ja"}, {"name": "x", "in_chips": 1},
+        {"name": "x", "in_chips": None},
     ]
     for body in bad:
         assert authed.post("/api/profiles", json=body).status_code == 422, body
@@ -233,6 +236,8 @@ def test_profile_crud_and_validation(authed):
     assert r.json()["in_bar"] is False and r.json()["terms"] == ["Klima", "Hitze"]
     assert authed.patch(f"/api/profiles/{p['id']}", json={"name": None}).status_code == 422
     assert authed.patch(f"/api/profiles/{p['id']}", json={"terms": None}).status_code == 422
+    for bad in (None, "nein", 0):
+        assert authed.patch(f"/api/profiles/{p['id']}", json={"in_chips": bad}).status_code == 422, bad
     assert authed.patch(f"/api/profiles/{p['id']}", json={"sources": []}).status_code == 422
     assert authed.patch("/api/profiles/999", json={"name": "x"}).status_code == 404
     # Vorgegebene Profile: änderbar, nicht löschbar
@@ -242,6 +247,28 @@ def test_profile_crud_and_validation(authed):
     assert authed.delete(f"/api/profiles/{p['id']}").status_code == 204
     assert authed.delete(f"/api/profiles/{p['id']}").status_code == 404
     assert len(authed.get("/api/profiles").json()) == 4
+
+
+def test_profile_in_chips_is_independent_of_in_bar(authed):
+    """Oben bei den Filtern (in_chips) und unten in der Leiste (in_bar) sind getrennte Schalter."""
+    r = authed.post("/api/profiles", json={"name": "Nur unten", "in_bar": True, "in_chips": False})
+    assert r.status_code == 201 and (r.json()["in_bar"], r.json()["in_chips"]) == (True, False)
+    pid = r.json()["id"]
+    # PATCH nur eines Schalters lässt den anderen stehen
+    r = authed.patch(f"/api/profiles/{pid}", json={"in_chips": True})
+    assert r.status_code == 200 and (r.json()["in_bar"], r.json()["in_chips"]) == (True, True)
+    r = authed.patch(f"/api/profiles/{pid}", json={"in_bar": False})
+    assert (r.json()["in_bar"], r.json()["in_chips"]) == (False, True)
+    r = authed.patch(f"/api/profiles/{pid}", json={"in_chips": False, "name": "Versteckt"})
+    assert (r.json()["name"], r.json()["in_bar"], r.json()["in_chips"]) == ("Versteckt", False, False)
+    # Liste und Umsortieren liefern den Wert mit
+    listed = {p["id"]: p for p in authed.get("/api/profiles").json()}
+    assert listed[pid]["in_chips"] is False
+    reordered = authed.post("/api/profiles/reorder", json={"ids": [pid]}).json()
+    assert reordered[0]["id"] == pid and reordered[0]["in_chips"] is False
+    # Die Leiste richtet sich nur nach in_bar
+    authed.patch(f"/api/profiles/{pid}", json={"in_bar": True})
+    assert f"profile:{pid}" in [it["key"] for it in authed.get("/api/bar").json()["items"]]
 
 
 def test_reorder_profiles(authed):

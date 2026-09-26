@@ -36,7 +36,8 @@ Zurückrollen auf den letzten geprüften Stand:
   cd $DEST && docker compose down
   docker tag $target kiosk:latest
   chown -R 10100:10100 $DEST/data
-  Datenbank zurück (Schema evtl. schon migriert): Pre-Deploy-Backup
+  Datenbank zurück nur bei einem Ziel-Image mit Schema < 6 (Schema 7 -> 6 braucht das nicht, 7 fügt
+  nur eine Spalte hinzu; Zurückspielen verwirft Konten und Lesestand seit dem Deploy): Pre-Deploy-Backup
     ${predeploy:-<keins angelegt>}
   bei gestopptem Container; geschrieben wird nur als 10100, root folgt so keinem Symlink aus dem Container:
   cd / && gunzip -c <Backup> | setpriv --reuid=10100 --regid=10100 --clear-groups \

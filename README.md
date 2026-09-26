@@ -84,7 +84,7 @@ Anfangsbuchstaben („Admin“). Der letzte aktive Admin lässt sich nicht lösc
 | POST | `/api/articles/{id}/later` `{value}` | Später lesen |
 | POST | `/api/articles/read-all` `{sources?, source?, profile?, max_id?}` | Alles als gelesen markieren (Angaben schränken ein, Schnittmenge; `max_id`: nur Artikel mit ID ≤ max_id, die Oberfläche schickt die höchste angezeigte ID); `{marked}` zählt nur Artikel ohne Paywall |
 | GET | `/api/profiles` | Profile nach `position`, mit `source_count` und `unread` (siehe Profile) |
-| POST | `/api/profiles` `{name, sources, terms, in_bar}` | Profil anlegen (201); `sources: null` = alle aktiven, `[]` ist ungültig (422) |
+| POST | `/api/profiles` `{name, sources, terms, in_bar, in_chips}` | Profil anlegen (201); `sources: null` = alle aktiven, `[]` ist ungültig (422) |
 | PATCH | `/api/profiles/{id}` (Teilfelder) | Profil ändern |
 | DELETE | `/api/profiles/{id}` | Profil löschen (204); vorgegebene Profile: 409 |
 | POST | `/api/profiles/reorder` `{ids}` | Reihenfolge setzen; liefert die Liste |
@@ -152,7 +152,11 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
   Weltweit (alle), Wirtschaft (`category: business`, ist keine davon aktiv: alle, mit Begriffen),
   Militär (alle, mit Begriffen). Sie sind änderbar, aber nicht löschbar.
 - Profil-Validierung: `name` 1 bis 40 Zeichen; `sources` `null` oder bekannte Quellen-IDs (höchstens 200);
-  `terms` 0 bis 20 Begriffe à 1 bis 40 Zeichen ohne `"`; `in_bar` boolesch. Fehler: 422.
+  `terms` 0 bis 20 Begriffe à 1 bis 40 Zeichen ohne `"`; `in_bar` und `in_chips` boolesch. Fehler: 422.
+- Wo ein Profil erscheint, stellen zwei Schalter getrennt ein: `in_chips` (Standard `true`) zeigt es oben
+  als Filterchip der Liste, `in_bar` (Standard `false`) unten in der Leiste. Das gerade gewählte Profil
+  steht in der Chipzeile auch ohne `in_chips`, damit man es sieht und abwählen kann. Alle Antworten mit
+  Profilen (`GET`/`POST /api/profiles`, `PATCH`, `reorder`) enthalten beide Felder.
 - Alle Ungelesen-Zähler (`unread` in Leiste, Profilen, Lieblingszeitungen, `/api/counts` und
   `/api/sources`) zählen nur Artikel des laufenden Tages ab 00:00 Ortszeit (`KIOSK_TZ`), um Mitternacht
   beginnen sie neu. Die Ungelesen-Liste, „Nächster ungelesener“ und „alles gelesen“ nehmen weiter alle
@@ -321,7 +325,8 @@ Statische Dateien (auch `sw.js`, Schriften, Icons) werden mit `Cache-Control: no
 
 Die App muss mit genau einem uvicorn-Worker laufen (Login-Bremse im Speicher, eine Sammler-Schleife,
 eine SQLite-Verbindung). Das Datenbankschema wird beim Start automatisch migriert (`meta.schema_version`,
-aktuell 6: Tabellen `users` und `user_articles`, Profile/Favoriten/Einstellungen mit `user_id`). Die alten
+aktuell 7: Tabellen `users` und `user_articles`, Profile/Favoriten/Einstellungen mit `user_id`; seit 7
+`profiles.in_chips`, bestehende Profile bekommen 1). Die alten
 Spalten `articles.read/starred/later` bleiben physisch stehen, werden aber nicht mehr benutzt.
 Den Test der Migration auf einer Kopie der Produktionsdatenbank aktiviert
 `KIOSK_PRODCOPY_DB=/pfad/zur/kopie.db .venv/bin/python -m pytest tests/test_users.py`.

@@ -201,6 +201,22 @@ export function profileById(id) {
   return (state.profiles || []).find((p) => String(p.id) === String(id)) || null;
 }
 
+/**
+ * Profil-Chips der Liste in Anzeigereihenfolge: das aktive Profil (ctx) vorn, danach die übrigen mit
+ * in_chips in ihrer gespeicherten Reihenfolge. Das aktive steht auch ohne in_chips da (z. B. aus der
+ * Leiste oder per Link geöffnet), damit man sieht, was filtert, und es abwählen kann.
+ */
+export function chipProfiles(profiles, ctx) {
+  const list = profiles || [];
+  const active = (p) => isActiveProfile(p, ctx);
+  return [...list.filter(active), ...list.filter((p) => !active(p) && p.in_chips !== false)];
+}
+
+/** Ist `p` das Profil des Listen-Kontexts `ctx`? (IDs als Zahl oder Text) */
+export function isActiveProfile(p, ctx) {
+  return !!ctx && ctx.type === 'profile' && String(p.id) === String(ctx.id);
+}
+
 /** Anzeigename einer Quelle: Kurzname (short) oder Name. */
 export function sourceLabel(id, fallback) {
   const s = state.sourceMap.get(id);

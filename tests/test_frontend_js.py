@@ -177,3 +177,33 @@ console.log(JSON.stringify({ got, stale }));
     got = json.loads(res.stdout)
     assert got["got"] == [[7, None], [7, 3]]
     assert got["stale"] == {"items": [{"id": 1}], "next": 5}
+
+
+def test_chip_profiles_hides_off_profiles_but_keeps_active():
+    """Filterchips der Liste: nur Profile mit in_chips (fehlt = an), das aktive immer und vorn."""
+    script = """
+globalThis.window = { matchMedia: () => ({ matches: false, addEventListener() {} }) };
+const { chipProfiles } = await import(process.argv[1] + '/store.js');
+const profiles = [{ id: 1, in_chips: true }, { id: 2, in_chips: false }, { id: 3 }, { id: 4, in_chips: false }];
+const ids = (ctx, list = profiles) => chipProfiles(list, ctx).map((p) => p.id);
+console.log(JSON.stringify({
+  all: ids({ type: 'all' }),
+  activeOn: ids({ type: 'profile', id: 3 }),
+  activeOff: ids({ type: 'profile', id: '4' }),
+  unknown: ids({ type: 'profile', id: 99 }),
+  source: ids({ type: 'source', id: 2 }),
+  none: ids({ type: 'all' }, null),
+  noCtx: ids(null),
+}));
+"""
+    res = subprocess.run([NODE, "--input-type=module", "-e", script, str(JS.as_uri())],
+                         capture_output=True, text=True, timeout=30, env={"PATH": ""})
+    assert res.returncode == 0, res.stderr
+    got = json.loads(res.stdout)
+    assert got["all"] == [1, 3]
+    assert got["activeOn"] == [3, 1]
+    assert got["activeOff"] == [4, 1, 3]    # aus der Leiste oder per Link geöffnet: sichtbar, abwählbar
+    assert got["unknown"] == [1, 3]
+    assert got["source"] == [1, 3]          # Zeitungs-Kontext: kein Profil aktiv
+    assert got["none"] == []
+    assert got["noCtx"] == [1, 3]

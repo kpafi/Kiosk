@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 
 import app.users as users_cli
 from app.auth import LOGIN_ERROR, hash_password, verify_password
-from app.db import FTS_DDL, Database, MigrationError
+from app.db import FTS_DDL, SCHEMA_VERSION, Database, MigrationError
 from app.main import app, state
 from app.users import seed_builtin_profiles
 from conftest import ADMIN_PASSWORD, UID, ago, make_row
@@ -157,9 +157,11 @@ def _check_migration(path: Path) -> dict:
         admin = db.get_user_by_name("admin")
         assert db.admin_created and admin["is_admin"] == 1 and db.user_count() == 1
         assert verify_password(ADMIN_PASSWORD, admin["password_hash"])
-        assert db.get_meta("schema_version") == "6"
+        assert db.get_meta("schema_version") == str(SCHEMA_VERSION)
         after = _v6_counts(db, admin["id"])
         assert after == before
+        # v7: übernommene Profile stehen weiter oben bei den Filtern
+        assert all(p["in_chips"] for p in db.list_profiles(admin["id"]))
         tables = {r["name"] for r in db.q("SELECT name FROM sqlite_master WHERE type='table'")}
         assert not {t for t in tables if t.endswith("_v5")}
         db.q("INSERT INTO articles_fts(articles_fts, rank) VALUES('integrity-check', 1)")

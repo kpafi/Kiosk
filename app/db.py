@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from .config import DEFAULT_TZ
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS source_state (
@@ -122,7 +122,8 @@ CREATE TABLE IF NOT EXISTS profiles (
     builtin      TEXT,                          -- 'de' | 'world' | 'business' | 'military' | NULL (eigenes)
     sources_json TEXT,                          -- JSON-Liste von Quellen-IDs oder NULL = alle aktiven
     terms_json   TEXT NOT NULL DEFAULT '[]',    -- JSON-Liste von Suchbegriffen (ODER, Präfix)
-    in_bar       INTEGER NOT NULL DEFAULT 0,
+    in_bar       INTEGER NOT NULL DEFAULT 0,    -- unten in der Leiste
+    in_chips     INTEGER NOT NULL DEFAULT 1,    -- oben bei den Filtern der Liste (v7)
     position     INTEGER NOT NULL DEFAULT 0,
     created_at   TEXT NOT NULL
 );
@@ -338,6 +339,12 @@ class Database:
                           "WHERE lower(trim(author)) IN ('none', 'null', 'undefined', '')")
             if version < 6:
                 self._migrate_v6(c, admin)
+            if version < 7:
+                # Schalter "oben bei den Filtern" je Profil; bestehende Profile bleiben sichtbar
+                # (DEFAULT 1). Nach _migrate_v6 hat profiles die Spalte schon (USER_TABLES).
+                existing = {r["name"] for r in c.execute("PRAGMA table_info(profiles)")}
+                if "in_chips" not in existing:
+                    c.execute("ALTER TABLE profiles ADD COLUMN in_chips INTEGER NOT NULL DEFAULT 1")
             c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
                       (str(SCHEMA_VERSION),))
 
@@ -889,24 +896,25 @@ class Database:
         return _profile(r) if r else None
 
     def create_profile(self, user_id: int, *, name: str, sources: list[str] | None, terms: list[str],
-                       in_bar: bool) -> int:
+                       in_bar: bool, in_chips: bool = True) -> int:
         with self.tx() as c:
             pos = c.execute("SELECT COALESCE(MAX(position) + 1, 0) AS p FROM profiles WHERE user_id=?",
                             (user_id,)).fetchone()["p"]
             cur = c.execute(
-                "INSERT INTO profiles (user_id, name, sources_json, terms_json, in_bar, position, created_at) "
-                "VALUES (?,?,?,?,?,?,?)",
+                "INSERT INTO profiles (user_id, name, sources_json, terms_json, in_bar, in_chips, position, "
+                "created_at) VALUES (?,?,?,?,?,?,?,?)",
                 (user_id, name, None if sources is None else json.dumps(sources),
-                 json.dumps(terms, ensure_ascii=False), 1 if in_bar else 0, pos, utcnow()),
+                 json.dumps(terms, ensure_ascii=False), 1 if in_bar else 0, 1 if in_chips else 0, pos, utcnow()),
             )
             return cur.lastrowid
 
     def update_profile(self, user_id: int, profile_id: int, fields: dict[str, Any]) -> None:
-        """Ändert nur die übergebenen Felder (name, sources, terms, in_bar)."""
+        """Ändert nur die übergebenen Felder (name, sources, terms, in_bar, in_chips)."""
         cols = {"name": ("name", lambda v: v),
                 "sources": ("sources_json", lambda v: None if v is None else json.dumps(v)),
                 "terms": ("terms_json", lambda v: json.dumps(v, ensure_ascii=False)),
-                "in_bar": ("in_bar", lambda v: 1 if v else 0)}
+                "in_bar": ("in_bar", lambda v: 1 if v else 0),
+                "in_chips": ("in_chips", lambda v: 1 if v else 0)}
         sets = [(cols[k][0], cols[k][1](v)) for k, v in fields.items() if k in cols]
         if not sets:
             return
@@ -1059,7 +1067,7 @@ def _profile(r: sqlite3.Row) -> dict[str, Any]:
         "id": r["id"], "name": r["name"], "builtin": r["builtin"],
         "sources": None if r["sources_json"] is None else json.loads(r["sources_json"]),
         "terms": json.loads(r["terms_json"] or "[]"),
-        "in_bar": bool(r["in_bar"]), "position": r["position"],
+        "in_bar": bool(r["in_bar"]), "in_chips": bool(r["in_chips"]), "position": r["position"],
     }
 
 

@@ -65,8 +65,12 @@ Gleicher Server wie secure-chat und MailDigest (203.0.113.10, SSH-Alias `kiosk-s
   (`kiosk:latest` ist dann ohnehin noch der alte Stand; das Umtaggen schadet nicht), dann ggf. die Datenbank
   wie unten zurückspielen und `docker compose up -d --no-build` (ohne `KIOSK_IMAGE`, also `kiosk:latest`).
   Zurückrollen nach einem erfolgreichen Deploy (auf das geprüfte Image davor):
-  `cd /opt/kiosk && docker compose down && docker tag kiosk:previous kiosk:latest`. Wurde das Schema schon
-  migriert, das Pre-Deploy-Backup dieses Deploys zurückspielen: jüngste Datei
+  `cd /opt/kiosk && docker compose down && docker tag kiosk:previous kiosk:latest`. Von Schema 7 zurück auf
+  ein Image mit Schema 6 braucht es **keine** Wiederherstellung: 7 fügt nur die Spalte `profiles.in_chips`
+  hinzu, das ältere Image überspringt die Migration (Version ist schon höher) und ignoriert die Spalte.
+  Ein Zurückspielen würde dann nur Konten, Lesestand und Profile verwerfen, die seit dem Deploy entstanden
+  sind. Nur bei einem Ziel-Image mit älterem Schema als 6 (und schon migrierter Datenbank) das
+  Pre-Deploy-Backup dieses Deploys zurückspielen: jüngste Datei
   `/opt/kiosk/backups/kiosk-predeploy-<UTC-Zeitstempel>.db.gz` (`ls -1t /opt/kiosk/backups/kiosk-predeploy-*.db.gz | head -1`)
   bei gestopptem Container entpacken:
   `cd / && gunzip -c <Datei> | setpriv --reuid=10100 --regid=10100 --clear-groups sh -c 'cd /opt/kiosk/data && rm -f kiosk.db kiosk.db-wal kiosk.db-shm && umask 077 && cat > kiosk.db'`

@@ -1,4 +1,4 @@
-// Profil-Editor (E2ProfilEditor): Name, Suchbegriffe, Leiste, Quellen nach Land.
+// Profil-Editor (E2ProfilEditor): Name, Suchbegriffe, Sichtbar (oben/unten), Quellen nach Land.
 import { h, hint, replace, toast } from '../ui/dom.js';
 import { close as closeIcon, plus } from '../ui/icons.js';
 import { subHeader } from '../ui/header.js';
@@ -21,7 +21,8 @@ export function profileEditorView(route) {
 
   // Arbeitskopie
   let profile = null;
-  let draft = { name: '', terms: [], in_bar: false, sources: null };
+  // Neu: oben bei den Filtern an, unten in der Leiste aus.
+  let draft = { name: '', terms: [], in_bar: false, in_chips: true, sources: null };
   let addingTerm = false;
   let confirmDelete = false;
   let error = '';
@@ -42,6 +43,7 @@ export function profileEditorView(route) {
           name: profile.name,
           terms: [...(profile.terms || [])],
           in_bar: !!profile.in_bar,
+          in_chips: profile.in_chips !== false,
           sources: profile.sources ? [...profile.sources] : null,
         };
       }
@@ -63,10 +65,18 @@ export function profileEditorView(route) {
     if (error) { build(); return; }
     busy = true;
     saveBtn.disabled = true;
-    const body = { name: draft.name.trim(), terms: draft.terms, in_bar: draft.in_bar, sources: draft.sources };
+    const body = {
+      name: draft.name.trim(), terms: draft.terms, in_bar: draft.in_bar, in_chips: draft.in_chips,
+      sources: draft.sources,
+    };
     try {
       if (isNew) await api('profiles', { method: 'POST', body });
-      else await api(`profiles/${profile.id}`, { method: 'PATCH', body });
+      else {
+        // Nur Geändertes schicken: Ein Schalter, der inzwischen anderswo umgelegt wurde (Profil-Blatt,
+        // anderes Gerät), bleibt sonst nicht stehen.
+        const changes = changedFields(body);
+        if (Object.keys(changes).length) await api(`profiles/${profile.id}`, { method: 'PATCH', body: changes });
+      }
       await Promise.allSettled([loadProfiles(), loadBar()]);
       emit('profiles');
       toast('Profil gespeichert');
@@ -79,6 +89,18 @@ export function profileEditorView(route) {
       error = err.detail || err.message;
       build();
     }
+  }
+
+  /** Felder von `body`, die sich gegenüber dem geladenen Profil geändert haben. */
+  function changedFields(body) {
+    // Quellen ohne Reihenfolge vergleichen (Auswahl per Schalter ordnet sie um); null = alle.
+    const srcKey = (s) => (s ? JSON.stringify([...s].sort()) : null);
+    const loaded = {
+      name: profile.name, terms: JSON.stringify(profile.terms || []), in_bar: !!profile.in_bar,
+      in_chips: profile.in_chips !== false, sources: srcKey(profile.sources),
+    };
+    const now = { ...body, terms: JSON.stringify(body.terms), sources: srcKey(body.sources) };
+    return Object.fromEntries(Object.keys(loaded).filter((k) => now[k] !== loaded[k]).map((k) => [k, body[k]]));
   }
 
   async function remove(e) {
@@ -167,14 +189,17 @@ export function profileEditorView(route) {
   function sourcesBlock() {
     const enabled = (state.sources || []);
     const all = draft.sources === null;
+    // Eigene Beschriftung, damit der Schalter nicht zur Gruppe „Sichtbar“ darüber zu gehören scheint.
     const out = [
-      h('div', { class: 'inline-row' },
-        h('span', { class: 't-ui', text: 'Alle aktiven Zeitungen' }),
-        toggle(all, 'Alle aktiven Zeitungen', (v) => {
-          // Wie „alle“: ohne Quellen mit in_all: false (z. B. heise Security); einzeln wählbar.
-          draft.sources = v ? null : enabled.filter((s) => s.enabled && s.in_all !== false).map((s) => s.id);
-          build();
-        })),
+      h('div', { class: 'field', role: 'group', 'aria-label': 'Zeitungen' },
+        h('span', { class: 'field-label t-caption', 'aria-hidden': 'true', text: 'Zeitungen' }),
+        h('div', { class: 'inline-row' },
+          h('span', { class: 't-ui', text: 'Alle aktiven Zeitungen' }),
+          toggle(all, 'Alle aktiven Zeitungen', (v) => {
+            // Wie „alle“: ohne Quellen mit in_all: false (z. B. heise Security); einzeln wählbar.
+            draft.sources = v ? null : enabled.filter((s) => s.enabled && s.in_all !== false).map((s) => s.id);
+            build();
+          }))),
     ];
     if (all) {
       out.push(h('p', { class: 't-caption muted', text: 'Auch Zeitungen, die du später einschaltest. Ohne Quellen, die nicht in ALLE stehen (heise Security).' }));
@@ -218,6 +243,18 @@ export function profileEditorView(route) {
     return out;
   }
 
+  // Wo das Profil erscheint: oben als Filterchip der Liste, unten in der Schnellzugriffsleiste.
+  function showBlock() {
+    const row = (label, key) => h('div', { class: 'inline-row' },
+      h('span', { class: 't-ui', text: label }),
+      toggle(draft[key], `${label} anzeigen`, (v) => { draft[key] = v; }));
+    return h('div', { class: 'field', role: 'group', 'aria-label': 'Sichtbar' },
+      h('span', { class: 'field-label t-caption', 'aria-hidden': 'true', text: 'Sichtbar' }),
+      h('div', {},
+        row('Oben bei den Filtern', 'in_chips'),
+        row('Unten in der Leiste', 'in_bar')));
+  }
+
   function build() {
     const nameInput = h('input', {
       class: 'input', value: draft.name, maxlength: 40, autocomplete: 'off', 'aria-label': 'Name',
@@ -240,9 +277,7 @@ export function profileEditorView(route) {
     replace(page,
       h('label', { class: 'field' }, h('span', { class: 'field-label t-caption', text: 'Name' }), nameInput),
       termsBlock(),
-      h('div', { class: 'inline-row' },
-        h('span', { class: 't-ui', text: 'In der Leiste anzeigen' }),
-        toggle(draft.in_bar, 'In der Leiste anzeigen', (v) => { draft.in_bar = v; })),
+      showBlock(),
       error ? h('div', { class: 'err-line t-caption', role: 'alert', text: error }) : null,
       sourcesBlock(),
       deleteBlock);

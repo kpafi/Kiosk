@@ -219,6 +219,7 @@ class ProfileIn(BaseModel):
     sources: list[str] | None = Field(None, max_length=MAX_SOURCE_IDS)
     terms: list[Term] = Field(default_factory=list, max_length=20)
     in_bar: StrictBool = False
+    in_chips: StrictBool = True
 
 
 class ProfilePatch(BaseModel):
@@ -227,12 +228,13 @@ class ProfilePatch(BaseModel):
     sources: list[str] | None = Field(None, max_length=MAX_SOURCE_IDS)
     terms: list[Term] | None = Field(None, max_length=20)
     in_bar: StrictBool | None = None
+    in_chips: StrictBool | None = None
 
 
 def _clean_fields(body: BaseModel) -> dict[str, Any]:
     """Nur gesetzte Felder; Quellen müssen bekannt sein, Dubletten fallen weg."""
     fields = {k: getattr(body, k) for k in body.model_fields_set}
-    for key in ("name", "terms", "in_bar"):
+    for key in ("name", "terms", "in_bar", "in_chips"):
         if key in fields and fields[key] is None:
             raise HTTPException(422, f"{key} darf nicht null sein")
     if fields.get("sources") == []:
@@ -259,7 +261,8 @@ async def create_profile(body: ProfileIn, user: User):
         raise HTTPException(409, f"Höchstens {MAX_PROFILES} Profile möglich, bitte erst eines löschen")
     fields = _clean_fields(body)
     pid = state.db.create_profile(user["id"], name=body.name, sources=fields.get("sources", body.sources),
-                                  terms=fields.get("terms", []), in_bar=body.in_bar)
+                                  terms=fields.get("terms", []), in_bar=body.in_bar,
+                                  in_chips=body.in_chips)
     invalidate_unread(user["id"])
     return _profile_view(user["id"], state.db.get_profile(user["id"], pid))
 

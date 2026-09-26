@@ -44,8 +44,9 @@ Kiosk ist ein privater Zeitungskiosk auf einem schwarzen Display: eine ruhige, c
 ## Profile und Filter
 
 - Ein Profil ist eine benannte Auswahl von Zeitungen, optional mit Suchbegriffen. Vorgegeben: DEUTSCHLAND, WELTWEIT, WIRTSCHAFT, MILITÄR. Eigene Profile beliebig.
-- Das Profil-Menü ist ein Blatt (Sheet) von unten in `raised` mit `radius-md` oben: Liste der Profile, jedes mit Schalter „In der Leiste“ und Pfeil zum Bearbeiten, unten „Profil anlegen“.
-- Der Profil-Editor: Name in einem Eingabefeld (`raised-2`, `radius-pill`), Suchbegriffe als Chips, darunter alle Zeitungen nach Land gruppiert mit einem runden Schalter je Zeitung. Ein Land lässt sich mit einem Chip komplett wählen.
+- Das Profil-Menü ist ein Blatt (Sheet) von unten in `raised` mit `radius-md` oben: Liste der Profile, jedes mit Schalter „In der Leiste“ und Pfeil zum Bearbeiten, unten „Profil anlegen“. Steht ein Profil nicht oben bei den Filtern, endet sein Untertitel mit „Nicht bei den Filtern“; umgestellt wird das im Editor.
+- Der Profil-Editor: Name in einem Eingabefeld (`raised-2`, `radius-pill`), Suchbegriffe als Chips, dann die Gruppe „Sichtbar“ mit zwei Schaltern: „Oben bei den Filtern“ (Filterchip der Liste, neu an) und „Unten in der Leiste“ (neu aus). Darunter „Zeitungen“ mit dem Schalter „Alle aktiven Zeitungen“, ist er aus, alle Zeitungen nach Land gruppiert mit einem runden Schalter je Zeitung. Ein Land lässt sich mit einem Chip komplett wählen. Gruppentitel im Editor sind Beschriftungen in `caption` (wie „Name“, „Suchbegriffe“), keine `section`-Titel.
+- Das gerade gewählte Profil steht immer als aktiver Chip in der Filterzeile, auch wenn es sonst nicht oben erscheint, damit man sieht, was filtert, und es abwählen kann.
 - Favoriten (Lieblingszeitungen) sind kein Profil, sondern eine Liste einzelner Zeitungen mit demselben Menü: Schalter „In der Leiste“, Stern zum Entfernen.
 
 ## Abstände und Formen

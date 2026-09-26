@@ -7,7 +7,8 @@ import { articlesLoader, createFeed } from '../ui/feed.js';
 import { emptyState, nextRunSentence } from '../ui/empty.js';
 import { openMenu } from './menu.js';
 import {
-  ctxParams, isAdmin, keepWatermark, loadBar, loadStatus, on, profileById, replaceHash, setUnreadFilter, state,
+  chipProfiles, ctxParams, isActiveProfile, isAdmin, keepWatermark, loadBar, loadStatus, on, profileById, replaceHash,
+  setUnreadFilter, state,
 } from '../store.js';
 import { api } from '../api.js';
 
@@ -49,7 +50,12 @@ function animateChips(row) {
   const before = chipsBefore;
   chipsBefore = null;
   if (!before || Date.now() - before.at > 2000 || before.hash !== (location.hash || '#/')) return;
-  const focusChip = before.focus ? row.querySelector(`.chip[data-key="${before.focus}"]`) : null;
+  // Chip weg (abgewähltes Profil ohne „Oben bei den Filtern“): Fokus auf „Ungelesen“ bzw. den ersten
+  // Chip statt auf body.
+  const focusChip = before.focus
+    ? row.querySelector(`.chip[data-key="${before.focus}"]`) || row.querySelector('.chip[data-key="u"]')
+      || row.querySelector('.chip[data-key]')
+    : null;
   const restoreFocus = () => { if (focusChip && focusChip.isConnected) focusChip.focus({ preventScroll: true }); };
   // Fokus sofort zurückgeben (vor den Animationen), damit Tastatur und Vorleser nicht warten.
   restoreFocus();
@@ -123,10 +129,8 @@ export function listView(route) {
   state.listIsCtx = true;
 
   function buildChips() {
-    const profiles = state.profiles || [];
-    const isActive = (p) => state.ctx.type === 'profile' && String(p.id) === String(state.ctx.id);
-    // Aktives Profil an Stelle 2, die übrigen in ihrer gespeicherten Reihenfolge.
-    const ordered = [...profiles.filter(isActive), ...profiles.filter((p) => !isActive(p))];
+    // Aktives Profil an Stelle 2, die übrigen (nur mit „Oben bei den Filtern“) in ihrer Reihenfolge.
+    const ordered = chipProfiles(state.profiles, state.ctx);
     const unread = chip('Ungelesen', {
       on: state.unread,
       onClick: () => {
@@ -141,7 +145,7 @@ export function listView(route) {
     replace(chipsEl,
       unread,
       ordered.map((p) => {
-        const active = isActive(p);
+        const active = isActiveProfile(p, state.ctx);
         const el = chip(p.name, { on: active, href: active ? '#/' : `#/?p=${p.id}` });
         el.dataset.key = `p${p.id}`;
         el.addEventListener('click', (e) => { if (!isModified(e)) rememberChips(chipsEl, el.getAttribute('href')); });

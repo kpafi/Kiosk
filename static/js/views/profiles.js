@@ -8,7 +8,11 @@ import {
   emit, goBack, loadBar, loadFavorites, loadProfiles, loadSources, state,
 } from '../store.js';
 
-/** Untertitel eines Profils: „15 Zeitungen · 3 Begriffe“, „Alle 92 Zeitungen“, „Eigenes · 6 Zeitungen“. */
+/**
+ * Untertitel eines Profils: „15 Zeitungen · 3 Begriffe“, „Alle 92 Zeitungen“, „Eigenes · 6 Zeitungen“.
+ * Steht es nicht oben bei den Filtern (in_chips aus), kommt „Nicht bei den Filtern“ dazu; der Schalter
+ * der Zeile gilt nur der Leiste, beides stellt der Editor ein.
+ */
 export function profileSub(p) {
   // Quellen mit in_all: false (z. B. heise Security) gehören nicht zu „alle Zeitungen“.
   const total = state.sources ? state.sources.filter((s) => s.enabled && s.in_all !== false).length : null;
@@ -21,7 +25,8 @@ export function profileSub(p) {
     const n = typeof p.source_count === 'number' ? p.source_count : p.sources.length;
     src = `${n} ${n === 1 ? 'Zeitung' : 'Zeitungen'}`;
   }
-  return [p.builtin ? null : 'Eigenes', src, termText].filter(Boolean).join(' · ');
+  const hidden = p.in_chips === false ? 'Nicht bei den Filtern' : null;
+  return [p.builtin ? null : 'Eigenes', src, termText, hidden].filter(Boolean).join(' · ');
 }
 
 const barKey = (i) => i.key || (i.type === 'all' ? 'all' : `${i.type}:${i.id}`);

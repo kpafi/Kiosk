@@ -298,8 +298,10 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
   304 auf den Index sagte nichts über die eigentliche Liste), jeder Abruf geht ohne Bedingung.
 - `include_paths` (optional, je Quelle in `sources.yaml`): Liste regulärer Ausdrücke; nur Einträge,
   deren URL-Pfad auf einen davon passt (`re.search`), werden angelegt. Gilt für Feeds und Sitemaps,
-  vor der Grenze von 300 Einträgen und vor dem Zählen neuer Artikel (GEA: nur Lokalressorts). Hat
-  der Filter alles verworfen, gilt der Abruf als erfolgreich (0 neue), ebenso eine leere Sitemap.
+  vor der Grenze von 300 Einträgen und vor dem Zählen neuer Artikel (GEA: nur Lokalressorts; FOCUS
+  online per negativem Lookahead ohne `kultur/stars`, `kultur/kino-tv`, `kultur/royals`, `die-debatte`
+  und `tagesthema`). Hat der Filter alles verworfen, gilt der Abruf als erfolgreich (0 neue), ebenso
+  eine leere Sitemap.
 - `guid_pattern` (optional): regulärer Ausdruck mit genau einer Gruppe, auf die Eintrags-URL angewandt;
   die Gruppe ist die GUID (GEA: `_arid,(\d+)`, die Artikelnummer), passt er nicht, bleibt die übliche.
 - Private, lokale und Metadaten-Adressen werden bei jedem Hop abgelehnt, zusätzlich wird nach dem

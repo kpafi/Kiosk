@@ -754,3 +754,37 @@ def test_strip_reading_times_drops_stored_teaser_items():
     assert strip_reading_times(STORED_SPIEGEL_TEASERS) == (
         "<p>Die Gewerkschaften lehnen die Pläne ab.</p>"
         "<p>Deutschlands Arbeitgeber warfen dem DGB »rituelle Reformverweigerung« vor.</p>")
+
+
+FOCUS_URL = "https://www.focus.de/finanzen/news/finanzamt-krypto_1234.html"
+FOCUS_ARTICLE = (
+    '<!doctype html><html><head><meta charset="utf-8"><title>Finanzamt und Krypto</title></head><body><main>'
+    '<article><h1>Finanzamt bekommt mehr Einblick in Ihre Bitcoin-Geschäfte</h1>'
+    '<div class="Content-Author-List Content-Author-Single"><div class="Content-Author-Images">'
+    '<span class="Content-Author"><img src="https://quadro.example/marvin-haas.jpg" alt="Marvin Haas"></span></div>'
+    '<span class="Content-Author-Text"><a href="https://www.focus.de/autoren/marvin-haas_1.html">Marvin Haas</a>'
+    '</span></div>'
+    '<div class="Html-Block" data-qa-article-content-text><p>Seit 2026 müssen bestimmte Krypto-Dienstleister '
+    'Informationen über ihre Kunden und deren Transaktionen an die zuständigen Steuerbehörden melden. '
+    'Deutschland setzt damit eine europäische Richtlinie um.</p><h2>Krypto-Mining kann gewerblich sein</h2>'
+    '<p>Wer Kryptowährungen in größerem Umfang und mit Gewinnerzielungsabsicht schürft, kann damit eine '
+    'gewerbliche Tätigkeit ausüben. Dann werden auch Gewerbe- und Umsatzsteuer relevant.</p></div>'
+    '<div class="Article-ReusableText Html-Block"><div><h2>So richten Sie FOCUS online als bevorzugte Quelle '
+    'bei Google ein</h2><p>Sie wollen FOCUS online als bevorzugte Quelle bei Google hinterlegen? Voraussetzung '
+    'ist ein Google-Konto. <a href="https://www.google.com/preferences/source?q=https://www.focus.de">Über '
+    'diesen Link</a> geht es direkt zur Einstellung.</p></div></div>'
+    '<div class="Article-ReusableText Html-Block"><p>Stefan Petzold ist Landschaftsarchitekt und Teil unseres '
+    'Expertenkreises.</p></div>'
+    '<section class="Newsletter-Container Html-Block" data-element-tracking-name="newsletter-widget">'
+    '<h2>Hier für den Auto-Newsletter anmelden!</h2><p>Sie wollen keinen Artikel unserer Auto-Experten '
+    'verpassen? Dann melden Sie sich jetzt kostenlos an.</p><button>Anmelden</button></section>'
+    '</article></main></body></html>')
+
+
+def test_focus_promo_boxes_and_byline_are_dropped_but_author_box_stays():
+    result = extract(FOCUS_ARTICLE.encode(), FOCUS_URL)
+    assert "Krypto-Dienstleister" in result.body_text and "Gewerbe- und Umsatzsteuer" in result.body_text
+    assert "bevorzugte Quelle" not in result.body_text and "google.com" not in result.body_html
+    assert "Expertenkreises" in result.body_text
+    assert "Newsletter" not in result.body_text and "Marvin Haas" not in result.body_text
+    assert "marvin-haas.jpg" not in result.body_html

@@ -531,13 +531,22 @@ _PLACEHOLDER_XPATH = f"//*[contains(concat(' ', normalize-space(@class), ' '), '
 # El País versteckt so echte Bildunterschriften, DW Datumsangaben.
 # SPIEGEL kennzeichnet den ganzen „Mehr zum Thema“-Kasten mit data-area="related_articles"; ohne ihn
 # rutschen auch keine Teaser-Überschriften mehr in den Text.
+# FOCUS online hängt an manche Artikel einen Werbekasten „So richten Sie FOCUS online als bevorzugte
+# Quelle bei Google ein“ (Article-ReusableText); dieselbe Klasse trägt auch Autorenkästen, die bleiben.
+# Dazu die Newsletter-Anmeldung („Hier für den Auto-Newsletter anmelden!“) und die Autorenzeile samt
+# Porträt über dem Text (Content-Author-List); der Autor steht schon in der Metazeile.
 _CHROME_XPATH = (
     "//button[not(.//img or .//picture)]"
     " | //*[@data-contains-auxiliary-icons or @data-icon-auxiliary]"
     " | //*[@data-area='play_button' or @data-area='bookmark_button' or @data-area='related_articles']"
+    " | //*[contains(concat(' ', normalize-space(@class), ' '), ' Article-ReusableText ')]"
+    "[contains(normalize-space(.), 'bevorzugte Quelle bei Google')]"
+    " | //*[@data-element-tracking-name='newsletter-widget']"
+    " | //*[contains(concat(' ', normalize-space(@class), ' '), ' Content-Author-List ')]"
 )
 _CHROME_MARKERS_RE = re.compile(
-    rb"<button|data-contains-auxiliary-icons|data-icon-auxiliary|play_button|bookmark_button|related_articles",
+    rb"<button|data-contains-auxiliary-icons|data-icon-auxiliary|play_button|bookmark_button|related_articles"
+    rb"|Article-ReusableText|newsletter-widget|Content-Author-List",
     re.I)
 
 

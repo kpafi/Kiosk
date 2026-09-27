@@ -55,7 +55,7 @@ def test_short_defaults_to_upper_name_and_is_validated(tmp_path):
 def test_shipped_catalog_has_distinct_short_names():
     catalog = Catalog.load(ROOT / "sources.yaml")
     shorts = [s.short for s in catalog.all()]
-    assert len(shorts) == 94 and len(set(shorts)) == 94
+    assert len(shorts) == 95 and len(set(shorts)) == 95
     assert all(0 < len(x) <= 12 and x == x.upper() for x in shorts)
     assert catalog.get("spiegel").short == "SPIEGEL"
 
@@ -122,6 +122,24 @@ def test_new_sources_heise_security_and_gea():
 def test_gea_include_paths(path, wanted):
     gea = Catalog.load(ROOT / "sources.yaml").get("gea")
     assert gea.wants_url("https://www.gea.de" + path) is wanted
+
+
+@pytest.mark.parametrize("path, wanted", [
+    ("/politik/ausland/serbiens-praesident-tritt-zurueck_86d6ebbb.html", True),
+    ("/panorama/welt/mann-tankt-mit-fremder-karte_1.html", True),
+    ("/finanzen/finanzamt-krypto_1.html", True),
+    ("/kultur/terminator-ikone-wird-70_1.html", True),          # Kultur ohne Promi-Ressort bleibt
+    ("/kultur/buecher/neuer-roman_1.html", True),
+    ("/kultur/stars/sylvie-meis_1.html", False),
+    ("/kultur/kino-tv/fernsehgarten_1.html", False),
+    ("/kultur/royals/prinz-william_1.html", False),
+    ("/die-debatte/leser-diskutieren_1.html", False),
+    ("/tagesthema/abends/19-uhr_1.html", False),
+    ("/sport/fussball/die-debatte-um-klopp_1.html", True),      # nur das Ressort am Anfang zählt
+])
+def test_focus_include_paths(path, wanted):
+    focus = Catalog.load(ROOT / "sources.yaml").get("focus")
+    assert focus.wants_url("https://www.focus.de" + path) is wanted
 
 
 def test_new_sources_are_enabled_in_an_existing_database(tmp_path):

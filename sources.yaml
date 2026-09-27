@@ -1,6 +1,6 @@
 # Quellenkatalog für Kiosk.
 # Alle Feeds wurden am 25.09.2026 vom Hetzner-Server aus getestet (Feed + Volltext-Extraktion),
-# heise Security und GEA am 26.09.2026.
+# heise Security und GEA am 26.09.2026, FOCUS online am 28.09.2026.
 # feed: RSS/Atom oder eine Google-News-Sitemap (urlset) bzw. ein Sitemap-Index, am Inhalt erkannt (GEA).
 # include_paths: optionale Liste regulärer Ausdrücke; nur Einträge, deren URL-Pfad (ohne Query) auf
 # einen davon passt (Python re.search), werden angelegt, z. B. nur die Lokalressorts einer Regionalzeitung.
@@ -26,6 +26,11 @@ sources:
   - {id: tagesspiegel, name: Tagesspiegel,            short: "TAGESSPIEGEL",  country: DE, lang: de, feed: "https://www.tagesspiegel.de/contentexport/feed/home",   homepage: "https://www.tagesspiegel.de",  default_enabled: false}
   - {id: fr,           name: Frankfurter Rundschau,   short: "FR",            country: DE, lang: de, feed: "https://www.fr.de/rssfeed.rdf",                         homepage: "https://www.fr.de",            default_enabled: false}
   - {id: handelsblatt, name: Handelsblatt,            short: "HANDELSBLATT",    country: DE, lang: de, feed: "https://www.handelsblatt.com/contentexport/feed/schlagzeilen", homepage: "https://www.handelsblatt.com", category: business, default_enabled: false}
+  # FOCUS online: der Gesamtfeed (400 Einträge, gut 2 Tage) ohne Promi-, TV- und Königshaus-Meldungen
+  # (kultur/stars, kultur/kino-tv, kultur/royals, rund ein Viertel des Feeds), ohne die KI-Auswertungen
+  # von Leserkommentaren (die-debatte) und ohne die KI-Tageszusammenfassungen eigener Artikel (tagesthema).
+  - {id: focus,        name: FOCUS online,            short: "FOCUS",         country: DE, lang: de, feed: "https://www.focus.de/rss",                             homepage: "https://www.focus.de",
+     include_paths: ['^/(?!kultur/(?:stars|kino-tv|royals)/|die-debatte/|tagesthema/)']}
   - {id: heise,        name: heise online,            short: "HEISE",         country: DE, lang: de, feed: "https://www.heise.de/rss/heise-atom.xml",               homepage: "https://www.heise.de",         category: tech}
   - {id: heisesec,     name: heise Security,          short: "HEISE SEC",     country: DE, lang: de, feed: "https://www.heise.de/security/rss/news-atom.xml",       homepage: "https://www.heise.de/security/", category: tech,
      in_all: false, note: "Nicht in ALLE (Meldungen stehen auch bei heise online); eigene Ansicht oder Profil"}

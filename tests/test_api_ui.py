@@ -8,7 +8,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.api_ui as api_ui
+from app.auth import hash_password
 from app.main import app, state
+from app.users import seed_builtin_profiles
 from conftest import UID, ago, make_row
 
 ORIGIN = "https://testserver"
@@ -439,7 +441,8 @@ def test_bar_order(authed):
 def test_settings_defaults_and_validation(authed):
     assert authed.get("/api/settings").json() == {
         "theme": "dark", "text_size": "m", "mark_read_on_open": True, "show_images": True,
-        "free_only": True, "bar_order": [], "desktop_empty": "overview", "focus_mode": False}
+        "free_only": True, "bar_order": [], "desktop_empty": "overview", "focus_mode": False,
+        "all_extra_sources": []}
     assert authed.patch("/api/settings", json={"theme": "system"}).json()["theme"] == "system"
     r = authed.patch("/api/settings", json={"theme": "light", "show_images": False})
     assert r.status_code == 200 and r.json()["theme"] == "light" and r.json()["show_images"] is False
@@ -741,6 +744,123 @@ def test_in_all_false_source_stays_in_saved_lists(sec_client):
     assert _ids(c.get("/api/articles", params={"later": "true"}).json()) == [sec_id]
     counts = c.get("/api/counts").json()
     assert counts["starred"] == 1 and counts["later"] == 1
+
+
+# ---- all_extra_sources: Quelle mit in_all: false für einen Benutzer doch in ALLE ------------
+
+EXTRA_PW = "reiner-passwort-123"
+
+
+def _second_user(name: str = "reiner", extra: list[str] | None = None) -> TestClient:
+    """Zweiter angemeldeter Client derselben App (kein Admin), mit all_extra_sources = extra."""
+    uid = state.db.create_user(name, hash_password(EXTRA_PW), display_name=name.title())
+    seed_builtin_profiles(state.db, state.catalog, uid)
+    other = TestClient(app, base_url=ORIGIN)      # ohne with: teilt Zustand und Lifespan
+    assert other.post("/api/login", json={"username": name, "password": EXTRA_PW}).status_code == 204
+    if extra is not None:
+        assert other.patch("/api/settings", json={"all_extra_sources": extra}).status_code == 200
+    return other
+
+
+def test_all_extra_sources_put_in_all_false_source_into_all_for_one_user(sec_client):
+    admin, reiner = sec_client, _second_user(extra=["sec"])
+    ids = {r["guid"]: r["id"] for r in state.db.q("SELECT id, guid FROM articles")}
+    # ALLE-Liste, Zähler, Leiste
+    assert _sources_of(admin.get("/api/articles").json()) == ["alpha", "beta"]
+    assert _sources_of(reiner.get("/api/articles").json()) == ["alpha", "sec", "beta"]
+    assert admin.get("/api/counts").json()["unread"] == 2 and reiner.get("/api/counts").json()["unread"] == 3
+    assert admin.get("/api/bar").json()["items"][0]["unread"] == 2
+    assert reiner.get("/api/bar").json()["items"][0]["unread"] == 3
+    # „nächster Artikel“, Suche und Länderfilter ohne Quelle
+    assert admin.get(f"/api/articles/{ids['alpha-1']}/next").json()["item"]["id"] == ids["beta-1"]
+    assert reiner.get(f"/api/articles/{ids['alpha-1']}/next").json()["item"]["id"] == ids["sec-1"]
+    assert _sources_of(admin.get("/api/articles", params={"q": "Patchday"}).json()) == ["alpha"]
+    assert _sources_of(reiner.get("/api/articles", params={"q": "Patchday"}).json()) == ["alpha", "sec"]
+    assert _sources_of(admin.get("/api/articles", params={"country": "DE"}).json()) == ["alpha"]
+    assert _sources_of(reiner.get("/api/articles", params={"country": "DE"}).json()) == ["alpha", "sec"]
+    # Profil ohne Quellenliste (Weltweit) wie ALLE
+    assert _profile(admin, "world")["source_count"] == 2 and _profile(admin, "world")["unread"] == 2
+    world = _profile(reiner, "world")
+    assert world["source_count"] == 3 and world["unread"] == 3
+    assert _sources_of(reiner.get("/api/articles", params={"profile": world["id"]}).json()) == \
+        ["alpha", "sec", "beta"]
+    # /api/sources: in_all je Benutzer
+    for client, want in ((admin, False), (reiner, True)):
+        in_all = {s["id"]: s["in_all"] for s in client.get("/api/sources").json()}
+        assert in_all == {"alpha": True, "beta": True, "gamma": True, "sec": want}
+    # read-all ohne Quelle: der Admin lässt sec ungelesen, reiner nicht
+    assert admin.post("/api/articles/read-all", json={}).json()["marked"] == 2
+    assert _unread("a.source_id") == ["sec"]
+    assert reiner.post("/api/articles/read-all", json={}).json()["marked"] == 3
+    assert reiner.get("/api/counts").json()["unread"] == 0
+
+
+def test_all_extra_sources_validation(sec_client):
+    c = sec_client
+    assert c.get("/api/settings").json()["all_extra_sources"] == []
+    r = c.patch("/api/settings", json={"all_extra_sources": ["sec", "sec"]})
+    assert r.status_code == 200 and r.json()["all_extra_sources"] == ["sec"]           # Dubletten fallen weg
+    # Unbekannte Quelle: 400 wie bei bar_order, gespeicherter Wert bleibt
+    assert c.patch("/api/settings", json={"all_extra_sources": ["sec", "gibtsnicht"]}).status_code == 400
+    for bad in (None, "sec", [1], ["x"] * 201):
+        assert c.patch("/api/settings", json={"all_extra_sources": bad}).status_code == 422, bad
+    assert c.get("/api/settings").json()["all_extra_sources"] == ["sec"]
+    # Eine Quelle mit in_all: true ist erlaubt (ohne Wirkung); leere Liste: wieder wie alle anderen
+    assert c.patch("/api/settings", json={"all_extra_sources": ["alpha"]}).status_code == 200
+    assert _sources_of(c.get("/api/articles").json()) == ["alpha", "beta"]
+    assert c.patch("/api/settings", json={"all_extra_sources": []}).json()["all_extra_sources"] == []
+    # Gespeichert, aber nicht (mehr) im Katalog: zählt nicht; kaputter Wert: Standard
+    state.db.set_settings(UID, {"all_extra_sources": ["weg", "sec", 5]})
+    assert c.get("/api/settings").json()["all_extra_sources"] == ["sec"]
+    assert _sources_of(c.get("/api/articles").json()) == ["alpha", "sec", "beta"]
+    state.db.set_settings(UID, {"all_extra_sources": "sec"})
+    assert c.get("/api/settings").json()["all_extra_sources"] == []
+    assert _sources_of(c.get("/api/articles").json()) == ["alpha", "beta"]
+
+
+def test_all_extra_sources_change_is_not_hidden_by_profile_counter_cache(sec_client):
+    """Profil-Zähler (60 s zwischengespeichert) folgen einer geänderten Einstellung sofort, auch wenn
+    sie direkt in der Datenbank geändert wurde (python -m app.users extra-sources)."""
+    c = sec_client
+    assert _profile(c, "world")["unread"] == 2
+    state.db.set_settings(UID, {"all_extra_sources": ["sec"]})
+    assert _profile(c, "world")["unread"] == 3
+    assert c.get("/api/bar").json()["items"][0]["unread"] == 3
+    state.db.set_settings(UID, {"all_extra_sources": []})
+    assert _profile(c, "world")["unread"] == 2
+
+
+def test_all_extra_sources_overview_frontpage_related_per_user(story_client):
+    """zeta (in_all: false) nur für reiner in Übersicht, Titelseite und rechter Seite; die Antworten
+    abwechselnd abgefragt, damit nichts vom einen Benutzer beim anderen landet."""
+    admin, reiner = story_client, _second_user(extra=["zeta"])
+    me = _add("alpha", 1, 2, story="big", image=True)
+    other = _add("zeta", 1, 1, story="big", image=True)
+    de = _add("delta", 1, 3, story="big")
+    sid = _link_stories()["big"]
+    for _ in range(2):
+        body = admin.get("/api/overview").json()
+        assert body["counts"]["new_today"] == 2 and body["counts"]["unread_today"] == 2
+        assert body["top_stories"] == []                  # nur zwei Zeitungen in ALLE: zu wenige
+        body = reiner.get("/api/overview").json()
+        assert body["counts"]["new_today"] == 3 and body["counts"]["unread_today"] == 3
+        assert [(s["story_id"], s["sources_count"]) for s in body["top_stories"]] == [(sid, 3)]
+        lead = admin.get("/api/frontpage").json()["lead"]
+        assert lead["story_id"] == sid and lead["sources_count"] == 2
+        lead = reiner.get("/api/frontpage").json()["lead"]
+        assert lead["story_id"] == sid and lead["sources_count"] == 3
+        body = admin.get(f"/api/articles/{me}/related").json()
+        assert body["sources_count"] == 2 and [it["id"] for it in body["same_story"]] == [de]
+        body = reiner.get(f"/api/articles/{me}/related").json()
+        assert body["sources_count"] == 3 and [it["id"] for it in body["same_story"]] == [other, de]
+    # Titelseite, Rubrik Weltweit (Profil ohne Quellenliste): zeta nur bei reiner (der Aufmacher
+    # ist dort schon vergeben, also ein zweiter zeta-Artikel)
+    solo = _add("zeta", 2, 1)
+
+    def world_ids(client):
+        sections = client.get("/api/frontpage").json()["sections"]
+        return {it["article"]["id"] for s in sections if s["name"] == "Weltweit" for it in s["items"]}
+    assert solo not in world_ids(admin) and solo in world_ids(reiner)
 
 
 # ---- Geschichten: rechte Seite am Desktop (related, overview, frontpage) -------------------

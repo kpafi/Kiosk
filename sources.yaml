@@ -28,9 +28,13 @@ sources:
   - {id: handelsblatt, name: Handelsblatt,            short: "HANDELSBLATT",    country: DE, lang: de, feed: "https://www.handelsblatt.com/contentexport/feed/schlagzeilen", homepage: "https://www.handelsblatt.com", category: business, default_enabled: false}
   # FOCUS online: der Gesamtfeed (400 Einträge, gut 2 Tage) ohne Promi-, TV- und Königshaus-Meldungen
   # (kultur/stars, kultur/kino-tv, kultur/royals, rund ein Viertel des Feeds), ohne die KI-Auswertungen
-  # von Leserkommentaren (die-debatte) und ohne die KI-Tageszusammenfassungen eigener Artikel (tagesthema).
+  # von Leserkommentaren (die-debatte), ohne die KI-Tageszusammenfassungen eigener Artikel (tagesthema)
+  # und ohne Ratgeber: gesundheit, familie, panorama/oktoberfest, reisen/fernreisen,
+  # finanzen/altersvorsorge, finanzen/karriere, immobilien/kaufen, auto/fahrberichte. Nicht in ALLE
+  # (in_all: false); wer sie dort will, bekommt sie per python -m app.users extra-sources <name> focus.
   - {id: focus,        name: FOCUS online,            short: "FOCUS",         country: DE, lang: de, feed: "https://www.focus.de/rss",                             homepage: "https://www.focus.de",
-     include_paths: ['^/(?!kultur/(?:stars|kino-tv|royals)/|die-debatte/|tagesthema/)']}
+     in_all: false, note: "Nicht in ALLE (außer bei Konten, die sie dort ausdrücklich haben); eigene Ansicht oder Profil",
+     include_paths: ['^/(?!kultur/(?:stars|kino-tv|royals)/|die-debatte/|tagesthema/|gesundheit/|familie/|panorama/oktoberfest/|reisen/fernreisen/|finanzen/(?:altersvorsorge|karriere)/|immobilien/kaufen/|auto/fahrberichte/)']}
   - {id: heise,        name: heise online,            short: "HEISE",         country: DE, lang: de, feed: "https://www.heise.de/rss/heise-atom.xml",               homepage: "https://www.heise.de",         category: tech}
   - {id: heisesec,     name: heise Security,          short: "HEISE SEC",     country: DE, lang: de, feed: "https://www.heise.de/security/rss/news-atom.xml",       homepage: "https://www.heise.de/security/", category: tech,
      in_all: false, note: "Nicht in ALLE (Meldungen stehen auch bei heise online); eigene Ansicht oder Profil"}

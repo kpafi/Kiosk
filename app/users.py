@@ -7,6 +7,10 @@
     disable <name> | enable <name>        disable beendet ebenfalls alle Sitzungen
     remove <name> [--yes]                 löscht Lesestand, Profile, Favoriten, Einstellungen
     admin <name> --on|--off
+    extra-sources <name> [quelle ...] [--profile-de]
+                                          Quellen mit in_all: false (z. B. focus), die für den
+                                          Benutzer doch in ALLE stehen; ohne Quelle: keine mehr.
+                                          --profile-de nimmt sie auch ins Profil Deutschland auf
 
 Ohne --password-stdin wird das Passwort zweimal verdeckt abgefragt (getpass). Mit
 --password-stdin kommt es aus der ersten Zeile der Standardeingabe (deploy/user.sh reicht es so
@@ -195,6 +199,38 @@ def cmd_admin(db: Database, args: argparse.Namespace) -> None:
     print(f"{user['username']} ist {'jetzt' if args.on else 'nicht mehr'} Admin")
 
 
+def cmd_extra_sources(db: Database, args: argparse.Namespace) -> None:
+    """Einstellung all_extra_sources setzen (api_ui.implicit_sources): Die genannten Quellen mit
+    in_all: false zählen für den Benutzer zu ALLE, Profilen ohne Quellenliste, Suche, Zählern und
+    Tagesübersicht. Die laufende App liest die Einstellung bei jeder Anfrage, kein Neustart nötig."""
+    user = _user(db, args.username)
+    catalog = _catalog()
+    ids = list(dict.fromkeys(args.sources))
+    unknown = [s for s in ids if s not in catalog]
+    if unknown:
+        raise UserError(f"Unbekannte Quelle: {', '.join(unknown)}")
+    always = [s for s in ids if catalog.get(s).in_all]
+    if always:
+        raise UserError(f"Steht ohnehin in ALLE (kein in_all: false in sources.yaml): {', '.join(always)}")
+    if args.profile_de and not ids:
+        raise UserError("--profile-de braucht mindestens eine Quelle")
+    db.set_settings(user["id"], {"all_extra_sources": ids})
+    name = user["username"]
+    print(f"{name}: zusätzlich in ALLE: {', '.join(ids)}" if ids else f"{name}: keine zusätzlichen Quellen in ALLE")
+    if args.profile_de:
+        de = next((p for p in db.list_profiles(user["id"]) if p["builtin"] == "de"), None)
+        if de is None:
+            print(f"{name} hat kein Profil Deutschland")
+        elif de["sources"] is None:
+            print("Profil Deutschland ohne Quellenliste: enthält sie schon (wie ALLE)")
+        else:
+            added = [s for s in ids if s not in de["sources"]]
+            if added:
+                db.update_profile(user["id"], de["id"], {"sources": [*de["sources"], *added]})
+            print(f"Profil Deutschland: {', '.join(added)} aufgenommen" if added
+                  else "Profil Deutschland: enthält sie schon")
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m app.users", description="Konten der Kiosk-Instanz verwalten")
     sub = p.add_subparsers(dest="command", required=True)
@@ -230,6 +266,14 @@ def _parser() -> argparse.ArgumentParser:
     group.add_argument("--on", dest="on", action="store_true")
     group.add_argument("--off", dest="on", action="store_false")
     adm.set_defaults(func=cmd_admin)
+
+    extra = sub.add_parser("extra-sources",
+                           help="Quellen mit in_all: false für einen Benutzer in ALLE aufnehmen (ohne Quelle: keine)")
+    extra.add_argument("username")
+    extra.add_argument("sources", nargs="*", metavar="quelle", help="Quellen-ID aus sources.yaml, z. B. focus")
+    extra.add_argument("--profile-de", action="store_true",
+                       help="die Quellen auch ins vorgegebene Profil Deutschland aufnehmen")
+    extra.set_defaults(func=cmd_extra_sources)
     return p
 
 

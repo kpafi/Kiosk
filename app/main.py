@@ -31,8 +31,8 @@ from .sources import Catalog
 from .state import State, state  # noqa: F401  (State für Importe von außen)
 from . import api_ui, stories
 from . import db as db_mod
-from .api_ui import (admin_user, article_scope, current_user, effective_sources, implicit_sources, invalidate_unread,
-                     public_user)
+from .api_ui import (admin_user, article_scope, current_user, effective_sources, implicit_sources, in_all_ids,
+                     invalidate_unread, public_user)
 from .users import seed_builtin_profiles
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -390,13 +390,14 @@ async def healthz():
 
 # ---- sources -------------------------------------------------------------
 
-def _source_view(s, st, counts, favorites: set[str]) -> dict[str, Any]:
+def _source_view(s, st, counts, favorites: set[str], in_all: set[str]) -> dict[str, Any]:
     c = counts.get(s.id, {"total": 0, "unread": 0, "unread_all": 0})
     return {
         "id": s.id, "name": s.name, "short": s.short, "is_favorite": s.id in favorites,
         "country": s.country, "lang": s.lang,
         "category": s.category, "homepage": s.homepage, "note": s.note, "tags": list(s.tags),
-        "in_all": s.in_all,   # false: nicht in ALLE und Profilen ohne Quellenliste
+        # false: nicht in ALLE und Profilen ohne Quellenliste; je Benutzer (all_extra_sources)
+        "in_all": s.id in in_all,
         "enabled": bool(st["enabled"]) if st else s.default_enabled,
         "last_ok_at": st["last_ok_at"] if st else None,
         "last_fetch_at": st["last_fetch_at"] if st else None,
@@ -412,7 +413,8 @@ async def list_sources(user: dict = Depends(current_user)):
     states = state.db.source_states()
     counts = state.db.source_counts(user["id"])
     favorites = _favorite_ids(user["id"])
-    return [_source_view(s, states.get(s.id), counts, favorites) for s in state.catalog.all()]
+    in_all = in_all_ids(user["id"])
+    return [_source_view(s, states.get(s.id), counts, favorites, in_all) for s in state.catalog.all()]
 
 
 def _favorite_ids(user_id: int) -> set[str]:
@@ -431,7 +433,7 @@ async def patch_source(source_id: str, body: SourcePatch, user: dict = Depends(a
     invalidate_unread()
     states = state.db.source_states()
     return _source_view(state.catalog.get(source_id), states.get(source_id),
-                        state.db.source_counts(user["id"]), _favorite_ids(user["id"]))
+                        state.db.source_counts(user["id"]), _favorite_ids(user["id"]), in_all_ids(user["id"]))
 
 
 class BulkSources(BaseModel):
@@ -748,7 +750,7 @@ async def related(article_id: int = PathParam(ge=1, le=MAX_ID), user: dict = Dep
     if not row:
         raise HTTPException(404, "Artikel nicht gefunden")
     row = dict(row)
-    scope = implicit_sources()
+    scope = implicit_sources(user["id"])
     budget = _Budget()                  # alle Abfragen der Seite zusammen (wie Übersicht und Titelseite)
     story_id = state.db.story_id_of(article_id)
     row["story_id"] = story_id          # get_article liefert sie nicht; topic_ids braucht sie (vor dem Fenster)
@@ -816,7 +818,7 @@ async def overview(user: dict = Depends(current_user)):
     budget = _Budget()
     local = datetime.now(timezone.utc).astimezone(state.db.tz)
     today = state.db.today_start()
-    scope = implicit_sources()
+    scope = implicit_sources(user["id"])
     counts = {"unread": None, "later": None}
     try:
         counts = state.db.article_counts(user["id"], scope, time_limit=budget.limit())
@@ -868,7 +870,7 @@ async def frontpage(user: dict = Depends(current_user)):
     uid = user["id"]
     budget = _Budget()
     local = datetime.now(timezone.utc).astimezone(state.db.tz)
-    scope = implicit_sources()
+    scope = implicit_sources(user["id"])
     lead = None
     window = "today"
     try:
@@ -890,7 +892,7 @@ async def frontpage(user: dict = Depends(current_user)):
     used_ids = {lead["article"]["id"]} if lead else set()
     sections = []
     for p in chosen:
-        sources, terms = effective_sources(p), p["terms"] or None
+        sources, terms = effective_sources(uid, p), p["terms"] or None
         try:
             groups = [g for g in state.db.profile_story_groups(uid, sources=sources, terms=terms, since=since,
                                                                limit=FRONTPAGE_GROUPS + len(used_stories),

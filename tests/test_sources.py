@@ -136,10 +136,36 @@ def test_gea_include_paths(path, wanted):
     ("/die-debatte/leser-diskutieren_1.html", False),
     ("/tagesthema/abends/19-uhr_1.html", False),
     ("/sport/fussball/die-debatte-um-klopp_1.html", True),      # nur das Ressort am Anfang zählt
+    # Ratgeber und Lifestyle
+    ("/gesundheit/some_1.html", False),
+    ("/gesundheit/ratgeber/schlaf/tipps_1.html", False),
+    ("/familie/schule/elternabend_1.html", False),
+    ("/panorama/oktoberfest/wiesn-bilanz_1.html", False),
+    ("/reisen/fernreisen/thailand_1.html", False),
+    ("/finanzen/altersvorsorge/rente-mit-63_1.html", False),
+    ("/finanzen/karriere/gehalt_1.html", False),
+    ("/immobilien/kaufen/eigentumswohnung_1.html", False),
+    ("/auto/fahrberichte/vw-id7_1.html", False),
+    # Nachbarn davon bleiben
+    ("/panorama/welt/unwetter_1.html", True),
+    ("/finanzen/news/dax-schliesst_1.html", True),
+    ("/finanzen/boerse/aktie_1.html", True),
+    ("/reisen/flug/streik-am-flughafen_1.html", True),
+    ("/immobilien/some-article_1.html", True),
+    ("/immobilien/mieten/mietpreisbremse_1.html", True),
+    ("/auto/news/rueckruf_1.html", True),
+    ("/politik/deutschland/gesundheit-reform_1.html", True),  # Gesundheitspolitik im Ressort Politik
 ])
 def test_focus_include_paths(path, wanted):
     focus = Catalog.load(ROOT / "sources.yaml").get("focus")
     assert focus.wants_url("https://www.focus.de" + path) is wanted
+
+
+def test_focus_is_not_in_all_by_default():
+    """FOCUS steht nur für Konten mit all_extra_sources in ALLE (wie heise Security gar nicht)."""
+    catalog = Catalog.load(ROOT / "sources.yaml")
+    assert {s.id for s in catalog.all() if not s.in_all} == {"heisesec", "focus"}
+    assert catalog.get("focus").default_enabled is True and "Nicht in ALLE" in catalog.get("focus").note
 
 
 def test_new_sources_are_enabled_in_an_existing_database(tmp_path):
@@ -196,6 +222,6 @@ def test_in_all_is_validated_and_set_for_heise_security(tmp_path):
     assert Catalog.load(path).get("x").in_all is False
     assert _load(tmp_path, "country: DE,").get("x").in_all is True
     catalog = Catalog.load(ROOT / "sources.yaml")
-    assert [s.id for s in catalog.all() if not s.in_all] == ["heisesec"]
+    assert [s.id for s in catalog.all() if not s.in_all] == ["focus", "heisesec"]   # FOCUS: siehe unten
     sec = catalog.get("heisesec")
     assert sec.default_enabled is True and "Nicht in ALLE" in sec.note

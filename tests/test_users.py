@@ -600,6 +600,54 @@ def test_cli_without_database(tmp_path, monkeypatch, capsys):
     assert "Keine Datenbank" in capsys.readouterr().err
 
 
+def test_cli_extra_sources(cli, capsys, tmp_path):
+    """extra-sources: Quellen mit in_all: false für einen Benutzer in ALLE (Einstellung
+    all_extra_sources), wahlweise auch ins Profil Deutschland; nur solche Quellen, ohne Quelle: keine."""
+    run, open_db = cli
+    catalog = tmp_path / "sources.yaml"
+    catalog.write_text(catalog.read_text(encoding="utf-8")
+                       + '  - {id: sec, name: Sec, country: DE, lang: de, feed: "https://sec.example/feed", '
+                         'in_all: false}\n'
+                       + '  - {id: pop, name: Pop, country: DE, lang: de, feed: "https://pop.example/feed", '
+                         'in_all: false}\n', encoding="utf-8")
+    run("add", "reiner", "--password-stdin", stdin=PW + "\n")
+    capsys.readouterr()
+
+    def state_of(name="reiner"):
+        db = open_db()
+        try:
+            uid = db.get_user_by_name(name)["id"]
+            de = next((p for p in db.list_profiles(uid) if p["builtin"] == "de"), {"sources": None})
+            return db.get_settings(uid).get("all_extra_sources"), de["sources"]
+        finally:
+            db.close()
+
+    assert state_of() == (None, ["alpha"])
+    assert run("extra-sources", "Reiner", "sec", "sec") == 0
+    assert "reiner: zusätzlich in ALLE: sec" in capsys.readouterr().out
+    assert state_of() == (["sec"], ["alpha"])
+    assert run("extra-sources", "reiner", "sec", "pop", "--profile-de") == 0
+    assert "Profil Deutschland: sec, pop aufgenommen" in capsys.readouterr().out
+    assert state_of() == (["sec", "pop"], ["alpha", "sec", "pop"])
+    assert run("extra-sources", "reiner", "pop", "--profile-de") == 0
+    assert "enthält sie schon" in capsys.readouterr().out
+    assert state_of() == (["pop"], ["alpha", "sec", "pop"])      # aus dem Profil nimmt es nichts heraus
+    # Fehler: nichts geändert
+    for argv, msg in ((("reiner", "gibtsnicht"), "Unbekannte Quelle: gibtsnicht"),
+                      (("reiner", "sec", "alpha"), "Steht ohnehin in ALLE"),
+                      (("reiner", "--profile-de"), "mindestens eine Quelle"),
+                      (("niemand", "sec"), "Unbekannter Benutzer")):
+        assert run("extra-sources", *argv) == 1, argv
+        assert msg in capsys.readouterr().err, argv
+    assert state_of() == (["pop"], ["alpha", "sec", "pop"])
+    # Ohne Quelle: keine zusätzlichen mehr
+    assert run("extra-sources", "reiner") == 0
+    assert "reiner: keine zusätzlichen Quellen in ALLE" in capsys.readouterr().out
+    assert state_of()[0] == []
+    # Die anderen Benutzer bleiben unberührt
+    assert state_of("admin")[0] is None
+
+
 # ---- deploy/user.sh ---------------------------------------------------------------
 
 def _fake_ssh(tmp_path: Path) -> dict:
@@ -623,6 +671,11 @@ def test_user_sh_syntax_and_forwarding(tmp_path):
     assert args[1] == "bash -c 'cd /opt/kiosk && docker compose exec -T kiosk python -m app.users admin anna --on '"
     r = subprocess.run(["bash", str(script), "remove", "anna", "--yes"], env=env, text=True, capture_output=True)
     assert r.returncode == 0 and "app.users remove anna --yes" in (tmp_path / "args").read_text()
+    r = subprocess.run(["bash", str(script), "extra-sources", "reiner", "focus", "--profile-de"], env=env,
+                       text=True, capture_output=True)
+    assert r.returncode == 0, r.stderr
+    assert "app.users extra-sources reiner focus --profile-de '" in (tmp_path / "args").read_text()
+    assert (tmp_path / "stdin").read_text() == ""
     # Unbekannter Befehl: kein ssh
     (tmp_path / "args").unlink()
     r = subprocess.run(["bash", str(script), "drop", "anna"], env=env, text=True, capture_output=True)

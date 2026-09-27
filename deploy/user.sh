@@ -6,6 +6,7 @@
 #   bash deploy/user.sh disable anna | enable anna
 #   bash deploy/user.sh remove anna
 #   bash deploy/user.sh admin anna --on|--off
+#   bash deploy/user.sh extra-sources anna [focus ...] [--profile-de]   (ohne Quelle: keine)
 # Passwörter werden hier lokal verdeckt abgefragt (getpass) und über stdin an
 # `python -m app.users ... --password-stdin` durchgereicht: Sie stehen nie in einer
 # Kommandozeile, Prozessliste oder Shell-History.
@@ -14,14 +15,14 @@ BOX="${BOX:-kiosk-server}"
 DEST=/opt/kiosk
 
 usage() {
-  sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//' >&2
   exit 2
 }
 
 [ $# -ge 1 ] || usage
 cmd=$1
 case "$cmd" in
-  list|add|passwd|disable|enable|remove|admin) ;;
+  list|add|passwd|disable|enable|remove|admin|extra-sources) ;;
   -h|--help|help) usage ;;
   *) echo "Unbekannter Befehl: $cmd" >&2; usage ;;
 esac

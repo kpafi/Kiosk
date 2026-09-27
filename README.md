@@ -55,7 +55,14 @@ python -m app.users passwd <name> [--password-stdin]   # beendet alle Sitzungen 
 python -m app.users disable <name> | enable <name>     # sperren beendet ebenfalls alle Sitzungen
 python -m app.users remove <name> [--yes]              # löscht Lesestand, Profile, Favoriten, Einstellungen
 python -m app.users admin <name> --on|--off
+python -m app.users extra-sources <name> [quelle ...] [--profile-de]   # in_all:false-Quellen in ALLE
 ```
+
+`extra-sources` setzt die Einstellung `all_extra_sources` (siehe Filter): Die genannten Quellen (nur
+solche mit `in_all: false`, z. B. `focus`) stehen für diesen Benutzer in ALLE; ohne Quelle stehen keine
+mehr drin. `--profile-de` nimmt sie zusätzlich in sein Profil Deutschland auf (herausnehmen geht in der
+Oberfläche). Die laufende App übernimmt das sofort. Beispiel: `python -m app.users extra-sources reiner
+focus --profile-de`.
 
 Benutzernamen: 2 bis 32 Zeichen aus `a-z`, `0-9`, `.`, `_`, `-` (Groß- und Kleinschreibung zählt beim
 Anmelden nicht). Passwörter: mindestens 12 Zeichen ohne Leerzeichen am Rand, nicht gleich dem
@@ -134,10 +141,15 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
   Artikel“, `read-all` ohne Quelle, Suche ohne Quelle, `country` ohne Quelle, Profile mit
   `sources: null`, der ALLE-Zähler in `/api/bar` und `unread` in `/api/counts`): die aktivierten Quellen
   ohne die mit `in_all: false` in `sources.yaml` (heise Security, deren Meldungen auch bei heise online
-  stehen). Ausdrücklich genannt zählen sie: `source=heisesec`, Profile mit Quellenliste, die
-  Zähler in `/api/sources` (Feld `in_all`), Lieblingszeitungen und ihre Chips in der Leiste. Gemerkt
+  stehen, und FOCUS online). Ausdrücklich genannt zählen sie: `source=heisesec`, Profile mit Quellenliste, die
+  Zähler in `/api/sources`, Lieblingszeitungen und ihre Chips in der Leiste. Gemerkt
   (`starred`/`later`) zeigt wie bisher alles Gemerkte. Das vorgegebene Profil Deutschland lässt solche
   Quellen beim Anlegen weg.
+- Je Benutzer lassen sich solche Quellen doch in „alle Quellen“ aufnehmen: Einstellung
+  `all_extra_sources` (ohne Oberfläche; `python -m app.users extra-sources`). Das gilt dann für ihn
+  überall oben, auch in Tagesübersicht, Titelseite und rechter Seite; `in_all` in `/api/sources` ist
+  der Wert für den angemeldeten Benutzer (`true` für seine zusätzlichen Quellen). Profil-Zähler im
+  Zwischenspeicher gelten nur für dieselbe Quellenmenge.
 - `profile=<id>`: Quellen des Profils (geschnitten mit den aktivierten Quellen; `sources: null` heißt
   alle aktivierten außer `in_all: false`) und, falls vorhanden, Suchbegriffe: jeder Begriff als Präfix-Phrase über den
   Volltextindex, ODER-verknüpft. Die Sortierung bleibt chronologisch (Keyset-Cursor wie ohne Profil).
@@ -185,9 +197,11 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
 - Einstellungen: `theme` (`system`/`dark`/`light`), `text_size` (`s`/`m`/`l`), `mark_read_on_open`,
   `show_images`, `free_only` (boolesch, streng), `bar_order` (Liste aus `source:<id>`/`profile:<id>`),
   `desktop_empty` (`overview`/`frontpage`: was am Desktop rechts steht, wenn kein Artikel offen ist),
-  `focus_mode` (boolesch, Fokusmodus am Desktop). Standard: `dark`, `m`, `true`, `true`, `true`, `[]`,
-  `overview`, `false`. Unbekannte Felder, andere Werte oder `null`: 422; ein ungültiger gespeicherter
-  Wert zählt nicht (Standard).
+  `focus_mode` (boolesch, Fokusmodus am Desktop), `all_extra_sources` (Liste von Quellen-IDs mit
+  `in_all: false`, die für den Benutzer in ALLE stehen, siehe Filter; höchstens 200, Dubletten fallen
+  weg, unbekannte Quellen: 400). Standard: `dark`, `m`, `true`, `true`, `true`, `[]`,
+  `overview`, `false`, `[]`. Unbekannte Felder, andere Werte oder `null`: 422; ein ungültiger gespeicherter
+  Wert zählt nicht (Standard), eine gespeicherte, nicht mehr vorhandene Quelle auch nicht.
   `free_only` bleibt nur aus Kompatibilität: `false` wird angenommen und gespeichert, hat aber keine
   Wirkung (Paywall-Artikel sind nie sichtbar); die Oberfläche zeigt den Schalter nicht mehr.
 - `counts` zählt `unread`, `later` und `starred` immer ohne Paywall-Artikel (wie die Listen).
@@ -218,7 +232,7 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
   The Local (Deutschland, Österreich, ...) und heise/heise Security je einmal, dieselbe Agenturmeldung
   in zwei Zeitungen aber doppelt. Gezählt werden nur Artikel, die zum Zeitraum passen (Übersicht und
   Aufmacher: heute; zum offenen Artikel: höchstens 36 h davor oder danach). Alle Listen hier zeigen nur
-  Quellen wie ALLE (aktiviert, ohne `in_all: false`), keine Paywall-Artikel, und beachten die
+  Quellen wie ALLE (aktiviert, ohne `in_all: false` außer `all_extra_sources`), keine Paywall-Artikel, und beachten die
   Aufbewahrungsgrenze; die Einträge haben die Form der Artikelliste.
 - `GET /api/articles/{id}/related` (404 wie `GET /api/articles/{id}`): `same_story` sind die anderen
   Artikel der Geschichte aus anderen Zeitungen (die eigene fehlt), höchstens 12, je Zeitung einer, in
@@ -299,8 +313,9 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
 - `include_paths` (optional, je Quelle in `sources.yaml`): Liste regulärer Ausdrücke; nur Einträge,
   deren URL-Pfad auf einen davon passt (`re.search`), werden angelegt. Gilt für Feeds und Sitemaps,
   vor der Grenze von 300 Einträgen und vor dem Zählen neuer Artikel (GEA: nur Lokalressorts; FOCUS
-  online per negativem Lookahead ohne `kultur/stars`, `kultur/kino-tv`, `kultur/royals`, `die-debatte`
-  und `tagesthema`). Hat der Filter alles verworfen, gilt der Abruf als erfolgreich (0 neue), ebenso
+  online per negativem Lookahead ohne `kultur/stars`, `kultur/kino-tv`, `kultur/royals`, `die-debatte`,
+  `tagesthema` und die Ratgeber `gesundheit`, `familie`, `panorama/oktoberfest`, `reisen/fernreisen`,
+  `finanzen/altersvorsorge`, `finanzen/karriere`, `immobilien/kaufen`, `auto/fahrberichte`). Hat der Filter alles verworfen, gilt der Abruf als erfolgreich (0 neue), ebenso
   eine leere Sitemap.
 - `guid_pattern` (optional): regulärer Ausdruck mit genau einer Gruppe, auf die Eintrags-URL angewandt;
   die Gruppe ist die GUID (GEA: `_arid,(\d+)`, die Artikelnummer), passt er nicht, bleibt die übliche.

@@ -84,6 +84,8 @@ Gleicher Server wie secure-chat und MailDigest (203.0.113.10, SSH-Alias `kiosk-s
   Passwort lokal zweimal verdeckt ab und reicht es über stdin (`--password-stdin`) durch; es steht nie in
   einer Kommandozeile oder Shell-History. `remove` fragt lokal nach und ruft dann mit `--yes` auf.
   Anderer SSH-Alias: `BOX=... bash deploy/user.sh ...`.
+  Quellen mit `in_all: false` für ein Konto in ALLE: `bash deploy/user.sh extra-sources reiner focus
+  --profile-de` (ohne Quelle: keine mehr).
 - Passwörter ändern: `bash deploy/user.sh passwd <name>`. `KIOSK_PASSWORD` in der `.env` legt nur beim
   ersten Start (bzw. beim Umbau auf Schema 6) den Admin `KIOSK_ADMIN_USER` (Standard `admin`) an und wird
   danach ignoriert. Die Prüfung von deploy.sh braucht kein Passwort; nach einem `passwd` muss die `.env`

@@ -38,6 +38,9 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     "show_images": True, "free_only": True, "bar_order": [],
     # Desktop: rechte Seite ohne offenen Artikel (Tagesübersicht oder Titelseite), Fokusmodus.
     "desktop_empty": "overview", "focus_mode": False,
+    # Quellen mit in_all: false, die für diesen Benutzer doch zu „alle Quellen“ zählen (implicit_sources);
+    # ohne Oberfläche, gesetzt per PATCH /api/settings oder python -m app.users extra-sources.
+    "all_extra_sources": [],
 }
 # Erlaubte Werte der Auswahl-Einstellungen; gespeicherte andere Werte zählen nicht (Standard gilt).
 SETTINGS_CHOICES: dict[str, tuple[str, ...]] = {
@@ -85,6 +88,8 @@ def ui_settings(user_id: int) -> dict[str, Any]:
             if key in SETTINGS_CHOICES and stored[key] not in SETTINGS_CHOICES[key]:
                 continue
             out[key] = stored[key]
+    # Nur Quellen aus dem Katalog; entfernte fallen still weg.
+    out["all_extra_sources"] = [s for s in out["all_extra_sources"] if isinstance(s, str) and s in state.catalog]
     return out
 
 
@@ -94,19 +99,29 @@ def enabled_sources() -> list[str]:
     return [s.id for s in state.catalog.all() if s.id in enabled]
 
 
-def implicit_sources() -> list[str]:
+def in_all_ids(user_id: int) -> set[str]:
+    """Quellen, die für den Benutzer zu „alle Quellen“ gehören (aktiviert oder nicht): alle ohne
+    in_all: false in sources.yaml, dazu seine Einstellung all_extra_sources."""
+    extra = set(ui_settings(user_id)["all_extra_sources"])
+    return {s.id for s in state.catalog.all() if s.in_all or s.id in extra}
+
+
+def implicit_sources(user_id: int) -> list[str]:
     """„Alle Quellen“, wo keine Quelle ausdrücklich genannt ist (ALLE, Profile ohne Quellenliste,
     Suche ohne Quelle, auch mit Länderfilter): die aktivierten ohne die mit in_all: false in
-    sources.yaml. Wird eine Quelle ausdrücklich genannt (?source=, Profil-Liste), zählt sie trotzdem."""
+    sources.yaml, außer der Benutzer hat sie in all_extra_sources. Wird eine Quelle ausdrücklich
+    genannt (?source=, Profil-Liste), zählt sie trotzdem. Hängt vom Benutzer ab: Was damit
+    zwischengespeichert wird, braucht die Quellenliste oder den Benutzer im Schlüssel."""
     enabled = set(state.db.enabled_source_ids())
-    return [s.id for s in state.catalog.all() if s.id in enabled and s.in_all]
+    wanted = in_all_ids(user_id)
+    return [s.id for s in state.catalog.all() if s.id in enabled and s.id in wanted]
 
 
-def effective_sources(profile: dict[str, Any]) -> list[str]:
+def effective_sources(user_id: int, profile: dict[str, Any]) -> list[str]:
     """Wirksame Quellen eines Profils: seine Liste geschnitten mit den aktivierten; ohne Liste
-    implicit_sources()."""
+    implicit_sources() des Benutzers."""
     if profile["sources"] is None:
-        return implicit_sources()
+        return implicit_sources(user_id)
     wanted = set(profile["sources"])
     return [s for s in enabled_sources() if s in wanted]
 
@@ -122,11 +137,11 @@ def article_scope(user_id: int, sources: list[str], countries: set[str], profile
                   *, only_enabled: bool = True) -> tuple[list[str] | None, list[str]]:
     """Filterkontext: (Quellen oder None = alle, Profil-Begriffe). Leere Liste = nichts passt.
 
-    Ohne ausdrückliche Quelle und ohne Profil gelten nur implicit_sources() (ALLE, auch mit
+    Ohne ausdrückliche Quelle und ohne Profil gelten nur implicit_sources(user_id) (ALLE, auch mit
     Länderfilter oder Suche); only_enabled=False (Gemerkt) lässt dann alle Quellen zu."""
     scope: list[str] | None = list(sources) if sources else None
     if scope is None and profile_id is None and only_enabled:
-        scope = implicit_sources()
+        scope = implicit_sources(user_id)
     if countries:
         scope = _intersect(scope, [s.id for s in state.catalog.all() if s.country in countries])
     terms: list[str] = []
@@ -134,14 +149,15 @@ def article_scope(user_id: int, sources: list[str], countries: set[str], profile
         profile = state.db.get_profile(user_id, profile_id)
         if profile is None:
             raise HTTPException(404, "Profil nicht gefunden")
-        scope = _intersect(scope, effective_sources(profile))
+        scope = _intersect(scope, effective_sources(user_id, profile))
         terms = profile["terms"]
     return scope, terms
 
 
-# (Benutzer-ID, Profil-ID) -> (Zeitpunkt, Ende des letzten Sammellaufs, Tagesbeginn, Zahl);
-# Zahl None: Zählung zu teuer (Zeitlimit), gilt SLOW_PROFILE_TTL lang.
-_unread_cache: dict[tuple[int, int], tuple[float, Any, str, int | None]] = {}
+# (Benutzer-ID, Profil-ID) -> (Zeitpunkt, Ende des letzten Sammellaufs, Tagesbeginn, Zahl, Quellen);
+# Zahl None: Zählung zu teuer (Zeitlimit), gilt SLOW_PROFILE_TTL lang. Andere Quellen als beim
+# Zählen (Quelle umgeschaltet, all_extra_sources geändert, auch aus der Kommandozeile): ungültig.
+_unread_cache: dict[tuple[int, int], tuple[float, Any, str, int | None, tuple[str, ...]]] = {}
 
 
 def invalidate_unread(user_id: int | None = None, *, profile_id: int | None = None) -> None:
@@ -177,7 +193,10 @@ def profile_unread(user_id: int, profile: dict[str, Any], sources: list[str],
     run = state.fetcher.state.get("last_finished")
     day = state.db.today_start()
     key = (user_id, profile["id"])
+    scope = tuple(sorted(sources))
     hit = _unread_cache.get(key)
+    if hit and hit[4] != scope:
+        hit = None
     now = time.monotonic()
     if hit and hit[3] is None and now - hit[0] < SLOW_PROFILE_TTL:
         return None
@@ -196,14 +215,14 @@ def profile_unread(user_id: int, profile: dict[str, Any], sources: list[str],
             return None  # nur das Restbudget war zu knapp: beim nächsten Mal wieder versuchen
         # Zu teures Profil: nicht zählen, statt Profilliste und Leiste scheitern zu lassen.
         log.warning("Zähler für Profil %s (Benutzer %s) abgebrochen: Zeitlimit", profile["id"], user_id)
-        _unread_cache[key] = (now, run, day, None)
+        _unread_cache[key] = (now, run, day, None, scope)
         return None
-    _unread_cache[key] = (now, run, day, n)
+    _unread_cache[key] = (now, run, day, n, scope)
     return n
 
 
 def _profile_view(user_id: int, profile: dict[str, Any], budget: CountBudget | None = None) -> dict[str, Any]:
-    sources = effective_sources(profile)
+    sources = effective_sources(user_id, profile)
     return {**profile, "source_count": len(sources),
             "unread": profile_unread(user_id, profile, sources, budget)}
 
@@ -380,11 +399,11 @@ def _bar(user_id: int) -> dict[str, Any]:
     budget = CountBudget()   # eines für alle Profile der Leiste
     for p in state.db.list_profiles(user_id):
         if p["in_bar"]:
+            unread_p = profile_unread(user_id, p, effective_sources(user_id, p), budget)
             entries[f"profile:{p['id']}"] = {"type": "profile", "id": p["id"], "key": f"profile:{p['id']}",
-                                             "label": p["name"].upper(),
-                                             "unread": profile_unread(user_id, p, effective_sources(p), budget)}
+                                             "label": p["name"].upper(), "unread": unread_p}
     ordered = [entries.pop(k) for k in ui_settings(user_id)["bar_order"] if k in entries]
-    total = state.db.article_counts(user_id, implicit_sources())["unread"]
+    total = state.db.article_counts(user_id, implicit_sources(user_id))["unread"]
     return {"items": [{"type": "all", "key": "all", "label": "ALLE", "unread": total},
                       *ordered, *entries.values()]}
 
@@ -428,6 +447,7 @@ class SettingsPatch(BaseModel):
     bar_order: list[BarKey] | None = Field(None, max_length=400)
     desktop_empty: Literal["overview", "frontpage"] | None = None
     focus_mode: StrictBool | None = None
+    all_extra_sources: list[str] | None = Field(None, max_length=MAX_SOURCE_IDS)
 
 
 @router.get("/settings")
@@ -444,6 +464,12 @@ async def patch_settings(body: SettingsPatch, user: User):
     if "bar_order" in values:
         _check_bar_keys(user["id"], values["bar_order"])
         values["bar_order"] = list(dict.fromkeys(values["bar_order"]))
+    if "all_extra_sources" in values:
+        # Bekannte Quellen (sonst 400 wie bei bar_order); eine mit in_all: true schadet nicht (ist ohnehin in ALLE).
+        unknown = [s for s in values["all_extra_sources"] if s not in state.catalog]
+        if unknown:
+            raise HTTPException(400, f"Unbekannte Quellen: {', '.join(unknown[:5])}")
+        values["all_extra_sources"] = list(dict.fromkeys(values["all_extra_sources"]))
     state.db.set_settings(user["id"], values)
     return ui_settings(user["id"])
 
@@ -457,7 +483,7 @@ async def counts(user: User):
     enabled = [sid for sid in catalog_ids if sid in states and states[sid]["enabled"]]
     return {
         # unread: wie ALLE (implicit_sources), ohne Paywall; later/starred: alle gemerkten (wie Gemerkt)
-        **state.db.article_counts(user["id"], implicit_sources()),
+        **state.db.article_counts(user["id"], implicit_sources(user["id"])),
         "profiles": len(state.db.list_profiles(user["id"])),
         "favorites": sum(1 for f in state.db.list_favorites(user["id"]) if f["source_id"] in state.catalog),
         "sources_enabled": len(enabled),

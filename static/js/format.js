@@ -315,3 +315,51 @@ export function isSmallImageUrl(url) {
   }
   return false;
 }
+
+// ---- Rechte Seite am Desktop (Tagesübersicht, Titelseite) ------------------------------------
+
+const WEEKDAYS = ['Sonntag', 'Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag'];
+const MONTH_NAMES = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September',
+  'Oktober', 'November', 'Dezember'];
+
+/** Tag als Date (Ortszeit): 'YYYY-MM-DD' (Kalendertag vom Server) oder Date; sonst null. */
+function asDay(value) {
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ''));
+  return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : null;
+}
+
+/** „Samstag 27. September“ (Versalien übernimmt CSS). */
+export function longDate(value) {
+  const d = asDay(value);
+  return d ? `${WEEKDAYS[d.getDay()]} ${d.getDate()}. ${MONTH_NAMES[d.getMonth()]}` : '';
+}
+
+/** „Sa 27.09.“ */
+export function shortDate(value) {
+  const d = asDay(value);
+  return d ? `${WEEKDAYS[d.getDay()].slice(0, 2)} ${pad(d.getDate())}.${pad(d.getMonth() + 1)}.` : '';
+}
+
+/** Uhrzeit „18:40“. */
+export function clockTime(d = new Date()) {
+  return hhmm(d);
+}
+
+/**
+ * Punkt-Histogramm: Füllhöhe je Stunde in 0..rows Punkten, ceil(n / max * rows); 0 bleibt 0, jede
+ * Stunde mit Artikeln hat mindestens einen Punkt. Fehlende oder kaputte Werte zählen als 0.
+ */
+export function histogramLevels(counts, rows = 6) {
+  const values = (Array.isArray(counts) ? counts : []).map((n) => (Number.isFinite(n) && n > 0 ? n : 0));
+  const max = Math.max(0, ...values);
+  return values.map((n) => (max && n ? Math.min(rows, Math.ceil((n / max) * rows)) : 0));
+}
+
+/** Quellenzeile einer Geschichte: „SPIEGEL, GUARDIAN, NZZ +7“ (gezeigte Kurznamen, Rest als +N). */
+export function sourcesLine(names, total) {
+  const list = (names || []).filter(Boolean);
+  const rest = (Number(total) || 0) - list.length;
+  if (rest <= 0) return list.join(', ');
+  return list.length ? `${list.join(', ')} +${rest}` : `+${rest}`;
+}

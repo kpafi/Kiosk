@@ -2,6 +2,8 @@
 Einstellungen, Zähler sowie die Erweiterungen der Artikelliste."""
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -437,7 +439,7 @@ def test_bar_order(authed):
 def test_settings_defaults_and_validation(authed):
     assert authed.get("/api/settings").json() == {
         "theme": "dark", "text_size": "m", "mark_read_on_open": True, "show_images": True,
-        "free_only": True, "bar_order": []}
+        "free_only": True, "bar_order": [], "desktop_empty": "overview", "focus_mode": False}
     assert authed.patch("/api/settings", json={"theme": "system"}).json()["theme"] == "system"
     r = authed.patch("/api/settings", json={"theme": "light", "show_images": False})
     assert r.status_code == 200 and r.json()["theme"] == "light" and r.json()["show_images"] is False
@@ -739,3 +741,512 @@ def test_in_all_false_source_stays_in_saved_lists(sec_client):
     assert _ids(c.get("/api/articles", params={"later": "true"}).json()) == [sec_id]
     counts = c.get("/api/counts").json()
     assert counts["starred"] == 1 and counts["later"] == 1
+
+
+# ---- Geschichten: rechte Seite am Desktop (related, overview, frontpage) -------------------
+
+STORY_SOURCES = (
+    '  - {id: delta, name: Delta, short: "DEL", country: DE, lang: de, feed: "https://delta.example/feed", '
+    'homepage: "https://delta.example"}\n'
+    '  - {id: eps, name: Epsilon, country: GB, lang: en, feed: "https://eps.example/feed", '
+    'homepage: "https://eps.example"}\n'
+    '  - {id: zeta, name: Zeta, country: DE, lang: de, feed: "https://zeta.example/feed", '
+    'homepage: "https://zeta.example", in_all: false}\n'
+    '  - {id: thelocalde, name: The Local DE, country: DE, lang: en, feed: "https://tlde.example/feed", '
+    'homepage: "https://tlde.example"}\n'
+    '  - {id: thelocalat, name: The Local AT, country: AT, lang: en, feed: "https://tlat.example/feed", '
+    'homepage: "https://tlat.example"}\n'
+)
+
+
+@pytest.fixture
+def story_client(app_env):
+    """Katalog alpha (de), beta (en), gamma (aus), delta (de), eps (en), zeta (de, in_all: false)."""
+    from conftest import SOURCES_YAML
+    from app import stories
+    (app_env / "sources.yaml").write_text(SOURCES_YAML + STORY_SOURCES, encoding="utf-8")
+    _STORIES.clear()
+    stories._model = None               # kein Modell eines früheren Tests (fremde Artikel-IDs)
+    with TestClient(app, base_url=ORIGIN) as c:
+        assert c.post("/api/login", json={"username": "admin", "password": "geheim-und-lang"}).status_code == 204
+        stories._model = None           # auch nicht das des Starts (leere Datenbank)
+        yield c
+    _STORIES.clear()
+    stories._model = None
+
+
+def _add(source: str, n: int, hours: float, *, story: str | None = None, image: bool = False,
+         paywalled: bool = False, title: str | None = None, summary: str | None = None) -> int:
+    """Legt einen Artikel an (story: Name der Geschichte, siehe _link_stories) und gibt die ID zurück."""
+    state.db.upsert_articles([make_row(source, n, ago(hours=hours), title=title or f"{source} {n} {story or ''}",
+                                       summary=summary or f"Anreißer {source} {n}",
+                                       image_url="https://img.example/x.jpg" if image else None)])
+    aid = state.db.one("SELECT id FROM articles WHERE guid=?", (f"{source}-{n}",))["id"]
+    if paywalled:
+        state.db.q("UPDATE articles SET paywalled=1 WHERE id=?", (aid,))
+    if story:
+        _STORIES.setdefault(story, []).append(aid)
+    return aid
+
+
+_STORIES: dict[str, list[int]] = {}
+
+
+def _link_stories() -> dict[str, int]:
+    """story_id wie der Lauf in app/stories.py: kleinste Artikel-ID der Geschichte."""
+    out = {}
+    for name, ids in _STORIES.items():
+        out[name] = min(ids)
+        state.db.set_story_ids([(min(ids), i) for i in ids])
+    _STORIES.clear()
+    return out
+
+
+def test_related_same_story_order_scope_and_paywall(story_client):
+    c = story_client
+    me = _add("alpha", 1, 2, story="s")
+    older_same = _add("alpha", 2, 5, story="s")
+    en_new = _add("beta", 1, 1, story="s")
+    _add("beta", 2, 4, story="s")                      # älter, gleiche Quelle: nur der neueste zählt
+    de_other = _add("delta", 1, 6, story="s")
+    _add("eps", 1, 1, story="s", paywalled=True)       # Paywall: ausgeblendet
+    _add("gamma", 1, 1, story="s")                     # Quelle ausgeschaltet
+    _add("zeta", 1, 1, story="s")                      # nicht in ALLE
+    sid = _link_stories()["s"]
+    body = c.get(f"/api/articles/{me}/related").json()
+    assert set(body) == {"story_id", "sources_count", "same_story", "topic"}
+    assert body["story_id"] == sid and body["sources_count"] == 3          # alpha, beta, delta
+    # Nur andere Zeitungen (die eigene fehlt), deutschsprachige vor englischen, dann die neuesten; je
+    # Zeitung einer.
+    assert [it["id"] for it in body["same_story"]] == [de_other, en_new]
+    assert older_same not in {it["id"] for it in body["topic"]}
+    assert me not in {it["id"] for it in body["topic"]}
+    # Gleiche Form wie die Liste
+    listed = {it["id"]: it for it in c.get("/api/articles").json()["items"]}
+    assert set(body["same_story"][0]) == set(listed[de_other])
+    assert body["same_story"][0] == listed[de_other]
+
+
+def test_related_without_story_and_unknown_article(story_client):
+    c = story_client
+    alone = _add("alpha", 1, 1)
+    assert c.get(f"/api/articles/{alone}/related").json() == {
+        "story_id": None, "sources_count": 1, "same_story": [], "topic": []}
+    assert c.get("/api/articles/999999/related").status_code == 404
+    assert c.get("/api/articles/0/related").status_code == 422
+
+
+def test_related_counts_newspapers_and_hides_copies_of_the_open_article(story_client):
+    """Eine wortgleiche Kopie des offenen Artikels erscheint nicht als „andere Zeitung“; die Zahl der
+    Zeitungen zählt, was die Seite zeigt (die eigene und die gelisteten), damit Kopf und Liste passen."""
+    c = story_client
+    text = "Wortgleicher Agenturtext über das Ereignis, lang genug für eine Kopie."
+    me = _add("alpha", 1, 2, story="s", title="Gleiche Meldung", summary=text)
+    copy = _add("delta", 1, 1, story="s", title="Gleiche Meldung", summary=text)
+    other = _add("beta", 1, 1, story="s", title="Other report", summary="Another text about it.")
+    _link_stories()
+    body = c.get(f"/api/articles/{me}/related").json()
+    assert body["sources_count"] == 2
+    assert [it["id"] for it in body["same_story"]] == [other] and copy not in {it["id"] for it in body["topic"]}
+
+
+def test_related_counts_only_members_near_the_article(story_client):
+    """Zur Geschichte zählen nur Artikel höchstens 36 h vom offenen Artikel entfernt (alte, übernommene
+    Mitglieder einer weiterlaufenden Geschichte blähen die Zahl nicht auf)."""
+    c = story_client
+    me = _add("alpha", 1, 2, story="s")
+    near = _add("beta", 1, 20, story="s")
+    far = _add("delta", 1, 24 * 4, story="s")
+    _link_stories()
+    body = c.get(f"/api/articles/{me}/related").json()
+    assert body["sources_count"] == 2 and [it["id"] for it in body["same_story"]] == [near]
+    assert far not in {it["id"] for it in body["topic"]}
+
+
+def test_frontpage_sections_cover_the_whole_day(story_client):
+    """Die Rubriken wählen aus allen Artikeln der letzten 24 h (in SQL gruppiert), nicht nur aus den
+    neuesten: eine Geschichte von vor 20 h mit zwei Zeitungen schlägt 320 neuere Einzelmeldungen."""
+    c = story_client
+    state.db.upsert_articles([make_row("alpha", 1000 + i, ago(minutes=5 + i)) for i in range(320)])
+    story = [_add("alpha", 1, 20, story="old"), _add("delta", 1, 20.5, story="old")]
+    for src in ("beta", "eps", "delta"):                      # größere Geschichte: der Aufmacher
+        _add(src, 2, 3, story="lead")
+    sid = _link_stories()["old"]
+    de = next(s for s in c.get("/api/frontpage").json()["sections"] if s["name"] == "Deutschland")
+    first = de["items"][0]
+    assert first["sources_count"] == 2 and state.db.story_id_of(first["article"]["id"]) == sid
+    assert first["article"]["id"] in story
+
+
+def test_story_pages_degrade_instead_of_failing_on_timeouts(story_client, monkeypatch):
+    from app.db import QueryTimeout
+    c = story_client
+    _add("alpha", 1, 2, story="s")
+    _add("beta", 1, 1, story="s")
+    _add("delta", 1, 1, story="s")
+    _link_stories()
+
+    def slow(*a, **kw):
+        raise QueryTimeout("zu langsam")
+
+    monkeypatch.setattr(state.db, "top_stories", slow)
+    monkeypatch.setattr(state.db, "profile_story_groups", slow)
+    ov = c.get("/api/overview")
+    assert ov.status_code == 200 and ov.json()["top_stories"] == [] and ov.json()["counts"]["new_today"] == 3
+    fp = c.get("/api/frontpage")
+    assert fp.status_code == 200 and fp.json()["lead"] is None and fp.json()["sections"] == []
+
+
+def test_story_pages_keep_what_fits_into_a_partly_used_budget(story_client, monkeypatch):
+    """Frisst eine Abfrage das Zeitbudget der Seite fast auf, fehlt nur, was danach käme."""
+    import time as time_mod
+
+    from app import main
+    c = story_client
+    for src in ("alpha", "beta", "delta"):
+        _add(src, 1, 1, story="s")
+    _link_stories()
+    monkeypatch.setattr(main, "STORY_PAGE_BUDGET", 0.3)
+    real = state.db.published_since
+
+    def slow(*a, **kw):
+        out = real(*a, **kw)
+        time_mod.sleep(0.35)
+        return out
+
+    monkeypatch.setattr(state.db, "published_since", slow)
+    ov = c.get("/api/overview")
+    assert ov.status_code == 200
+    body = ov.json()
+    assert body["counts"]["new_today"] == 3 and sum(body["hourly"]) == 3 and body["top_stories"] == []
+
+
+def test_story_pages_survive_timeouts_of_counts_and_members(story_client, monkeypatch):
+    from app.db import QueryTimeout
+    c = story_client
+    me = _add("alpha", 1, 2, story="s")
+    _add("beta", 1, 1, story="s")
+    _link_stories()
+
+    def slow(*a, **kw):
+        raise QueryTimeout("zu langsam")
+
+    monkeypatch.setattr(state.db, "article_counts", slow)
+    ov = c.get("/api/overview")
+    assert ov.status_code == 200 and ov.json()["counts"]["unread_today"] is None
+    monkeypatch.setattr(state.db, "story_articles", slow)
+    monkeypatch.setattr(state.db, "story_member_ids", slow)
+    rel = c.get(f"/api/articles/{me}/related")
+    assert rel.status_code == 200 and rel.json()["same_story"] == [] and rel.json()["story_id"] is not None
+
+
+def test_top_stories_count_newspapers_in_sql(story_client):
+    """Ausgaben eines Verlags (The Local DE und AT) zählen schon in der Abfrage als eine Zeitung: 16
+    neuere Geschichten aus Alpha und zwei The-Local-Ausgaben (zwei Zeitungen) verdrängen die ältere mit
+    drei Zeitungen nicht aus der Vorauswahl."""
+    c = story_client
+    for k in range(16):
+        for src in ("alpha", "thelocalde", "thelocalat"):
+            _add(src, 100 + k, 0.5, story=f"tl{k}")
+    for src in ("alpha", "beta", "delta"):
+        _add(src, 1, 3, story="real")
+    sids = _link_stories()
+    top = c.get("/api/overview").json()["top_stories"]
+    assert [s["story_id"] for s in top] == [sids["real"]] and top[0]["sources_count"] == 3
+
+
+def test_representative_and_same_story_order_follow_centrality(story_client, monkeypatch):
+    """Vertreter und Reihenfolge nach Mittigkeit (stories.centrality): Ein deutscher Artikel, der nur
+    einen Nebenaspekt erzählt, verliert gegen einen mittigen englischen; unter den mittigen gewinnt der
+    deutsche. Englische Artikel, die mit dem offenen nicht erkennbar dasselbe erzählen, fehlen."""
+    from app import stories
+    c = story_client
+    side_de = _add("alpha", 1, 1, story="s", image=True)
+    central_en = _add("beta", 1, 2, story="s", image=True)
+    central_de = _add("delta", 1, 3, story="s")
+    other_en = _add("eps", 1, 2, story="s")
+    _link_stories()
+    scores = {side_de: 0.2, central_en: 0.9, central_de: 0.8, other_en: 0.85}
+    monkeypatch.setattr(stories, "central_scores", lambda ids: {i: scores[i] for i in ids if i in scores})
+    top = c.get("/api/overview").json()["top_stories"]
+    assert top[0]["article"]["id"] == central_de                  # mittig (>= 0.85 * 0.9) und deutsch
+    monkeypatch.setattr(stories, "shown_with", lambda a, b: b != other_en)
+    same = [it["id"] for it in c.get(f"/api/articles/{side_de}/related").json()["same_story"]]
+    assert same == [central_de, central_en]
+
+
+def test_related_without_story_shows_the_same_event_as_same_story(story_client, monkeypatch):
+    """Ohne Geschichte: Artikel anderer Zeitungen, die dasselbe Ereignis erzählen (stories.same_event_ids),
+    stehen unter „dieselbe Geschichte“ (gezählt wie gelistet), nicht unter den Themen."""
+    from app import stories
+    c = story_client
+    me = _add("alpha", 1, 2)
+    other = _add("beta", 1, 1)
+    hidden = _add("zeta", 1, 1)                       # nicht in ALLE: fehlt auch hier
+    monkeypatch.setattr(stories, "same_event_ids", lambda row, exclude: [other, hidden])
+    monkeypatch.setattr(stories, "topic_ids", lambda db, row, exclude, **kw: [i for i in (other,) if i not in exclude])
+    body = c.get(f"/api/articles/{me}/related").json()
+    assert body["story_id"] is None and [it["id"] for it in body["same_story"]] == [other]
+    assert body["sources_count"] == 2 and body["topic"] == []
+
+
+def test_related_without_story_keeps_the_candidates_stories_out_of_topics(story_client, monkeypatch):
+    """Gehört ein Artikel desselben Ereignisses zu einer Geschichte, ist keines ihrer Mitglieder ein Thema."""
+    from app import stories
+    c = story_client
+    me = _add("alpha", 1, 2)
+    other = _add("beta", 1, 1, story="s")
+    member = _add("delta", 1, 1, story="s")
+    unrelated = _add("eps", 1, 1)
+    _link_stories()
+    monkeypatch.setattr(stories, "same_event_ids", lambda row, exclude: [other])
+    monkeypatch.setattr(stories, "topic_ids", lambda db, row, exclude, **kw: [i for i in (member, unrelated)
+                                                                        if i not in exclude])
+    body = c.get(f"/api/articles/{me}/related").json()
+    assert [it["id"] for it in body["same_story"]] == [other]
+    assert [it["id"] for it in body["topic"]] == [unrelated]
+
+
+def test_related_passes_the_story_id_to_topics(story_client, monkeypatch):
+    """Auch vor dem Fenster (außerhalb des Modells) kennt topic_ids die Geschichte des Artikels."""
+    from app import stories
+    c = story_client
+    me = _add("alpha", 1, 24 * 5, story="old")
+    _add("beta", 1, 24 * 5, story="old")
+    sid = _link_stories()["old"]
+    seen = {}
+
+    def spy(db, row, exclude, **kw):
+        seen["story_id"] = row.get("story_id")
+        return []
+
+    monkeypatch.setattr(stories, "topic_ids", spy)
+    assert c.get(f"/api/articles/{me}/related").status_code == 200
+    assert seen["story_id"] == sid
+
+
+def test_overview_and_frontpage_just_after_midnight_use_the_last_24_hours(story_client, monkeypatch):
+    """Um 00:05 KIOSK_TZ hat „heute“ noch keine Geschichte: Meistberichtet und Aufmacher kommen aus den
+    letzten 24 Stunden (window „24h“), Zähler und Stunden bleiben bei heute."""
+    c = story_client
+    for src in ("alpha", "beta", "delta"):
+        _add(src, 1, 2, story="night")
+    sids = _link_stories()
+    midnight = (datetime.now(timezone.utc) - timedelta(minutes=5)).replace(microsecond=0).isoformat()   # seit 00:05
+    monkeypatch.setattr(state.db, "today_start", lambda now=None: midnight)
+    ov = c.get("/api/overview").json()
+    assert ov["window"] == "24h" and [s["story_id"] for s in ov["top_stories"]] == [sids["night"]]
+    assert ov["counts"]["new_today"] == 0 and sum(ov["hourly"]) == 0
+    fp = c.get("/api/frontpage").json()
+    assert fp["window"] == "24h" and fp["lead"]["story_id"] == sids["night"]
+
+
+def test_top_story_names_and_active_sources_count_newspapers(story_client):
+    """The Local Deutschland und Österreich sind eine Zeitung: ein Kurzname, eine aktive Zeitung."""
+    c = story_client
+    for src in ("alpha", "thelocalde", "thelocalat", "beta"):
+        _add(src, 1, 1, story="s")
+    _link_stories()
+    ov = c.get("/api/overview").json()
+    top = ov["top_stories"][0]
+    assert top["sources_count"] == 3 and len(top["sources"]) == 3
+    assert ov["counts"]["active_sources"] == 3 and ov["counts"]["new_today"] == 4
+
+
+def test_overview_day_query_timeout_gives_nulls(story_client, monkeypatch):
+    from app.db import QueryTimeout
+    c = story_client
+    _add("alpha", 1, 1)
+
+    def slow(*a, **kw):
+        raise QueryTimeout("zu langsam")
+
+    monkeypatch.setattr(state.db, "published_since", slow)
+    body = c.get("/api/overview").json()
+    assert body["counts"]["new_today"] is None and body["counts"]["active_sources"] is None
+    assert body["hourly"] == []
+
+
+def test_related_runs_under_one_budget(story_client, monkeypatch):
+    """Alle Abfragen von /related teilen ein Zeitbudget; ist es verbraucht, bleibt die Seite leer statt 503."""
+    import time as time_mod
+
+    from app import main
+    c = story_client
+    me = _add("alpha", 1, 2, story="s")
+    _add("beta", 1, 1, story="s")
+    _link_stories()
+    monkeypatch.setattr(main, "STORY_PAGE_BUDGET", 0.2)
+    real = state.db.story_articles
+
+    def slow(*a, **kw):
+        out = real(*a, **kw)
+        time_mod.sleep(0.25)
+        return out
+
+    monkeypatch.setattr(state.db, "story_articles", slow)
+    rel = c.get(f"/api/articles/{me}/related")
+    assert rel.status_code == 200 and rel.json()["same_story"] == [] and rel.json()["topic"] == []
+
+
+def test_single_paper_story_counts_as_no_story(story_client):
+    """Eine übrig gebliebene story_id, die nur noch eine Zeitung trägt, ist keine Geschichte."""
+    c = story_client
+    me = _add("alpha", 1, 2, story="s")
+    _add("alpha", 2, 1, story="s")                 # dieselbe Zeitung
+    _link_stories()
+    body = c.get(f"/api/articles/{me}/related").json()
+    assert body["story_id"] is None and body["same_story"] == [] and body["sources_count"] == 1
+
+
+def test_related_old_article_is_404_for_others(story_client):
+    """Wie GET /api/articles/{id}: hinter der Aufbewahrungsgrenze nur für den, der es gemerkt hat."""
+    c = story_client
+    old = _add("alpha", 1, 24 * 200)
+    assert c.get(f"/api/articles/{old}/related").status_code == 404
+    # Gemerkt, bevor die Aufbewahrungsfrist ablief (set_flag erlaubt das danach nicht mehr)
+    state.db.q("INSERT INTO user_articles (user_id, article_id, starred, updated_at) VALUES (?, ?, 1, ?)",
+               (UID, old, ago(days=150)))
+    assert c.get(f"/api/articles/{old}/related").status_code == 200
+
+
+def test_related_flags_do_not_leak_between_users(story_client):
+    from app.auth import hash_password
+    c = story_client
+    me = _add("alpha", 1, 2, story="s")
+    other = _add("beta", 1, 1, story="s")
+    _link_stories()
+    anna = state.db.create_user("anna", hash_password("anna-passwort-123"))
+    state.db.set_flag(anna, other, "read", True)
+    state.db.set_flag(anna, other, "starred", True)
+    item = c.get(f"/api/articles/{me}/related").json()["same_story"][0]
+    assert item["id"] == other and item["read"] == 0 and item["starred"] == 0
+
+
+def test_related_topic_from_real_clustering(story_client):
+    """Mit einem echten Lauf: dieselbe Geschichte über zwei Sprachen, verwandtes Thema daneben."""
+    import asyncio
+
+    from app import stories
+    c = story_client
+    quake = [
+        ("alpha", "Erdbeben in der Türkei: Mindestens 40 Tote in Malatya",
+         "Ein Erdbeben der Stärke 7,1 hat die Provinz Malatya erschüttert. Rettungskräfte suchen Verschüttete."),
+        ("beta", "Earthquake in Turkey's Malatya kills at least 40",
+         "A magnitude 7.1 earthquake struck Malatya province, rescuers search the rubble for survivors."),
+        ("eps", "Malatya earthquake: death toll rises to 40 as rescuers search rubble",
+         "Rescuers in Turkey's Malatya province search for survivors after the 7.1 magnitude quake."),
+    ]
+    ids = [_add(src, i, 3 - i, title=t, summary=s) for i, (src, t, s) in enumerate(quake)]
+    later = _add("delta", 9, 1, title="Nach dem Erdbeben in Malatya: Türkei bittet um internationale Hilfe",
+                 summary="Die Türkei bittet nach dem schweren Erdbeben in der Provinz Malatya um Zelte und Helfer "
+                         "aus dem Ausland, die Regierung ruft den Notstand aus.")
+    _add("beta", 8, 1, title="Apple unveils new iPhone with satellite messaging", summary="In Cupertino.")
+    asyncio.run(stories.refresh(state.db, state.catalog))
+    body = c.get(f"/api/articles/{ids[0]}/related").json()
+    # Die deutsche Folgemeldung (Hilfsersuchen) darf zur Geschichte gehören oder ein verwandtes Thema sein.
+    same = {it["id"] for it in body["same_story"]}
+    assert body["story_id"] == ids[0] and same - {later} == set(ids[1:])
+    assert body["sources_count"] == 3 + (later in same)
+    topic = {it["id"] for it in body["topic"]}
+    assert not topic & {*ids}
+    assert all(it["source_id"] in ("alpha", "beta", "delta", "eps") for it in body["topic"])
+
+
+def test_overview_counts_top_stories_and_hourly(story_client):
+    c = story_client
+    # Geschichte a: 4 Quellen, b: 3 Quellen, c: nur 2 (fehlt in der Übersicht)
+    a_de = _add("alpha", 1, 2, story="a", image=True)
+    _add("beta", 1, 1, story="a", image=True)
+    _add("delta", 1, 3, story="a")
+    _add("eps", 1, 1, story="a")
+    _add("alpha", 2, 1, story="b")
+    b_pick = _add("delta", 2, 2, story="b", image=True)
+    _add("eps", 2, 3, story="b", image=True)
+    _add("alpha", 3, 1, story="c")
+    _add("beta", 3, 1, story="c")
+    _add("beta", 4, 1, paywalled=True)            # zählt nirgends
+    _add("zeta", 4, 1)                            # nicht in ALLE
+    _add("alpha", 5, 24 * 3)                      # nicht von heute
+    sids = _link_stories()
+    state.db.set_flag(UID, a_de, "read", True)
+    state.db.set_flag(UID, b_pick, "later", True)
+    body = c.get("/api/overview").json()
+    assert set(body) == {"date", "now_hour", "counts", "top_stories", "window", "hourly"}
+    assert body["window"] == "today"
+    assert len(body["date"]) == 10 and 0 <= body["now_hour"] <= 23
+    assert body["counts"] == {"new_today": 9, "unread_today": c.get("/api/counts").json()["unread"],
+                              "later": 1, "active_sources": 4}
+    assert body["counts"]["unread_today"] == 8
+    assert len(body["hourly"]) == 24 and sum(body["hourly"]) == 9
+    top = body["top_stories"]
+    assert [s["story_id"] for s in top] == [sids["a"], sids["b"]]
+    assert [s["sources_count"] for s in top] == [4, 3]
+    # Vertreter: deutschsprachig mit Bild; Kurznamen in der Reihenfolge der Auswahl
+    assert top[0]["article"]["id"] == a_de and top[0]["sources"][0] == "ALPHA"
+    assert top[1]["article"]["id"] == b_pick and top[1]["sources"][:1] == ["DEL"]
+    assert len(top[0]["sources"]) == 4 and set(top[0]["sources"]) == {"ALPHA", "BETA", "DEL", "EPSILON"}
+    assert top[0]["article"]["read"] == 1 and top[0]["article"]["summary"]
+
+
+def test_frontpage_lead_and_profile_sections(story_client):
+    c = story_client
+    lead_img = _add("beta", 1, 2, story="big", image=True)
+    _add("alpha", 1, 1, story="big")
+    _add("delta", 1, 1, story="big")
+    two = _add("alpha", 2, 3, story="two")
+    _add("delta", 2, 2, story="two", image=True)
+    solo_new = _add("delta", 3, 1)
+    solo_old = _add("alpha", 4, 5)
+    _add("alpha", 5, 30)                          # älter als 24 h
+    sids = _link_stories()
+    body = c.get("/api/frontpage").json()
+    assert set(body) == {"date", "now_hour", "window", "lead", "sections"}
+    assert body["window"] == "today"
+    assert body["date"] == c.get("/api/overview").json()["date"] and 0 <= body["now_hour"] <= 23
+    lead = body["lead"]
+    assert lead["story_id"] == sids["big"] and lead["sources_count"] == 3
+    assert lead["article"]["id"] == lead_img      # der Aufmacher bevorzugt ein Bild
+    de = next(s for s in body["sections"] if s["name"] == "Deutschland")
+    ids = [it["article"]["id"] for it in de["items"]]
+    # ohne den Aufmacher; Geschichte "two" zuerst (2 Quellen, das Bild gewinnt), dann die neuesten
+    assert len(ids) == 3 and state.db.story_id_of(ids[0]) == sids["two"] and ids[0] != two
+    assert ids[1:] == [solo_new, solo_old]
+    assert [it["sources_count"] for it in de["items"]] == [2, 1, 1]
+    # Profile ohne Treffer (Wirtschaft, Militär: nur Begriffe) fallen weg; jede Geschichte nur einmal.
+    names = [s["name"] for s in body["sections"]]
+    assert "Wirtschaft" not in names and "Militär" not in names
+    shown = [it["article"]["id"] for s in body["sections"] for it in s["items"]]
+    assert len(shown) == len(set(shown)) and lead_img not in shown
+    # Nur Profile, die oben als Filterchip stehen
+    world = _profile(c, "world")
+    c.patch(f"/api/profiles/{_profile(c, 'de')['id']}", json={"in_chips": False})
+    assert [s["profile_id"] for s in c.get("/api/frontpage").json()["sections"]] == [world["id"]]
+
+
+def test_frontpage_and_overview_when_empty(story_client):
+    c = story_client
+    fp = c.get("/api/frontpage").json()
+    assert fp["lead"] is None and fp["sections"] == [] and len(fp["date"]) == 10
+    body = c.get("/api/overview").json()
+    assert body["top_stories"] == [] and body["hourly"] == [0] * 24
+    assert body["counts"] == {"new_today": 0, "unread_today": 0, "later": 0, "active_sources": 0}
+
+
+def test_story_routes_need_login(app_env):
+    with TestClient(app, base_url=ORIGIN) as c:
+        for path in ("/api/overview", "/api/frontpage", "/api/articles/1/related"):
+            assert c.get(path).status_code == 401, path
+
+
+def test_settings_desktop_empty_and_focus_mode(authed):
+    assert authed.patch("/api/settings", json={"desktop_empty": "frontpage"}).json()["desktop_empty"] == "frontpage"
+    assert authed.patch("/api/settings", json={"focus_mode": True}).json()["focus_mode"] is True
+    for bad in ({"desktop_empty": "sidebar"}, {"desktop_empty": None}, {"desktop_empty": 1},
+                {"focus_mode": "yes"}, {"focus_mode": 1}, {"focus_mode": None}):
+        assert authed.patch("/api/settings", json=bad).status_code == 422, bad
+    got = authed.get("/api/settings").json()
+    assert got["desktop_empty"] == "frontpage" and got["focus_mode"] is True
+    # Kaputter gespeicherter Wert: Standard gilt
+    state.db.q("INSERT OR REPLACE INTO settings (user_id, key, value) VALUES (?, 'desktop_empty', '\"x\"')", (UID,))
+    assert authed.get("/api/settings").json()["desktop_empty"] == "overview"

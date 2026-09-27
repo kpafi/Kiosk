@@ -6,6 +6,8 @@ import mimetypes
 import os
 import re
 import sqlite3
+import time
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,9 +29,10 @@ from .extract import strip_reading_times
 from .fetcher import Fetcher
 from .sources import Catalog
 from .state import State, state  # noqa: F401  (State für Importe von außen)
-from . import api_ui
+from . import api_ui, stories
 from . import db as db_mod
-from .api_ui import admin_user, article_scope, current_user, invalidate_unread, public_user
+from .api_ui import (admin_user, article_scope, current_user, effective_sources, implicit_sources, invalidate_unread,
+                     public_user)
 from .users import seed_builtin_profiles
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -94,6 +97,9 @@ async def _running(app: FastAPI):
     state.fetcher = Fetcher(state.db, state.catalog, state.settings)
     state.started_at = datetime.now(timezone.utc)
     await state.fetcher.start()
+    # Geschichten einmal beim Start gruppieren (story_id und das Modell für verwandte Themen); das
+    # Rechnen läuft in einem Thread, der Start wartet darauf (wenige Sekunden).
+    await state.fetcher.update_stories()
     if state.settings.disable_fetcher:
         state.task = None
         log.warning("KIOSK_DISABLE_FETCHER gesetzt: keine automatischen Sammelläufe")
@@ -620,6 +626,310 @@ async def get_article(article_id: int = PathParam(ge=1, le=MAX_ID), retry: bool 
         # liest die Oberfläche nicht; Suche (FTS) und Lesezeit bleiben beim gespeicherten Stand.
         item["body_html"] = strip_reading_times(item["body_html"])
     return item
+
+
+# ---- Geschichten (rechte Seite am Desktop) --------------------------------------------
+
+SAME_STORY_MAX = 12         # „dieselbe Geschichte“: höchstens so viele andere Artikel (einer je Zeitung)
+TOPIC_MAX = stories.TOPIC_LIMIT
+TOP_STORIES_MAX = 5         # Tagesübersicht: so viele Geschichten ...
+TOP_STORY_MIN_SOURCES = 3   # ... mit mindestens so vielen Zeitungen heute
+TOP_STORY_MIN_TODAY = 3     # weniger Geschichten heute (kurz nach Mitternacht): die letzten 24 Stunden
+TOP_STORY_SOURCES = 4       # Kurznamen je Geschichte
+FRONTPAGE_SECTIONS = 4      # Titelseite: höchstens so viele Profile ...
+FRONTPAGE_ITEMS = 3         # ... mit je so vielen Artikeln ...
+FRONTPAGE_HOURS = 24        # ... aus den letzten so vielen Stunden
+FRONTPAGE_GROUPS = 12       # Geschichten je Profil, aus denen die Titelseite wählt
+USER_LANG = "de"            # Sprache der Oberfläche: deutschsprachige Artikel zuerst
+# Übersicht und Titelseite haben zusammen höchstens so viele Sekunden für ihre Abfragen; was dann
+# fehlt (eine Rubrik, die Geschichten des Tages), bleibt leer statt einer 503.
+STORY_PAGE_BUDGET = 3.0
+CENTRAL_SHARE = 0.85        # Vertreter einer Geschichte: so mittig wie der mittigste (Anteil)
+
+
+class _Budget:
+    """Gemeinsames Zeitbudget der Abfragen einer Anfrage; jede einzelne höchstens db.READ_TIME_LIMIT."""
+
+    def __init__(self, seconds: float | None = None):
+        self.deadline = time.monotonic() + (STORY_PAGE_BUDGET if seconds is None else seconds)
+
+    def limit(self) -> float:
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise QueryTimeout("Zeitbudget der Anfrage verbraucht")
+        return min(db_mod.READ_TIME_LIMIT, left)
+
+
+def _item(row) -> dict[str, Any]:
+    """Listeneintrag wie in GET /api/articles; die mitgelesene story_id fällt weg."""
+    item = _decorate(dict(row))
+    item.pop("story_id", None)
+    if item["paywalled"]:
+        item["summary"] = ""
+    return item
+
+
+def _lang_of(row) -> str | None:
+    src = state.catalog.get(row["source_id"])
+    return src.lang if src else None
+
+
+def _count_sources(rows) -> int:
+    """Zahl der Zeitungen einer Geschichte: verschiedene Verlage (stories.publisher). Dieselbe
+    Agenturmeldung in zwei Zeitungen zählt doppelt, die Ausgaben von The Local oder heise und heise
+    Security zählen einmal."""
+    return len({stories.publisher(r["source_id"]) for r in rows})
+
+
+def _publishers() -> dict[str, str]:
+    """Quelle -> Verlag für Quellen, die mit anderen als eine Zeitung zählen (für die SQL-Zählung)."""
+    return {s.id: stories.publisher(s.id) for s in state.catalog.all() if stories.publisher(s.id) != s.id}
+
+
+def _ranked(rows, *, image_first: bool = False) -> list:
+    """Artikel einer Geschichte, der beste Vertreter zuerst: Er soll die Geschichte erzählen, also
+    mittig stehen (stories.centrality: mindestens CENTRAL_SHARE der größten Mittigkeit der Gruppe);
+    unter den mittigen deutschsprachig, mit Bild, mit Volltext, dann der neueste (der aktuelle Stand).
+    Titelseite: das Bild vor der Sprache. Ohne Lauf der Gruppierung zählt jeder als mittig."""
+    cent = stories.central_scores([r["id"] for r in rows])
+    top = max(cent.values(), default=0.0)
+
+    def key(row) -> tuple:
+        central = cent.get(row["id"], 0.0) >= CENTRAL_SHARE * top
+        de, img = _lang_of(row) == USER_LANG, bool(row["image_url"])
+        first = (img, de) if image_first else (de, img)
+        return (central, *first, row["text_status"] == "full", row["published_at"], row["id"])
+
+    return sorted(rows, key=key, reverse=True)
+
+
+def _short(source_id: str) -> str:
+    src = state.catalog.get(source_id)
+    return src.short if src else source_id
+
+
+def _top_stories(user_id: int, scope: list[str], since: str, budget: _Budget, *, min_sources: int, limit: int,
+                 image_first: bool = False) -> list[dict[str, Any]]:
+    """Geschichten mit den meisten Zeitungen seit `since` (Artikel ohne Paywall aus `scope`, nur deren
+    Artikel zählen), zwei Abfragen für alle. Sortiert nach Zahl der Zeitungen, dann dem neuesten Artikel."""
+    cand = state.db.top_stories(sources=scope, since=since, min_sources=min_sources, limit=3 * limit,
+                                publishers=_publishers(), time_limit=budget.limit())
+    by_story: dict[int, list] = defaultdict(list)
+    for r in state.db.story_articles(user_id, [c["story_id"] for c in cand], sources=scope, since=since,
+                                     time_limit=budget.limit()):
+        by_story[r["story_id"]].append(r)
+    out = []
+    for c in cand:
+        rows = by_story.get(c["story_id"], [])
+        n = _count_sources(rows)
+        if n < min_sources:
+            continue
+        ranked = _ranked(rows, image_first=image_first)
+        # Je Zeitung ein Kurzname (der erste in der Reihenfolge der Auswahl): nie mehr Namen als Zeitungen.
+        papers: dict[str, str] = {}
+        for r in ranked:
+            papers.setdefault(stories.publisher(r["source_id"]), _short(r["source_id"]))
+        shorts = list(dict.fromkeys(papers.values()))
+        out.append({"story_id": c["story_id"], "sources_count": n, "sources": shorts[:TOP_STORY_SOURCES],
+                    "article": _item(ranked[0]), "_newest": max(r["published_at"] for r in rows)})
+    out.sort(key=lambda s: s["_newest"], reverse=True)
+    out.sort(key=lambda s: s["sources_count"], reverse=True)
+    for s in out:
+        del s["_newest"]
+    return out[:limit]
+
+
+@app.get("/api/articles/{article_id}/related")
+async def related(article_id: int = PathParam(ge=1, le=MAX_ID), user: dict = Depends(current_user)):
+    """Rechte Seite zu einem Artikel: dieselbe Geschichte in anderen Zeitungen (eine je Zeitung, ohne
+    die eigene, deutschsprachige zuerst, dann die neuesten) und verwandte Themen. Zur Geschichte zählen
+    nur Artikel, die höchstens stories.MAX_GAP vom offenen Artikel entfernt erschienen sind."""
+    row = state.db.get_article(article_id, user["id"])
+    if not row:
+        raise HTTPException(404, "Artikel nicht gefunden")
+    row = dict(row)
+    scope = implicit_sources()
+    budget = _Budget()                  # alle Abfragen der Seite zusammen (wie Übersicht und Titelseite)
+    story_id = state.db.story_id_of(article_id)
+    row["story_id"] = story_id          # get_article liefert sie nicht; topic_ids braucht sie (vor dem Fenster)
+    exclude = {article_id}
+    members: list = []
+    try:
+        if story_id is not None:
+            at = datetime.fromisoformat(row["published_at"])
+            members = [m for m in state.db.story_articles(user["id"], [story_id], sources=scope,
+                                                          since=_iso(at - stories.MAX_GAP),
+                                                          until=_iso(at + stories.MAX_GAP),
+                                                          time_limit=budget.limit())
+                       if m["id"] != article_id]
+            if _count_sources([*members, row]) < 2:
+                # Eine „Geschichte“ aus nur einer Zeitung (übrig geblieben, nachdem die anderen Artikel
+                # anders gruppiert wurden) ist keine: wie ohne Geschichte.
+                story_id = row["story_id"] = None
+                members = []
+            else:
+                exclude.update(state.db.story_member_ids(story_id, time_limit=budget.limit()))
+        if story_id is None:
+            # Ohne Geschichte: Artikel anderer Zeitungen, die trotzdem dasselbe Ereignis erzählen
+            # (stories.same_event_ids), stehen hier und nicht unter den Themen.
+            ids = stories.same_event_ids(row, {article_id})
+            exclude.update(ids)
+            found = {r["id"]: r for r in state.db.articles_by_ids(user["id"], ids, sources=scope,
+                                                                  time_limit=budget.limit())}
+            members = [found[i] for i in ids if i in found]
+            # Gehört so ein Artikel zu einer Geschichte, ist deren ganzer Rest auch kein anderes Thema.
+            for sid in sorted({r["story_id"] for r in found.values() if r["story_id"] is not None}):
+                exclude.update(state.db.story_member_ids(sid, time_limit=budget.limit()))
+    except (QueryTimeout, sqlite3.OperationalError) as e:
+        log.warning("Dieselbe Geschichte zu %s: %s", article_id, e)
+        members = []
+    own, own_key = stories.publisher(row["source_id"]), stories.copy_key(row)
+    # Je Zeitung der beste Vertreter (siehe _ranked); wortgleiche Kopien und englische Artikel, die mit
+    # dem offenen nur über andere Mitglieder zusammenhängen (stories.shown_with), fehlen.
+    best: dict[str, Any] = {}
+    for m in _ranked(members):
+        paper = stories.publisher(m["source_id"])
+        if paper == own or (own_key and stories.copy_key(m) == own_key):
+            continue
+        if paper not in best and stories.shown_with(article_id, m["id"]):
+            best[paper] = m
+    shown = list(best.values())[:SAME_STORY_MAX]
+    same = [_item(m) for m in shown]
+    # Zeitungen, die die Seite auch zeigt (und die eigene): Kopf und Liste passen zusammen.
+    count = _count_sources([*shown, row])
+    try:
+        ids = stories.topic_ids(state.db, row, exclude, time_limit=budget.limit())
+        found = {r["id"]: r for r in state.db.articles_by_ids(user["id"], ids, sources=scope,
+                                                              time_limit=budget.limit())}
+        topic = [_item(found[i]) for i in ids if i in found][:TOPIC_MAX]
+    except (QueryTimeout, sqlite3.OperationalError) as e:
+        log.warning("Verwandte Themen zu %s: %s", article_id, e)
+        topic = []
+    return {"story_id": story_id, "sources_count": count, "same_story": same, "topic": topic}
+
+
+@app.get("/api/overview")
+async def overview(user: dict = Depends(current_user)):
+    """Tagesübersicht (rechte Seite ohne offenen Artikel): Zähler, Geschichten mit den meisten
+    Zeitungen heute, Artikel je Stunde. „Heute“ ab 00:00 KIOSK_TZ wie die Ungelesen-Zähler, Quellen
+    wie ALLE, ohne Paywall. Reicht das Zeitbudget nicht, bleiben Stunden bzw. Geschichten leer."""
+    budget = _Budget()
+    local = datetime.now(timezone.utc).astimezone(state.db.tz)
+    today = state.db.today_start()
+    scope = implicit_sources()
+    counts = {"unread": None, "later": None}
+    try:
+        counts = state.db.article_counts(user["id"], scope, time_limit=budget.limit())
+    except QueryTimeout:
+        log.warning("Tagesübersicht: Zähler abgebrochen (Zeitlimit)")
+    hourly: list[int] = [0] * 24
+    new_today = active = None
+    try:
+        day = state.db.published_since(sources=scope, since=today, time_limit=budget.limit())
+        for r in day:
+            try:
+                hourly[datetime.fromisoformat(r["published_at"]).astimezone(state.db.tz).hour] += 1
+            except ValueError:
+                continue
+        new_today = len(day)
+        active = len({stories.publisher(r["source_id"]) for r in day})      # Zeitungen, nicht Quellen
+    except QueryTimeout:
+        log.warning("Tagesübersicht: Artikel des Tages abgebrochen (Zeitlimit)")
+        hourly = []                     # die Oberfläche zeigt dann keine Stunden (Zähler: „–“)
+    top, window = [], "today"
+    try:
+        top = _top_stories(user["id"], scope, today, budget, min_sources=TOP_STORY_MIN_SOURCES,
+                           limit=TOP_STORIES_MAX)
+        # Kurz nach Mitternacht hat „heute“ noch kaum Geschichten: dann die der letzten 24 Stunden.
+        if len(top) < TOP_STORY_MIN_TODAY:
+            day_before = _top_stories(user["id"], scope, _iso(datetime.now(timezone.utc) - timedelta(hours=24)),
+                                      budget, min_sources=TOP_STORY_MIN_SOURCES, limit=TOP_STORIES_MAX)
+            if len(day_before) > len(top):
+                top, window = day_before, "24h"
+    except QueryTimeout:
+        log.warning("Tagesübersicht: Geschichten des Tages abgebrochen (Zeitlimit)")
+    return {
+        "date": local.date().isoformat(), "now_hour": local.hour,
+        "counts": {"new_today": new_today, "unread_today": counts["unread"], "later": counts["later"],
+                   "active_sources": active},
+        "top_stories": top,
+        "window": window,
+        "hourly": hourly,
+    }
+
+
+@app.get("/api/frontpage")
+async def frontpage(user: dict = Depends(current_user)):
+    """Titelseite (rechte Seite ohne offenen Artikel): die größte Geschichte des Tages als Aufmacher,
+    dazu je Profil (die oben als Filterchip, sonst alle; höchstens FRONTPAGE_SECTIONS) die Geschichten
+    der letzten FRONTPAGE_HOURS Stunden mit den meisten Zeitungen. Jede Geschichte erscheint nur
+    einmal auf der Seite (Aufmacher und frühere Rubriken gehen vor). Eine Rubrik, deren Abfrage das
+    Zeitbudget sprengt, fehlt."""
+    uid = user["id"]
+    budget = _Budget()
+    local = datetime.now(timezone.utc).astimezone(state.db.tz)
+    scope = implicit_sources()
+    lead = None
+    window = "today"
+    try:
+        top = _top_stories(uid, scope, state.db.today_start(), budget, min_sources=2, limit=1, image_first=True)
+        if not top:                     # kurz nach Mitternacht: der Aufmacher der letzten 24 Stunden
+            top = _top_stories(uid, scope, _iso(datetime.now(timezone.utc) - timedelta(hours=24)), budget,
+                               min_sources=2, limit=1, image_first=True)
+            window = "24h" if top else "today"
+    except QueryTimeout:
+        log.warning("Titelseite: Aufmacher abgebrochen (Zeitlimit)")
+        top = []
+    if top:
+        lead = {k: top[0][k] for k in ("story_id", "sources_count", "article")}
+    profiles = state.db.list_profiles(uid)
+    chosen = ([p for p in profiles if p["in_chips"]] or profiles)[:FRONTPAGE_SECTIONS]
+    now = datetime.now(timezone.utc)
+    since = _iso(now - timedelta(hours=FRONTPAGE_HOURS))
+    used_stories = {lead["story_id"]} if lead else set()
+    used_ids = {lead["article"]["id"]} if lead else set()
+    sections = []
+    for p in chosen:
+        sources, terms = effective_sources(p), p["terms"] or None
+        try:
+            groups = [g for g in state.db.profile_story_groups(uid, sources=sources, terms=terms, since=since,
+                                                               limit=FRONTPAGE_GROUPS + len(used_stories),
+                                                               publishers=_publishers(),
+                                                               time_limit=budget.limit())
+                      if g["k"] not in used_stories]
+            rows = state.db.profile_group_articles(uid, [g["k"] for g in groups], sources=sources, terms=terms,
+                                                   since=since, time_limit=budget.limit())
+            story_ids = [g["k"] for g in groups if g["k"] > 0]
+            # Zeitungen je Geschichte wie in der Übersicht (Quellen wie ALLE), aus denselben 24 Stunden
+            members: dict[int, list] = defaultdict(list)
+            for r in state.db.story_articles(uid, story_ids, sources=scope, since=since,
+                                             time_limit=budget.limit()):
+                members[r["story_id"]].append(r)
+        except QueryTimeout:
+            log.warning("Titelseite: Profil %s (Benutzer %s) abgebrochen: Zeitlimit", p["id"], uid)
+            continue
+        by_key: dict[int, list] = defaultdict(list)
+        for r in rows:
+            by_key[r["story_id"] if r["story_id"] is not None else -r["id"]].append(r)
+        entries = []
+        for g in groups:
+            grp = [r for r in by_key.get(g["k"], []) if r["id"] not in used_ids]
+            if not grp:
+                continue
+            pick = _ranked(grp, image_first=True)[0]
+            n = max(_count_sources(members.get(g["k"], [])), 1) if g["k"] > 0 else 1
+            entries.append((n, pick["published_at"], g["k"], pick))
+        entries.sort(key=lambda e: (e[0], e[1]), reverse=True)
+        items = []
+        for n, _, key, pick in entries[:FRONTPAGE_ITEMS]:
+            used_stories.add(key)
+            used_ids.add(pick["id"])
+            items.append({"article": _item(pick), "sources_count": n})
+        if items:
+            sections.append({"profile_id": p["id"], "name": p["name"], "items": items})
+    # Tag und Stunde des Servers (KIOSK_TZ) wie in der Übersicht: Die Oberfläche lädt um Mitternacht neu.
+    return {"date": local.date().isoformat(), "now_hour": local.hour, "window": window, "lead": lead,
+            "sections": sections}
 
 
 class FlagBody(BaseModel):

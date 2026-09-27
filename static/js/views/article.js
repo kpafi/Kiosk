@@ -1,6 +1,6 @@
 // Leseansicht (E2Lese, rechts in E2Desktop): Kopf mit Flags, Meta, Titel, Bild, Volltext, Nächster.
 import { h, hint, isDesktop, replace } from '../ui/dom.js';
-import { arrowRight, back, bookmark, checkCheck, external, star } from '../ui/icons.js';
+import { arrowRight, back, bookmark, checkCheck, collapse, expand, external, star } from '../ui/icons.js';
 import { iconButton } from '../ui/header.js';
 import { markOpenRow } from '../ui/row.js';
 import {
@@ -11,6 +11,8 @@ import {
   emit, goBack, on, replaceHash, setFlag, sourceLabel, state,
 } from '../store.js';
 import { toast } from '../ui/dom.js';
+import { relatedRail } from './related.js';
+import { focusActive, toggleFocusMode } from './focus.js';
 
 const NOTE = {
   partial: 'Nur Anfang verfügbar',
@@ -32,6 +34,7 @@ function nextFromList(id) {
   return rest.find((it) => !it.read && it.id !== id) || null;
 }
 
+const PROGRESS_DOTS = 30;   // Fokusmodus: Punkte des Lesefortschritts
 const POLL_MS = 3000;       // Text wird im Hintergrund geholt: so oft nachfragen …
 const POLL_MAX_MS = 30000;  // … und so lange höchstens
 
@@ -80,6 +83,7 @@ const SHORT_P_MAX = 40;    // Rubrik-/Leerabsatz („War“, „Prefer“): kür
 const HERO_CREDIT_RE = /\b(?:AP|dpa|Reuters|Getty|AFP|EPA|Bloomberg|imago|POOL|Photo|Foto|Bild)\b/i;
 const HERO_CAPTION_MAX = 200;
 const HERO_MIN_WIDTH = 300;   // kleineres Feed-Bild (Vorschau) wird nicht hochskaliert, sondern weggelassen
+const INLINE_MIN_WIDTH = 120;   // kleinere Bilder im Text (ohne Grund klein) werden weggelassen
 
 /** Leerer oder kurzer Rubrik-Absatz ohne Bild. */
 function isFiller(node) {
@@ -270,12 +274,46 @@ export function planHero(bodyEl, imageUrl, author) {
   return { src: large ? large.getAttribute('src') : imageUrl, copies };
 }
 
+const heroOf = (img) => img.closest('.art')?.querySelector(':scope > .art-hero') || null;
+
+/**
+ * Winzige Bilder im Text (taz liefert Varianten mit 14 px Breite) wirken kaputt und fallen weg.
+ * Gewollt kleine (laut URL oder width/height, Autorenfoto mit Alt-Text = Autor) bleiben, ebenso
+ * Wiederholungen des Titelbilds (data-hero-copy; die entfernt der Titelbild-Handler wie bisher).
+ * Die Bildzeile bleibt als Bildzeile stehen; nennt sie nur die Bildquelle und gibt es ein
+ * Titelbild, wandert sie unter das Titelbild (hat es schon eine, entfällt sie).
+ * @returns {boolean} entfernt?
+ */
+export function dropIfTiny(img, caption, author, findHero = heroOf) {
+  if (img.dataset.heroCopy || !img.parentNode || !img.naturalWidth || img.naturalWidth >= INLINE_MIN_WIDTH
+      || isSmallImage(img, author)) return false;
+  const credit = !!caption && (CAPTION_RE.test(caption.textContent || '') || isCreditCaption(caption));
+  const hero = credit ? findHero(img) : null;
+  img.remove();
+  if (!caption) return true;
+  if (hero && hero.parentNode) {
+    const next = hero.nextElementSibling;
+    if (next && next.classList.contains('art-caption')) caption.remove();
+    else {
+      caption.classList.add('art-caption');
+      caption.dataset.movedCredit = '1';   // fällt mit dem Titelbild weg
+      hero.after(caption);
+    }
+  } else caption.classList.add('art-caption');
+  return true;
+}
+
+/** dropIfTiny, sobald das Bild geladen ist. */
+export function dropWhenTiny(img, caption, author) {
+  img.addEventListener('load', () => dropIfTiny(img, caption, author), { once: true });
+}
+
 /**
  * Artikeltext aus body_html. Erst in einem <template> aufbereiten (dort laden Bilder noch nicht),
  * dann einfügen: Links in neuem Tab, Bilder faul und ohne Referrer oder (show_images aus) entfernt.
  * Einzige HTML-Stelle: body_html ist serverseitig auf eine Whitelist bereinigt.
  */
-export function buildBody(html, title) {
+export function buildBody(html, title, author = '') {
   const tpl = document.createElement('template');
   tpl.innerHTML = html;
   const frag = tpl.content;
@@ -299,6 +337,7 @@ export function buildBody(html, title) {
       if (caption) caption.classList.add('art-caption');
       img.remove();
     }, { once: true });
+    dropWhenTiny(img, caption, author);
   }
   const bodyEl = h('div', { class: 'article-body t-article' });
   bodyEl.append(frag);
@@ -320,17 +359,97 @@ export function articleView(id) {
   const nextPill = h('a', { class: 'pill only-desktop', hidden: true, href: '#' },
     h('span', { text: onlyUnread ? 'Nächster ungelesener' : 'Nächster' }), arrowRight(18));
   const nextBlock = h('div', { class: 'next-block only-mobile', hidden: true });
+  // Fokusmodus: schwebende Pille unten rechts mit dem nächsten Artikel (sichtbar nur im Fokusmodus).
+  const focusNextTitle = h('span', { class: 'focus-next-title' });
+  const focusNext = h('a', { class: 'focus-next only-desktop', hidden: true, href: '#' },
+    h('span', { class: 'focus-next-label t-caption', text: 'Nächster' }),
+    focusNextTitle,
+    h('span', { class: 'focus-next-arrow', 'aria-hidden': 'true' }, arrowRight(18)));
 
   // ---- Kopf ----
   const btnLater = iconButton(bookmark(20), 'Später lesen', { onClick: () => toggle('later') });
   const btnStar = iconButton(star(20), 'Favorit', { onClick: () => toggle('star') });
   const btnRead = iconButton(checkCheck(20), 'Als gelesen markieren', { onClick: () => toggle('read') });
+  const btnFocus = iconButton(expand(20), 'Fokusmodus', { onClick: () => toggleFocusMode(), extraClass: 'only-desktop' });
+  btnFocus.setAttribute('aria-keyshortcuts', 'F');
+  // Lesefortschritt (nur im Fokusmodus sichtbar): 30 Punkte und Prozent.
+  const progressDots = h('span', { class: 'art-progress-dots', 'aria-hidden': 'true' },
+    Array.from({ length: PROGRESS_DOTS }, () => h('span')));
+  const progressText = h('span', { class: 'art-progress-pct t-caption', 'aria-hidden': 'true', text: '0 %' });
+  const progress = h('div', {
+    class: 'art-progress only-desktop', role: 'progressbar', 'aria-label': 'Lesefortschritt',
+    'aria-valuemin': '0', 'aria-valuemax': '100', 'aria-valuenow': '0',
+  }, progressDots, progressText);
   const header = h('header', { class: 'hdr art-hdr' },
     iconButton(back(20), 'Zurück', { onClick: () => goBack(state.lastListHash), extraClass: 'only-mobile' }),
     h('div', { class: 'hdr-spacer only-mobile' }),
+    progress,
+    btnFocus,
+    h('span', { class: 'hdr-sep only-desktop', 'aria-hidden': 'true' }),
     btnLater, btnStar, btnRead);
   const body = h('div', { class: 'art' });
-  el.append(header, body);
+  el.append(h('div', { class: 'art-main' }, header, body), focusNext);
+
+  // Kontextspalte nur am Desktop (am Handy weder Element noch Anfrage). Wird das Fenster erst später
+  // breiter als 900 px, entsteht sie dann (ensureRail beim Wechsel der Breite).
+  let rail = null;
+  let failed = false;       // Artikel ließ sich nicht laden: Kontextspalte bleibt weg
+  function ensureRail() {
+    if (rail || !alive || !isDesktop()) return;
+    rail = relatedRail();
+    el.classList.add('has-rail');
+    el.insertBefore(rail.el, focusNext);
+    if (failed) rail.fail();
+    else if (item) {
+      if (item.paywalled) rail.fail();
+      else rail.load(item.id);
+    }
+  }
+  ensureRail();
+  const desktopQuery = window.matchMedia('(min-width: 900px)');
+  const onWidth = () => { if (desktopQuery.matches) ensureRail(); };
+  desktopQuery.addEventListener('change', onWidth);
+
+  function paintFocus() {
+    const active = state.settings.focus_mode === true;
+    btnFocus.classList.toggle('is-on', active);
+    btnFocus.setAttribute('aria-pressed', active ? 'true' : 'false');
+    btnFocus.replaceChildren(active ? collapse(20) : expand(20));
+  }
+  paintFocus();
+
+  // Lesefortschritt: Scrollposition von #reader bis zum Ende des Artikeltexts (.art; die Abschnitte
+  // darunter zählen nicht), höchstens einmal je Bild berechnet, auch wenn sich Größen ändern.
+  const readerEl = document.getElementById('reader');
+  let progressFrame = 0;
+  let shownPct = -1;
+  function paintProgress() {
+    progressFrame = 0;
+    if (!alive || !focusActive()) return;
+    const end = body.getBoundingClientRect().bottom - readerEl.getBoundingClientRect().top + readerEl.scrollTop;
+    const max = end - readerEl.clientHeight;
+    const pct = max > 0 ? Math.round(Math.min(1, Math.max(0, readerEl.scrollTop / max)) * 100) : 100;
+    if (pct === shownPct) return;
+    shownPct = pct;
+    const filled = Math.round((pct / 100) * PROGRESS_DOTS);
+    [...progressDots.children].forEach((dot, i) => dot.classList.toggle('on', i < filled));
+    progressText.textContent = `${pct} %`;
+    progress.setAttribute('aria-valuenow', String(pct));
+  }
+  function queueProgress() {
+    if (!progressFrame) progressFrame = requestAnimationFrame(paintProgress);
+  }
+  readerEl.addEventListener('scroll', queueProgress, { passive: true });
+  const resized = typeof ResizeObserver === 'function'
+    ? new ResizeObserver(() => { shownPct = -1; queueProgress(); }) : null;
+  resized?.observe(body);
+  resized?.observe(readerEl);
+  const offSettings = on('settings', (patch) => {
+    if (!('focus_mode' in patch)) return;
+    paintFocus();
+    shownPct = -1;
+    queueProgress();
+  });
 
   function paintFlags() {
     if (!item) return;
@@ -377,12 +496,13 @@ export function articleView(id) {
     if (item.paywalled) {
       parts.push(h('div', { class: 'art-note t-caption', text: 'Bezahlartikel werden nicht angezeigt' }));
     } else if (item.body_html) {
-      bodyEl = buildBody(item.body_html, item.title);
+      bodyEl = buildBody(item.body_html, item.title, author);
     }
 
     const plan = state.settings.show_images && !item.paywalled ? planHero(bodyEl, item.image_url, author) : null;
     if (plan) {
       const { copies } = plan;
+      for (const copy of copies) copy.dataset.heroCopy = '1';   // siehe dropWhenTiny
       const hero = h('img', {
         class: 'art-hero', src: plan.src, alt: '', decoding: 'async', referrerpolicy: 'no-referrer',
       });
@@ -391,9 +511,20 @@ export function articleView(id) {
       // Alt-Text und Bildzeile der ersten Wiederholung wandern zum Titelbild (auch ein kurzer Absatz
       // mit Bildquelle ohne „Foto:“). Ein Feed-Bild unter 300 px (Vorschau) fällt weg; eine
       // Wiederholung im Text bleibt dann stehen.
+      // Titelbild fällt weg: die Wiederholungen im Text gelten wieder als normale Bilder (auch die
+      // schon geladenen prüft dropIfTiny jetzt), eine dorthin gewanderte Bildzeile fällt mit weg.
+      const dropHero = () => {
+        const next = hero.nextElementSibling;
+        if (next && next.dataset && next.dataset.movedCredit) next.remove();
+        hero.remove();
+        for (const copy of copies) {
+          delete copy.dataset.heroCopy;
+          if (copy.complete && copy.naturalWidth) dropIfTiny(copy, captionAfter(copy), author);
+        }
+      };
       hero.addEventListener('load', () => {
         if (fromFeed() && hero.naturalWidth && hero.naturalWidth < HERO_MIN_WIDTH) {
-          hero.remove();
+          dropHero();
           return;
         }
         if (!copies.length) return;
@@ -409,7 +540,7 @@ export function articleView(id) {
       // Große Fassung aus dem Text lädt nicht: einmal auf das Feed-Bild zurückfallen, dann aufgeben.
       hero.addEventListener('error', () => {
         if (!fromFeed() && item.image_url) hero.src = item.image_url;
-        else hero.remove();
+        else dropHero();
       });
       parts.push(hero);
     }
@@ -433,6 +564,8 @@ export function articleView(id) {
     parts.push(nextBlock);
     replace(body, parts);
     loadNext(nextPill, nextBlock);
+    shownPct = -1;
+    queueProgress();
   }
 
   /** Sofort-Vorschau aus der Liste (Titel, Meta, Anreißer), solange die Details laden. */
@@ -467,6 +600,11 @@ export function articleView(id) {
     pill.href = `#/a/${next.id}`;
     pill.hidden = false;
     pill.addEventListener('click', go);
+    focusNext.href = `#/a/${next.id}`;
+    focusNextTitle.textContent = next.title || '(ohne Titel)';
+    focusNext.setAttribute('aria-label', `Nächster Artikel: ${next.title || '(ohne Titel)'}`);
+    focusNext.addEventListener('click', go);
+    focusNext.hidden = false;
     replace(block,
       h('span', { class: 't-caption', text: nextParams().unread !== 'false' ? 'Nächster ungelesener Artikel' : 'Nächster Artikel' }),
       h('a', { class: 'next-card', href: `#/a/${next.id}`, on: { click: go } },
@@ -500,6 +638,11 @@ export function articleView(id) {
       if (first && state.settings.mark_read_on_open && !item.read) {
         setFlag(item.id, 'read', true).catch(() => {});
       }
+      if (first && rail) {
+        if (item.paywalled) rail.fail();
+        else rail.load(item.id);
+      }
+      if (first) ensureRail();
       if (polling) pollTimer = setTimeout(() => load(false), POLL_MS);
     } catch (err) {
       if (!alive) return;
@@ -510,6 +653,8 @@ export function articleView(id) {
         return;
       }
       el.removeAttribute('aria-busy');
+      failed = true;
+      rail?.fail();
       replace(body, hint(err.status === 404 ? 'Artikel nicht gefunden' : `Fehler: ${err.detail || err.message}`));
     }
   }
@@ -531,14 +676,13 @@ export function articleView(id) {
       alive = false;
       if (state.openArticle === item) state.openArticle = null;
       clearTimeout(pollTimer);
+      cancelAnimationFrame(progressFrame);
+      readerEl.removeEventListener('scroll', queueProgress);
+      resized?.disconnect();
+      desktopQuery.removeEventListener('change', onWidth);
       offFlags();
+      offSettings();
+      rail?.destroy();
     },
   };
-}
-
-/** Rechte Spalte auf dem Desktop ohne geöffneten Artikel. */
-export function readerEmpty() {
-  return h('div', { class: 'reader-empty' },
-    h('div', { class: 't-section', text: 'WÄHLE EINEN ARTIKEL' }),
-    h('p', { class: 't-caption muted', text: 'j / k blättern · Enter öffnen · / suchen' }));
 }

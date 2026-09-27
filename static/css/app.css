@@ -746,3 +746,423 @@ mark {
 .feed-error .hint { padding: 0; }
 .offline .matrix { margin-bottom: var(--space-4); }
 .offline .t-teaser { color: var(--muted); margin-top: 8px; max-width: 32ch; }
+
+/* ---- Desktop: rechte Seite (E3Desktop*) ------------------------------------------------
+   Alles hier wirkt nur ab 900px; am Handy gibt es die Elemente nicht oder sie sind ausgeblendet. */
+.focus-rail, .focus-next { display: none; }
+
+@media (min-width: 900px) {
+  /* Kopf der Leseansicht: Lesefortschritt (nur im Fokusmodus sichtbar), Fokus-Knopf, Trennstrich. */
+  .art-progress { flex-grow: 1; min-width: 0; display: flex; align-items: center; gap: 12px; visibility: hidden; }
+  .art-progress-dots { display: flex; gap: 4px; }
+  .art-progress-dots span { width: 6px; height: 6px; border-radius: var(--radius-pill); background: var(--hairline); }
+  .art-progress-dots span.on { background: var(--ink); }
+  .art-progress-pct { color: var(--muted); white-space: nowrap; }
+  .hdr-sep { width: 1px; height: 24px; margin: 0 4px; flex-shrink: 0; background: var(--hairline); }
+
+  /* Kontextspalte (E3DesktopKontext): unter dem Artikel (900–1399px oder Fokusmodus) … */
+  .art-view.has-rail .art { padding-bottom: 32px; }
+  .art-rail { max-width: var(--measure); padding: 0 40px 64px; }
+  .art-rail-inner { display: flex; flex-direction: column; gap: 32px; padding-top: 24px; border-top: 1px solid var(--hairline); }
+  .rail-head, .home-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; padding-bottom: 12px; }
+  /* Kontextspalte: Titel darf zweizeilig werden, die Zahl bleibt oben rechts. */
+  .rail-head { flex-wrap: nowrap; }
+  .rail-head .t-caption, .home-head .t-caption { margin-left: auto; white-space: nowrap; }
+  .rail-title-sec, .home-sec {
+    font-family: var(--font-dot);
+    font-size: 16px;
+    line-height: 19px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    min-width: 0;
+  }
+  .rail-list { display: flex; flex-direction: column; }
+  .rail-item {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 12px 0;
+    border-top: 1px solid var(--hairline);
+    color: var(--ink);
+    text-decoration: none;
+  }
+  .rail-item:first-child { border-top: 0; }
+  .rail-item:focus-visible, .rail-more:focus-visible, .home-story:focus-visible, .home-profile:focus-visible,
+  .fp-lead:focus-visible, .fp-item:focus-visible { outline-offset: 4px; border-radius: var(--radius-sm); }
+  .rail-loading { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; padding-top: 4px; }
+  .rail-loading .matrix { width: 64px; gap: 8px; margin-bottom: 4px; }
+  .rail-loading .matrix span { width: 6px; height: 6px; }
+  /* Tastenhinweise überall gleich (Board: Space Grotesk 13px, gemischte Schreibung). */
+  .key-hints { font-family: var(--font-sans); font-size: 13px; line-height: 18px; color: var(--muted); text-transform: none; }
+  .key-hints span { white-space: nowrap; }
+  .empty .key-hints { max-width: none; }
+  .home-error { gap: 8px; }
+  .home-page > .home-error, .home-page > .home-loading { flex: 1 0 auto; height: auto; }
+  .rail-title { font-size: 16px; line-height: 22px; font-weight: 500; overflow-wrap: anywhere; }
+  .rail-item.is-read .rail-title { color: var(--muted); }
+  .rail-more {
+    display: block;
+    width: 100%;
+    min-height: var(--tap);
+    padding: 0;
+    border: 0;
+    border-top: 1px solid var(--hairline);
+    background: transparent;
+    color: var(--ink);
+    text-align: left;
+  }
+
+  /* Rechte Seite ohne Artikel: Tagesübersicht (E3DesktopUebersicht) und Titelseite
+     (E3DesktopTitelseite). Die Spalte ist 380px (900px Fenster) bis ~1400px breit: Umbruch per
+     Container-Abfrage auf .home. */
+  .home { container-type: inline-size; min-height: 100%; }
+  .home > .reader-empty { height: auto; min-height: 100dvh; }
+  .home-page { display: flex; flex-direction: column; gap: 28px; min-height: 100dvh; padding: 28px 40px; }
+  .home-page--front { gap: 24px; }
+  .home-top { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; }
+  .home-top .t-caption { margin-left: auto; }
+  .home-title {
+    font-family: var(--font-dot);
+    font-size: 32px;
+    line-height: 38px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+  }
+  .home-tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
+  .home-tile {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 18px 20px;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-md);
+  }
+  .home-tile-num {
+    font-family: var(--font-dot);
+    font-size: clamp(36px, 5cqi, 56px);
+    line-height: 1.2;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+  }
+  .home-tile-num.is-signal { color: var(--signal-text); }
+  .home-cols { display: flex; gap: 40px; }
+  .home-col--main { flex: 1 1 0; min-width: 0; }
+  .home-col--side { width: 340px; flex-shrink: 0; display: flex; flex-direction: column; gap: 28px; }
+  .home-none { padding-top: 4px; }
+  .home-story {
+    display: flex;
+    align-items: flex-start;
+    gap: 20px;
+    padding: 14px 0;
+    border-top: 1px solid var(--hairline);
+    color: var(--ink);
+    text-decoration: none;
+  }
+  .home-story:first-child { border-top: 0; }
+  .home-story-num {
+    width: 56px;
+    flex-shrink: 0;
+    font-family: var(--font-dot);
+    font-size: 32px;
+    line-height: 38px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--signal-text);
+  }
+  .home-story-text { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  .home-story-title { font-size: 18px; line-height: 24px; font-weight: 500; overflow-wrap: anywhere; }
+  .hist-grid { display: flex; gap: 5px; }
+  .hist-col { display: flex; flex-direction: column; gap: 4px; }
+  .hist-col span { width: 7px; height: 7px; border-radius: var(--radius-pill); background: var(--hairline); }
+  .hist-col--past span.on { background: var(--ink); }
+  .hist-col--now span.on { background: var(--signal); }
+  .hist-axis { display: grid; grid-template-columns: repeat(24, 7px); column-gap: 5px; padding-top: 8px; }
+  .hist-axis span { grid-row: 1; white-space: nowrap; }
+  .home-profile {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-height: 48px;
+    border-top: 1px solid var(--hairline);
+    color: var(--ink);
+    text-decoration: none;
+  }
+  .home-profile:first-child { border-top: 0; }
+  .home-profile-name { flex-grow: 1; min-width: 0; font-size: 16px; line-height: 22px; font-weight: 500; overflow-wrap: anywhere; }
+  .home-profile-num {
+    font-family: var(--font-dot);
+    font-size: 18px;
+    line-height: 21px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--signal-text);
+  }
+  .home-keys { margin-top: auto; }
+
+  .fp-lead {
+    display: flex;
+    gap: 32px;
+    padding-bottom: 24px;
+    border-bottom: 1px solid var(--hairline);
+    color: var(--ink);
+    text-decoration: none;
+  }
+  .fp-lead-img {
+    width: 50%;
+    max-width: 540px;
+    height: 300px;
+    flex-shrink: 0;
+    object-fit: cover;
+    border-radius: var(--radius-md);
+    background: var(--raised-2);
+  }
+  .fp-lead-text { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; justify-content: center; gap: 14px; }
+  .fp-lead-title {
+    font-size: calc(36px * var(--scale));
+    line-height: calc(42px * var(--scale));
+    font-weight: 500;
+    letter-spacing: -0.01em;
+    overflow-wrap: anywhere;
+  }
+  .fp-lead-summary {
+    font-size: calc(17px * var(--scale));
+    line-height: calc(26px * var(--scale));
+    color: var(--muted);
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 4;
+    line-clamp: 4;
+  }
+  .fp-also { color: var(--signal-text); }
+  .fp-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px; }
+  .fp-item { min-width: 0; display: flex; flex-direction: column; gap: 10px; color: var(--ink); text-decoration: none; }
+  .fp-item--noimg { padding-top: 12px; border-top: 1px solid var(--hairline); }
+  .fp-item-img--none { flex-shrink: 0; }
+  .fp-item-img {
+    display: block;
+    width: 100%;
+    height: 150px;
+    object-fit: cover;
+    border-radius: var(--radius-md);
+    background: var(--raised-2);
+  }
+  .fp-item-title {
+    font-size: calc(18px * var(--scale));
+    line-height: calc(24px * var(--scale));
+    font-weight: 500;
+    overflow-wrap: anywhere;
+  }
+  .fp-item-title.is-read { color: var(--muted); }
+
+  @container (max-width: 859px) {
+    .home-cols { flex-direction: column; gap: 28px; }
+    .home-col--side { width: auto; }
+    .fp-lead { flex-direction: column; gap: 16px; }
+    .fp-lead-img { width: 100%; max-width: none; height: 240px; }
+    .fp-lead-title { font-size: calc(28px * var(--scale)); line-height: calc(34px * var(--scale)); }
+    .fp-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @container (max-width: 639px) {
+    .home-page { gap: 24px; padding: 24px; }
+    .home-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .home-tile { padding: 14px 16px; }
+    .home-tile-num { font-size: 36px; }
+  }
+  /* Karte quer (Bild links in Spaltenbreite, Text rechts): einzige Karte einer Rubrik ab zwei
+     Spalten, und bei zwei Spalten eine dritte Karte allein in ihrer Zeile. Ohne Bild (auch ohne
+     Platzhalter) nur Text mit Linie oben. */
+  @container (min-width: 560px) {
+    .fp-grid > .fp-item:only-child { grid-column: 1 / -1; }
+    .fp-grid > .fp-item:only-child:not(.fp-item--noimg):not(.fp-item--ph) {
+      display: grid;
+      grid-template-columns: calc((100% - 48px) / 3) minmax(0, 1fr);
+      grid-template-rows: auto 1fr;
+      column-gap: 24px;
+      row-gap: 10px;
+    }
+    .fp-grid > .fp-item:only-child:not(.fp-item--noimg):not(.fp-item--ph) > .fp-item-img { grid-column: 1; grid-row: 1 / span 2; }
+    .fp-grid > .fp-item:only-child:not(.fp-item--noimg):not(.fp-item--ph) > :not(.fp-item-img) { grid-column: 2; }
+    .fp-grid > .fp-item--ph:only-child > .fp-item-img--none { display: none; }
+    .fp-grid > .fp-item--ph:only-child { padding-top: 12px; border-top: 1px solid var(--hairline); }
+  }
+  @container (min-width: 560px) and (max-width: 859px) {
+    .fp-grid > .fp-item:nth-child(3):last-child { grid-column: 1 / -1; }
+    .fp-grid > .fp-item:only-child:not(.fp-item--noimg):not(.fp-item--ph),
+    .fp-grid > .fp-item:nth-child(3):last-child:not(.fp-item--noimg):not(.fp-item--ph) {
+      display: grid;
+      grid-template-columns: calc((100% - 24px) / 2) minmax(0, 1fr);
+      grid-template-rows: auto 1fr;
+      column-gap: 24px;
+      row-gap: 10px;
+    }
+    .fp-grid > .fp-item:nth-child(3):last-child:not(.fp-item--noimg):not(.fp-item--ph) > .fp-item-img { grid-column: 1; grid-row: 1 / span 2; }
+    .fp-grid > .fp-item:nth-child(3):last-child:not(.fp-item--noimg):not(.fp-item--ph) > :not(.fp-item-img) { grid-column: 2; }
+    .fp-grid > .fp-item--ph:nth-child(3):last-child > .fp-item-img--none { display: none; }
+    .fp-grid > .fp-item--ph:nth-child(3):last-child { padding-top: 12px; border-top: 1px solid var(--hairline); }
+  }
+  @container (max-width: 559px) {
+    .fp-grid { grid-template-columns: minmax(0, 1fr); }
+    /* Eine Spalte: keine grauen Flächen für fehlende Bilder, stattdessen die Linie oben. */
+    .fp-item-img--none { display: none; }
+    .fp-item--ph { padding-top: 12px; border-top: 1px solid var(--hairline); }
+    .fp-lead-img { height: 200px; }
+    .fp-lead-title { font-size: calc(24px * var(--scale)); line-height: calc(30px * var(--scale)); }
+  }
+
+  /* Einstellungen: Abschnitt „Am PC“ (E3DesktopEinstellungen). */
+  .set-pc { display: flex; flex-direction: column; padding-bottom: 16px; }
+  .sec-pc { display: flex; align-items: center; gap: 12px; padding: 20px 0 8px; }
+  .badge-signal { padding: 2px 8px; border: 1px solid var(--signal); border-radius: var(--radius-pill); color: var(--signal-text); }
+  .set-label { padding: 4px 0 8px; }
+}
+
+/* … ab 1400px ohne Fokusmodus als eigene Spalte rechts, die beim Scrollen stehen bleibt. */
+@media (min-width: 1400px) {
+  html:not([data-focus="on"]) .art-view.has-rail {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 340px;
+    align-items: start;
+    min-height: 100%;
+  }
+  /* Text bis zur rechten Kante der Knöpfe im Kopf (Board Kontext: Spalte 740px). */
+  html:not([data-focus="on"]) .art-view.has-rail .art { max-width: 740px; padding-bottom: 64px; }
+  html:not([data-focus="on"]) .art-rail {
+    position: sticky;
+    top: 0;
+    height: 100dvh;
+    max-width: none;
+    padding: 24px 28px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    scrollbar-color: var(--rule) transparent;
+    border-left: 1px solid var(--hairline);
+  }
+  html:not([data-focus="on"]) .art-rail-inner { padding-top: 0; border-top: 0; }
+}
+
+/* ---- Fokusmodus (E3DesktopFokus): nur ab 900px und nur mit offenem Artikel ---------------- */
+@media (min-width: 900px) {
+  html[data-focus="on"] #shell[data-layout="article"] { grid-template-columns: 76px minmax(0, 1fr); }
+  /* Liste bleibt eingehängt und behält ihre Scrollposition, ist aber weder sichtbar noch bedienbar. */
+  html[data-focus="on"] #shell[data-layout="article"] #view {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 520px;
+    visibility: hidden;
+    pointer-events: none;
+  }
+  html[data-focus="on"] #shell[data-layout="article"] #reader { grid-column: 2; grid-row: 1; }
+  html[data-focus="on"] #shell[data-layout="article"] #bar { display: none !important; }
+  html[data-focus="on"] #shell[data-layout="article"] .focus-rail {
+    grid-column: 1;
+    grid-row: 1;
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    padding: 20px 0;
+    overflow-y: auto;
+    scrollbar-width: none;
+    border-right: 1px solid var(--hairline);
+  }
+  .focus-rail-mark { padding-bottom: 8px; font-family: var(--font-dot); font-size: 28px; line-height: 36px; font-weight: 700; }
+  .focus-rail-count { margin-top: auto; display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .focus-rail-num {
+    font-family: var(--font-dot);
+    font-size: 22px;
+    line-height: 26px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--signal-text);
+  }
+
+  html[data-focus="on"] .art-progress { visibility: visible; }
+  /* Kopf bleibt oben stehen, damit der Lesefortschritt beim Scrollen sichtbar ist. */
+  html[data-focus="on"] .art-hdr { position: sticky; top: 0; z-index: 5; background: var(--bg); }
+  html[data-focus="on"] .art { --art-gap: 18px; max-width: 840px; margin: 0 auto; padding: 24px 40px 120px; }
+  html[data-focus="on"] .art-view.has-rail .art { padding-bottom: 32px; }
+  html[data-focus="on"] .art-title { font-size: calc(40px * var(--scale)); line-height: calc(48px * var(--scale)); }
+  html[data-focus="on"] .art-hero { max-height: 380px; }
+  html[data-focus="on"] .article-body p, html[data-focus="on"] .article-body li,
+  html[data-focus="on"] .article-body blockquote, html[data-focus="on"] .article-body td,
+  html[data-focus="on"] .article-body th {
+    font-size: calc(19px * var(--scale));
+    line-height: calc(30px * var(--scale));
+  }
+  html[data-focus="on"] .article-body h1, html[data-focus="on"] .article-body h2, html[data-focus="on"] .article-body h3,
+  html[data-focus="on"] .article-body h4, html[data-focus="on"] .article-body h5, html[data-focus="on"] .article-body h6 {
+    font-size: calc(21px * var(--scale));
+    line-height: calc(28px * var(--scale));
+  }
+  /* Bildzeilen bleiben klein (sonst gewänne die Absatzgröße oben). */
+  html[data-focus="on"] .article-body .art-caption, html[data-focus="on"] .article-body figcaption {
+    font-size: 12px;
+    line-height: 16px;
+  }
+  html[data-focus="on"] .art-rail { max-width: 840px; margin: 0 auto; padding: 0 40px 120px; }
+
+  /* Schwebende Pille „Nächster“ unten rechts, nur im freien Rand neben der Textspalte. Der Text
+     endet bei 76px + (100vw - 76px) / 2 + 380px; bis 40px vor den rechten Rand bleiben
+     (100vw - 76px) / 2 - 420px, abzüglich 16px Luft. Reicht das nicht für Pille mit lesbarem
+     Titel (unter 1600px), bleibt nur der runde Pfeil (rechts bündig mit den Knöpfen im Kopf); wo
+     auch der die letzte Textzeile berühren würde (unter 1036px), macht der Text rechts Platz. */
+  html[data-focus="on"] .focus-next {
+    position: fixed;
+    right: 40px;
+    bottom: 24px;
+    z-index: 10;
+    max-width: calc((100vw - 76px) / 2 - 436px);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px 10px 20px;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-pill);
+    background: var(--raised);
+    color: var(--ink);
+    text-decoration: none;
+  }
+  .focus-next-label { color: var(--signal-text); flex-shrink: 0; }
+  .focus-next-title {
+    min-width: 0;
+    max-width: 300px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    font-size: 15px;
+    line-height: 20px;
+    font-weight: 500;
+  }
+  .focus-next-arrow {
+    width: var(--tap);
+    height: var(--tap);
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--rule);
+    border-radius: var(--radius-pill);
+  }
+}
+
+@media (min-width: 900px) and (max-width: 1599.98px) {
+  html[data-focus="on"] .focus-next { max-width: none; padding: 0; gap: 0; border: 0; background: transparent; }
+  html[data-focus="on"] .focus-next-label, html[data-focus="on"] .focus-next-title {
+    position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
+  }
+  html[data-focus="on"] .focus-next-arrow { background: var(--raised); border-color: var(--rule); }
+  html[data-focus="on"] .focus-next:focus-visible { outline: none; }
+  html[data-focus="on"] .focus-next:focus-visible .focus-next-arrow { outline: 2px solid var(--ink); outline-offset: 2px; }
+}
+@media (min-width: 900px) and (max-width: 1035.98px) {
+  /* Rechter Textrand mindestens 100px vor dem Fensterrand (Pfeil 44px + 40px Rand + 16px Luft):
+     Spalte 840px mittig in 100vw - 76px, also 558px - 50vw; nie weniger als die üblichen 40px. */
+  html[data-focus="on"] .art, html[data-focus="on"] .art-rail { padding-right: max(40px, 558px - 50vw); }
+}

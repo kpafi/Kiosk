@@ -22,6 +22,10 @@ const SHAPES = {
   newspaper: { body: '<path d="M4 5h16v14H4zM8 9h8M8 13h5"/>' },
   settings: { body: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>' },
   clock: { body: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>' },
+  // Fokusmodus (E3DesktopFokus): aufziehen, einklappen, Liste einblenden.
+  expand: { body: '<path d="M4 4h6M4 4v6M20 20h-6M20 20v-6M4 4l6 6M20 20l-6-6"/>' },
+  collapse: { body: '<path d="M10 4v6H4M14 20v-6h6M10 10 4 4M14 14l6 6"/>' },
+  list: { body: '<path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/>', join: false },
 };
 
 /**
@@ -64,3 +68,6 @@ export const chevronRight = (s = 18) => icon('chevronRight', s);
 export const arrowRight = (s = 18) => icon('arrowRight', s);
 export const external = (s = 16) => icon('external', s);
 export const clock = (s = 16) => icon('clock', s);
+export const expand = (s = 20) => icon('expand', s);
+export const collapse = (s = 20) => icon('collapse', s);
+export const listIcon = (s = 20) => icon('list', s);

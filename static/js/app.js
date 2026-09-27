@@ -11,7 +11,10 @@ import { showBar } from './ui/bar.js';
 import { closeSheet, isSheetOpen } from './ui/sheet.js';
 import { markOpenRow } from './ui/row.js';
 import { listView } from './views/list.js';
-import { articleView, readerEmpty } from './views/article.js';
+import { articleView } from './views/article.js';
+import { readerHome } from './views/home.js';
+import { installFocusRail, settleFocus } from './views/focus.js';
+import { barWanted as layoutBarWanted, homeVisible } from './layout.js';
 import { savedView } from './views/saved.js';
 import { searchView } from './views/search.js';
 import { sourceView } from './views/sourceView.js';
@@ -37,6 +40,7 @@ let listScroll = 0;                         // Scrollposition der Liste (Handy)
 let openedId = null;                        // zuletzt geöffneter Artikel (Handy: Fokus zurück auf seine Zeile)
 let afterLogin = null;                      // Ziel nach dem Anmelden
 let afterLoginUser = null;                  // Benutzer-ID, zu der afterLogin gehört
+const home = readerHome();                  // Desktop ohne Artikel: Tagesübersicht oder Titelseite
 
 // ---- Routen (parseHash in route.js) -------------------------------------------------
 
@@ -64,9 +68,25 @@ function ensureList() {
   return mount(LIST_VIEWS[r.name] ? r : parseHash('#/'), LIST_VIEWS[r.name] || listView);
 }
 
-function setLayout(layout, bar) {
+/** Leiste unten: nur zu Listen, mit offenem Artikel nur am Desktop und nicht im Fokusmodus. */
+function barWanted() {
+  return layoutBarWanted({
+    viewLayout: current.view && current.view.layout, viewBar: !!(current.view && current.view.bar),
+    layout: shell.dataset.layout, desktop: isDesktop(), focus: state.settings.focus_mode === true,
+  });
+}
+
+/** Tagesübersicht/Titelseite laden, sobald sie zu sehen ist (Desktop, Liste, kein Artikel). */
+function syncHome() {
+  home.setVisible(homeVisible({
+    authed: state.authed, readerOpen: !!reader, layout: shell.dataset.layout, desktop: isDesktop(),
+  }));
+}
+
+function setLayout(layout) {
   shell.dataset.layout = layout;
-  showBar(!!bar);
+  showBar(barWanted());
+  syncHome();
 }
 
 function closeReader() {
@@ -74,7 +94,11 @@ function closeReader() {
   reader = null;
   state.openArticleId = null;
   markOpenRow(null);
-  readerEl.replaceChildren(readerEmpty());
+  readerEl.setAttribute('aria-label', home.label());
+  if (readerEl.firstChild !== home.el || readerEl.childNodes.length !== 1) {
+    readerEl.replaceChildren(home.el);
+    readerEl.scrollTop = 0;   // Übersicht beginnt oben, nicht an der Stelle des eben gelesenen Artikels
+  }
 }
 
 function setTitle(view) {
@@ -85,6 +109,7 @@ function showLogin() {
   if (current.key === 'login') return;
   closeSheet({ silent: true });
   closeReader();
+  home.reset();
   const r = parseHash(location.hash);
   if (r.name !== 'login') {
     afterLogin = location.hash || '#/';
@@ -92,7 +117,7 @@ function showLogin() {
     afterLoginUser = state.user ? state.user.id : null;
   }
   const view = mount({ key: 'login' }, () => loginView({ onSuccess: loggedIn }));
-  setLayout('page', false);
+  setLayout('page');
   setTitle(view);
   view.onShow?.();
 }
@@ -136,15 +161,18 @@ function route() {
   const wasArticle = shell.dataset.layout === 'article';
 
   if (r.name === 'article') {
-    const list = ensureList();
+    ensureList();
     if (!wasArticle) listScroll = window.scrollY;
     reader?.destroy();
     reader = articleView(r.id);
+    readerEl.setAttribute('aria-label', 'Artikel');
     readerEl.replaceChildren(reader.el);
-    setLayout('article', isDesktop() && list.bar);
+    setLayout('article');
     openedId = Number(r.id);
-    if (isDesktop()) readerEl.scrollTop = 0;
-    else {
+    if (isDesktop()) {
+      readerEl.scrollTop = 0;
+      settleFocus();   // Fokusmodus: Tastatur auf den Artikel, nicht auf die eingeklappte Liste
+    } else {
       window.scrollTo(0, 0);
       // Handy: Die Liste ist ausgeblendet, der Fokus läge sonst auf der unsichtbaren Zeile.
       readerEl.focus({ preventScroll: true });
@@ -155,8 +183,8 @@ function route() {
 
   closeReader();
   if (r.name === 'profiles') {
-    const list = ensureList();
-    setLayout('list', list.bar);
+    ensureList();
+    setLayout('list');
     setTitle({ title: 'Profile' });
     openProfiles(r);
     return;
@@ -166,7 +194,7 @@ function route() {
   const fresh = current.key !== r.key;
   const view = fresh ? mount(r, factory) : current.view;
   if (!fresh && view.layout === 'list') state.lastListHash = r.hash;
-  setLayout(view.layout, view.bar);
+  setLayout(view.layout);
   setTitle(view);
   if (fresh) {
     window.scrollTo(0, 0);
@@ -233,7 +261,7 @@ function showOffline(status = 0) {
   closeSheet({ silent: true });
   closeReader();
   const view = mount({ key: 'offline' }, () => offlineView({ onRetry: start, status }));
-  setLayout('page', false);
+  setLayout('page');
   setTitle(view);
 }
 
@@ -272,6 +300,7 @@ async function boot() {
     showLogin();
   });
   installKeyboard();
+  installFocusRail();
   window.addEventListener('hashchange', () => { tagHistory(); route(); });
   document.addEventListener('click', sameHashLinks);
   // Zurück auf einen Eintrag mit derselben Adresse: kein hashchange, trotzdem neu routen.
@@ -286,10 +315,11 @@ async function boot() {
   });
   scheduleMidnightRefresh();
   window.matchMedia('(min-width: 900px)').addEventListener('change', () => {
-    const list = current.view && current.view.layout === 'list';
-    const article = shell.dataset.layout === 'article';
-    showBar(!!(list && current.view.bar && (!article || isDesktop())));
+    showBar(barWanted());
+    syncHome();
   });
+  // Fokusmodus blendet die Leiste aus (nur mit offenem Artikel am Desktop, siehe barWanted).
+  on('settings', (patch) => { if ('focus_mode' in patch) showBar(barWanted()); });
 
   registerServiceWorker();
   await start();

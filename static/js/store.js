@@ -9,6 +9,8 @@ export const DEFAULT_SETTINGS = {
   show_images: true,
   free_only: true,   // nur noch aus Kompatibilität; Paywall-Artikel zeigt die Oberfläche nie
   bar_order: [],
+  desktop_empty: 'overview',   // Desktop ohne offenen Artikel: 'overview' (Tagesübersicht) oder 'frontpage'
+  focus_mode: false,           // Desktop: Fokusmodus (Liste eingeklappt, Text mittig)
 };
 
 const LS_SETTINGS = 'kiosk.settings';   // auch von theme-boot.js gelesen
@@ -67,7 +69,10 @@ export function resetUserState() {
     favorites: null, bar: null, counts: null, listItems: [], listIsCtx: false, listWatermark: null,
     lastListHash: '#/', openArticleId: null, unread: true, ctx: { type: 'all' },
   });
+  userGen += 1;
   applySettings();
+  emit('user-reset');   // z. B. laufendes Speichern des Fokusmodus beenden (focus.js)
+  emit('bar');   // Zähler (Leiste, Fokus-Leiste) nicht mit den Zahlen des vorigen Benutzers stehen lassen
 }
 
 // ---- Ereignisse ------------------------------------------------------------
@@ -150,19 +155,39 @@ export function applySettings() {
   const theme = s.theme === 'system' ? (lightQuery.matches ? 'light' : 'dark') : s.theme;
   root.dataset.theme = theme === 'light' ? 'light' : 'dark';
   root.dataset.text = ['s', 'm', 'l'].includes(s.text_size) ? s.text_size : 'm';
+  // Fokusmodus wirkt nur am Desktop mit offenem Artikel (CSS); das Attribut steht immer.
+  root.dataset.focus = s.focus_mode === true ? 'on' : 'off';
   const meta = document.querySelector('meta[name="theme-color"]');
   if (meta) meta.setAttribute('content', theme === 'light' ? '#f2f2f2' : '#000000');
 }
 
-/** Sofort anwenden, dann speichern (Fehler gehen an den Aufrufer). */
-export async function saveSettings(patch) {
+/** Einstellungen nur lokal übernehmen und anwenden (ohne Speichern), z. B. zum Zurückrollen. */
+export function setLocalSettings(patch) {
   state.settings = { ...state.settings, ...patch };
   lsSet(LS_SETTINGS, state.settings);
   applySettings();
   emit('settings', patch);
+}
+
+const settingsSeq = {};   // je Schlüssel: nur die Antwort des letzten Speicherns dieses Schlüssels zählt
+let userGen = 0;          // Benutzerwechsel: späte Antworten des vorigen Benutzers zählen nicht
+
+/** Sofort anwenden, dann speichern (Fehler gehen an den Aufrufer). Aus der Antwort werden nur die
+ *  eigenen Schlüssel übernommen (focus_mode z. B. speichert focus.js selbst, nacheinander). */
+export async function saveSettings(patch) {
+  const gen = userGen;
+  const seqs = {};
+  for (const key of Object.keys(patch)) seqs[key] = settingsSeq[key] = (settingsSeq[key] || 0) + 1;
+  setLocalSettings(patch);
   const data = await api('settings', { method: 'PATCH', body: patch });
-  if (data) state.settings = { ...DEFAULT_SETTINGS, ...data };
-  lsSet(LS_SETTINGS, state.settings);
+  if (!data || gen !== userGen) return;
+  // Hat der Server für einen eigenen Schlüssel etwas anderes gespeichert, gilt das.
+  const changed = {};
+  for (const key of Object.keys(patch)) {
+    if (settingsSeq[key] !== seqs[key] || !(key in data)) continue;   // inzwischen erneut gespeichert
+    if (JSON.stringify(data[key]) !== JSON.stringify(state.settings[key])) changed[key] = data[key];
+  }
+  if (Object.keys(changed).length) setLocalSettings(changed);
 }
 
 export function setUnreadFilter(value) {

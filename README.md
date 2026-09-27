@@ -13,6 +13,7 @@ Konto, Lesestand, Profilen, Lieblingszeitungen, Leiste und Einstellungen (siehe 
   - `extract.py` Volltext per trafilatura, HTML auf eine Whitelist bereinigt, Paywall-Erkennung
   - `db.py` SQLite mit WAL und FTS5-Volltextsuche
   - `api_ui.py` Routen für die Oberfläche: Profile, Lieblingszeitungen, Leiste, Einstellungen, Zähler
+  - `stories.py` Geschichten: erkennt Artikel verschiedener Zeitungen über dasselbe Ereignis (de/en)
   - `auth.py` Passwort-Hashes (scrypt), signiertes Cookie pro Benutzer, Login-Bremse
   - `users.py` Konten verwalten auf der Kommandozeile (`python -m app.users`)
 - `static/` Web-Oberfläche (PWA ohne Build-Schritt: `index.html`, `js/`, `css/`, `sw.js`)
@@ -79,6 +80,9 @@ Anfangsbuchstaben („Admin“). Der letzte aktive Admin lässt sich nicht lösc
 | GET | `/api/articles?source=&country=&profile=&q=&unread=&starred=&later=&free=&days=&before=&offset=&limit=` | Artikelliste, siehe Blättern und Filter |
 | GET | `/api/articles/{id}` | Artikel mit Volltext, siehe Abruf auf Anforderung |
 | GET | `/api/articles/{id}/next?source=&country=&profile=&unread=true&starred=&later=&free=&days=` | Nächster älterer Artikel im selben Filterkontext: `{item}` oder `{item: null}` |
+| GET | `/api/articles/{id}/related` | Rechte Seite zum Artikel: `{story_id, sources_count, same_story, topic}`, siehe Geschichten |
+| GET | `/api/overview` | Tagesübersicht: `{date, now_hour, counts, top_stories, hourly}`, siehe Geschichten |
+| GET | `/api/frontpage` | Titelseite: `{lead, sections}`, siehe Geschichten |
 | POST | `/api/articles/{id}/read` `{value}` | Gelesen-Status |
 | POST | `/api/articles/{id}/star` `{value}` | Favorit |
 | POST | `/api/articles/{id}/later` `{value}` | Später lesen |
@@ -179,11 +183,81 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
   `bar_order`; nicht dort genannte hängen hinten an (erst Zeitungen, dann Profile). `label` ist für
   Zeitungen `short` aus `sources.yaml` (höchstens 12 Zeichen, Versalien), für Profile der Name in Versalien.
 - Einstellungen: `theme` (`system`/`dark`/`light`), `text_size` (`s`/`m`/`l`), `mark_read_on_open`,
-  `show_images`, `free_only` (boolesch, streng), `bar_order` (Liste aus `source:<id>`/`profile:<id>`).
-  Standard: `dark`, `m`, `true`, `true`, `true`, `[]`. Unbekannte Felder oder `null`: 422.
+  `show_images`, `free_only` (boolesch, streng), `bar_order` (Liste aus `source:<id>`/`profile:<id>`),
+  `desktop_empty` (`overview`/`frontpage`: was am Desktop rechts steht, wenn kein Artikel offen ist),
+  `focus_mode` (boolesch, Fokusmodus am Desktop). Standard: `dark`, `m`, `true`, `true`, `true`, `[]`,
+  `overview`, `false`. Unbekannte Felder, andere Werte oder `null`: 422; ein ungültiger gespeicherter
+  Wert zählt nicht (Standard).
   `free_only` bleibt nur aus Kompatibilität: `false` wird angenommen und gespeichert, hat aber keine
   Wirkung (Paywall-Artikel sind nie sichtbar); die Oberfläche zeigt den Schalter nicht mehr.
 - `counts` zählt `unread`, `later` und `starred` immer ohne Paywall-Artikel (wie die Listen).
+
+### Geschichten (rechte Seite am Desktop)
+
+- `app/stories.py` gruppiert nach jedem Abruf der Feeds und einmal beim Start alle Artikel der letzten
+  48 h: Artikel verschiedener Zeitungen (auch deutsch und englisch gemischt) über dasselbe Ereignis
+  bekommen dieselbe `articles.story_id` (`NULL` = keine Geschichte). Eine neue Geschichte bekommt die
+  kleinste Artikel-ID der Gruppe; eine bestehende behält ihre ID, solange ihre Artikel zusammenbleiben
+  (auch wenn der erste aus dem Fenster wandert oder ein kleinerer dazukommt), aber nie über mehr als 36 h:
+  Liegt ihr ältester Artikel weiter zurück, beginnt eine neue Geschichte (die älteren Artikel behalten die
+  alte ID, außer sie stammen dann nur noch aus einer Zeitung). Ohne neue Artikel gruppiert der Sammler
+  höchstens alle 30 Minuten neu.
+  Eine Geschichte braucht mindestens zwei Zeitungen, ihre Artikel liegen höchstens 36 h auseinander.
+  Gruppiert wird nach Ereignis, nicht nach Thema: zwei Beben, zwei Streiks oder zwei Goldmedaillen am
+  selben Tag bleiben getrennt, ebenso zwei Geschichten über dieselbe Person. Kommentare und Analysen
+  (Titel oder URL) gehören nur bei sehr hoher Ähnlichkeit dazu und verbinden nie andere Artikel;
+  Liveblogs, Ticker, Newsletter und Sendungen gehören nie zu einer Geschichte. Namen allein verbinden
+  nicht (Spielbericht und Vertragsverlängerung desselben Vereins), verschiedene Spielstände trennen.
+  Verfahren und Messung stehen in `app/stories.py` und `tests/test_stories.py` (vier
+  zeitlich getrennte, beschriftete Fenster echter Feed-Einträge unter `tests/fixtures/`, darunter zwei
+  mit Artikeln, die es beim Einstellen noch nicht gab). Das Rechnen läuft in einem Thread, Fehler beenden
+  den Sammler nie; ein Lauf, der während eines anderen fällig wird, folgt gleich danach. Der Volltext zählt
+  nur bei fehlendem oder sehr kurzem Anreißer (unter 80 Zeichen); kam so ein Volltext bei der Extraktion,
+  gruppiert der Sammler gleich noch einmal.
+- `sources_count` ist die Zahl der Zeitungen: verschiedene Verlage, also zählen die Ausgaben von
+  The Local (Deutschland, Österreich, ...) und heise/heise Security je einmal, dieselbe Agenturmeldung
+  in zwei Zeitungen aber doppelt. Gezählt werden nur Artikel, die zum Zeitraum passen (Übersicht und
+  Aufmacher: heute; zum offenen Artikel: höchstens 36 h davor oder danach). Alle Listen hier zeigen nur
+  Quellen wie ALLE (aktiviert, ohne `in_all: false`), keine Paywall-Artikel, und beachten die
+  Aufbewahrungsgrenze; die Einträge haben die Form der Artikelliste.
+- `GET /api/articles/{id}/related` (404 wie `GET /api/articles/{id}`): `same_story` sind die anderen
+  Artikel der Geschichte aus anderen Zeitungen (die eigene fehlt), höchstens 12, je Zeitung einer, in
+  der Reihenfolge der Vertreter (siehe unten); wörtliche Kopien des offenen Artikels fehlen, ebenso
+  anderssprachige Artikel, die mit dem offenen nicht erkennbar dasselbe erzählen (zwei gemeinsame
+  Inhaltswörter in Titel und erstem Satz oder sehr hohe Ähnlichkeit). Ohne Geschichte (`story_id:
+  null`) stehen hier Artikel anderer Zeitungen, die trotzdem dasselbe Ereignis erzählen (ähnlich genug
+  für eine Kante, höchstens 36 h auseinander). Eine Geschichte, die im Zeitraum nur eine Zeitung
+  hat, gilt als keine. `sources_count` zählt die Zeitungen, die die Seite zeigt:
+  die des offenen Artikels und die gelisteten (ohne Treffer 1). `topic` sind bis zu 5 Artikel der
+  letzten 7 Tage zum selben Thema, aber ein anderes Ereignis: nie derselben Geschichte, nie aus derselben
+  Zeitung, nie ein Artikel, der das Ereignis erzählt, ohne in der Geschichte zu stehen (ähnlich wie zwei
+  ihrer Artikel oder, ohne Geschichte, wie der offene; oder ihr Stichwort wie „Fairford“ im Titel), nie
+  Liveblogs, Ticker, Newsletter oder Sendungen; das Thema muss im Titel stehen, ein besonderes Wort
+  (Name, Ort) gemeinsam haben, höchstens einer je Geschichte und je Ereignis, höchstens 2 je Zeitung.
+  Zu einem Liveblog oder einer Sendung gibt es keine Themen.
+- `GET /api/overview`: `date` und `now_hour` in `KIOSK_TZ`; `counts` = `{new_today, unread_today, later,
+  active_sources}` (heute ab 00:00 `KIOSK_TZ`; `unread_today` wie der ALLE-Zähler, `later` wie in
+  `/api/counts`, `active_sources` = Zeitungen mit Artikeln heute); `top_stories` bis zu 5 Geschichten mit
+  mindestens 3 Zeitungen heute, meiste zuerst, dann die neueste: `{story_id, sources_count, sources,
+  article}` mit bis zu 4 Kurznamen (einer je Zeitung) in der Reihenfolge der Auswahl. Hat heute weniger
+  als 3 solche Geschichten (kurz nach Mitternacht), kommen sie aus den letzten 24 Stunden, falls das
+  mehr sind: `window` ist dann `"24h"`, sonst `"today"`; Zähler und Stunden bleiben bei heute. `hourly` =
+  24 Zahlen (Artikel je Stunde heute, wie `new_today`). Vertreter einer Geschichte: ein Artikel, der sie
+  erzählt (mittig: mindestens 85 % der größten Ähnlichkeit zum Schwerpunkt der Gruppe), darunter
+  deutschsprachig vor anderen, mit Bild, mit Volltext, dann der neueste. Reicht das Zeitbudget für die
+  Zähler nicht, sind `unread_today` und `later` `null`; für die Artikel des Tages nicht, sind `new_today`
+  und `active_sources` `null` und `hourly` leer (`[]`).
+- `GET /api/frontpage`: `date` und `now_hour` in `KIOSK_TZ` wie in der Übersicht; `lead` ist die
+  Geschichte mit den meisten Zeitungen heute (mindestens 2; gibt es heute keine, die der letzten 24
+  Stunden, dann `window: "24h"`, sonst `"today"`; ohne beides `null`), Vertreter bevorzugt mit Bild:
+  `{story_id, sources_count, article}`. `sections` für die Profile mit `in_chips` (keines: alle), in ihrer
+  Reihenfolge, höchstens die ersten 4: `{profile_id, name, items: [{article, sources_count}]}` mit bis zu
+  3 Artikeln der letzten 24 h, je Geschichte einer (Vertreter wie oben, das Bild vor der Sprache), meiste
+  Zeitungen zuerst, dann die neuesten. Der Aufmacher und schon gezeigte Geschichten fehlen in späteren
+  Rubriken; Rubriken ohne Artikel fallen weg. Gruppiert wird in SQL über alle Artikel der 24 h.
+- Übersicht, Titelseite und die Seite zum Artikel (`related`) haben je höchstens 3 s für ihre Abfragen;
+  was dann fehlt (eine Rubrik, die Geschichten des Tages, die Stunden, dieselbe Geschichte, die Themen),
+  bleibt leer statt einer 503.
 
 ### Text- und HTML-Vertrag
 
@@ -250,7 +324,11 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
 - Bereits gesehene Feed-Einträge (Quelle + GUID) stehen in `seen_guids` und werden nicht erneut angelegt,
   auch nachdem der Artikel gelöscht wurde. Solange ein Eintrag im Feed steht, wird sein Zeitstempel
   (höchstens täglich) aufgefrischt; gelöscht wird er erst, wenn er doppelt so lange wie die
-  Aufbewahrungsfrist nicht mehr im Feed stand.
+  Aufbewahrungsfrist nicht mehr im Feed stand. Nur für das Muster der BBC (sie hängt eine wechselnde Nummer an
+  die GUID: „…#1“, „…#8“): Ist die GUID ohne „#…“ die Adresse oder die GUID ohne „#…“ eines Artikels
+  derselben Quelle mit derselben Adresse und demselben Titel, der weniger als 6 Stunden davor oder danach
+  erschien, ist es derselbe Artikel und wird nicht angelegt. Ein täglicher Eintrag unter fester Adresse
+  mit neuem Titel und stündliche Sendungen mit fester Adresse und festem Titel, aber eigener GUID bleiben neu.
 - Vorübergehende Fehler (Timeouts, Netzwerk- und DNS-Fehler, 5xx, 408/425/429, Größenlimit) werden
   nach 1 h, 4 h und 12 h erneut versucht, danach gilt der Artikel als `failed`. Ein `Retry-After`
   bei 429 wird respektiert (höchstens 12 h). Andere 4xx sind sofort endgültig `failed`.
@@ -325,8 +403,9 @@ Statische Dateien (auch `sw.js`, Schriften, Icons) werden mit `Cache-Control: no
 
 Die App muss mit genau einem uvicorn-Worker laufen (Login-Bremse im Speicher, eine Sammler-Schleife,
 eine SQLite-Verbindung). Das Datenbankschema wird beim Start automatisch migriert (`meta.schema_version`,
-aktuell 7: Tabellen `users` und `user_articles`, Profile/Favoriten/Einstellungen mit `user_id`; seit 7
-`profiles.in_chips`, bestehende Profile bekommen 1). Die alten
+aktuell 8: Tabellen `users` und `user_articles`, Profile/Favoriten/Einstellungen mit `user_id`; seit 7
+`profiles.in_chips`, bestehende Profile bekommen 1; seit 8 `articles.story_id` mit Index, gefüllt vom
+ersten Lauf nach dem Start). Die alten
 Spalten `articles.read/starred/later` bleiben physisch stehen, werden aber nicht mehr benutzt.
 Den Test der Migration auf einer Kopie der Produktionsdatenbank aktiviert
 `KIOSK_PRODCOPY_DB=/pfad/zur/kopie.db .venv/bin/python -m pytest tests/test_users.py`.

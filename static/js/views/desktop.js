@@ -1,7 +1,19 @@
-// Tastatur für Liste und Leseansicht: j/k blättern, Enter öffnen, m/s/l Flags, / Suche.
-import { isTyping, toast } from '../ui/dom.js';
+// Tastatur für Liste und Leseansicht: j/k blättern, Enter öffnen, m/s/l Flags, / Suche,
+// F Fokusmodus (Desktop, Artikel offen), Esc beendet ihn.
+import { h, isDesktop, isTyping, toast } from '../ui/dom.js';
 import { isSheetOpen } from '../ui/sheet.js';
 import { navigate, setFlag, state } from '../store.js';
+import { focusActive, setFocusMode, toggleFocusMode } from './focus.js';
+
+/** Tastenhinweise am Desktop (rechte Seite ohne Artikel, wie im Board). */
+export const KEY_HINTS = ['j / k blättern', 'Enter öffnen', '/ suchen'];
+
+/** Hinweiszeile; jeder Hinweis bricht nur als Ganzes um. */
+export function keyHints(extraClass = '') {
+  const el = h('p', { class: `key-hints ${extraClass}`.trim() });
+  KEY_HINTS.forEach((hint, i) => el.append(...(i ? [' · '] : []), h('span', { text: hint })));
+  return el;
+}
 
 function rows() {
   return [...document.querySelectorAll('#view .row')];
@@ -42,11 +54,19 @@ export function installKeyboard() {
     if (!state.authed) return;
     const key = e.key;
     if (key === 'j' || key === 'k') {
+      if (focusActive()) return;   // Fokusmodus: die Liste ist eingeklappt
       e.preventDefault();
       moveFocus(key === 'j' ? 1 : -1);
     } else if (key === '/') {
       e.preventDefault();
       navigate('#/suche');
+    } else if ((key === 'f' || key === 'F') && !e.shiftKey && state.openArticleId && isDesktop()) {
+      e.preventDefault();
+      if (!e.repeat) toggleFocusMode();   // gehaltene Taste schaltet nicht dauernd um
+    } else if (key === 'Escape' && state.settings.focus_mode === true && state.openArticleId && isDesktop()) {
+      // Ein offenes Blatt fängt Escape vorher ab (siehe oben: isSheetOpen, defaultPrevented).
+      e.preventDefault();
+      if (!e.repeat) setFocusMode(false);
     } else if (FLAG_KEYS[key]) {
       const item = targetItem();
       if (!item) return;

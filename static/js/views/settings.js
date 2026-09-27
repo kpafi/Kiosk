@@ -1,4 +1,5 @@
-// Einstellungen (E2Einstellungen): Konto, Erscheinungsbild, Textgröße, Lesen, Quellen, Abmelden.
+// Einstellungen (E2Einstellungen): Konto, Erscheinungsbild, Textgröße, Am PC (nur Desktop,
+// E3DesktopEinstellungen), Lesen, Quellen, Abmelden.
 import { h, replace, toast } from '../ui/dom.js';
 import { chevronRight } from '../ui/icons.js';
 import { subHeader } from '../ui/header.js';
@@ -6,6 +7,7 @@ import { chipGroup } from '../ui/chips.js';
 import { toggle } from '../ui/toggle.js';
 import { api } from '../api.js';
 import { formatCount, formatMB } from '../format.js';
+import { focusSwitchChange } from './focus.js';
 import {
   emit, isAdmin, loadSettings, loadStatus, resetUserState, saveSettings, state,
 } from '../store.js';
@@ -67,6 +69,12 @@ export function settingsView() {
       { value: 's', label: 'Klein' }, { value: 'm', label: 'Normal' }, { value: 'l', label: 'Groß' },
     ], s.text_size, (v) => { save({ text_size: v }).catch(() => {}); });
 
+    const emptyChips = selectGroup('Rechts, wenn kein Artikel offen ist', [
+      { value: 'overview', label: 'Tagesübersicht' }, { value: 'frontpage', label: 'Titelseite' },
+    ], s.desktop_empty === 'frontpage' ? 'frontpage' : 'overview', (v) => { save({ desktop_empty: v }).catch(() => {}); });
+    emptyChips.removeAttribute('aria-label');
+    emptyChips.setAttribute('aria-labelledby', 'set-desktop-empty');
+
     const admin = isAdmin();
     const user = state.user;
     const build_ = st.build ? String(st.build).slice(0, 8) : 'lokal';
@@ -89,6 +97,15 @@ export function settingsView() {
       themeChips,
       section('TEXTGRÖSSE'),
       sizeChips,
+      // Nur am Desktop (ab 900 px): rechte Seite ohne Artikel und Fokusmodus.
+      h('div', { class: 'set-pc only-desktop' },
+        h('div', { class: 'sec-pc' },
+          h('h2', { class: 't-section', text: 'AM PC' }),
+          h('span', { class: 'badge-signal t-caption', text: 'Nur am PC' })),
+        h('span', { class: 'set-label t-ui', id: 'set-desktop-empty', text: 'Rechts, wenn kein Artikel offen ist' }),
+        emptyChips,
+        row('Fokusmodus', 'Liste einklappen, Text mittig · Taste F · Esc beendet',
+          toggle(s.focus_mode === true, 'Fokusmodus', focusSwitchChange))),
       section('LESEN'),
       row('Gelesen beim Öffnen', 'Beim Öffnen als gelesen markieren',
         toggle(s.mark_read_on_open, 'Gelesen beim Öffnen', (v) => save({ mark_read_on_open: v }))),

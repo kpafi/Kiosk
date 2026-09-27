@@ -29,6 +29,7 @@ from .extract import drop_title_echo, extract, is_placeholder, is_small_image_ur
 from .netguard import BlockedURL, ResolveError, check_url, server_addr_blocked, set_deny_networks
 from .sitemap import ParsedRows, parse_sitemap, pick_child, sitemap_kind, url_host
 from .sources import Catalog, Source
+from . import stories
 
 log = logging.getLogger("kiosk.fetcher")
 
@@ -36,6 +37,7 @@ READER_UA = "Mozilla/5.0 (compatible; KioskReader/0.1; private RSS reader)"
 FEED_CONCURRENCY = 8
 EXTRACT_BATCH = 60
 EXTRACT_MAX_PER_CYCLE = 900
+STORIES_IDLE_REFRESH = timedelta(minutes=30)   # ohne neue Artikel: Geschichten höchstens so oft neu gruppieren
 PER_DOMAIN_DELAY = 0.4
 IMAGE_TYPES = ("image/",)
 # Eingangsgrenzen; die Ausgabe begrenzen FEED_MAX_ENTRIES und extract.MAX_BODY_HTML, beides wird im
@@ -310,6 +312,8 @@ class Fetcher:
         self._priority_sem = asyncio.Semaphore(PRIORITY_CONCURRENCY)
         # Artikel-ID -> laufende Extraktion; verhindert doppelte Abrufe und doppelt gezählte Versuche.
         self._inflight: dict[int, asyncio.Task] = {}
+        self._extracted_ids: list[int] = []         # zuletzt extrahierte Artikel (siehe run_once)
+        self._stories_at = -math.inf                 # monotone Zeit des letzten Laufs der Gruppierung
         # Extraktionen auf Anforderung: wie viele laufen oder warten (Grenze PRIORITY_QUEUE_MAX) und
         # wann die letzte je Artikel endete (monotone Zeit, für RETRY_MIN_INTERVAL).
         self._ondemand_count = 0
@@ -474,7 +478,13 @@ class Fetcher:
             try:
                 try:
                     new = await self._fetch_all_feeds()
+                    # Neue Artikel gleich gruppieren, nicht erst nach der (langen) Textextraktion. Ohne
+                    # neue Artikel nur, wenn der letzte Lauf STORIES_IDLE_REFRESH her ist (das Fenster
+                    # wandert trotzdem weiter).
+                    if new or time.monotonic() - self._stories_at >= STORIES_IDLE_REFRESH.total_seconds():
+                        await self.update_stories()
                     extracted = await self._extract_pending()
+                    await self.update_stories(only_if_new_bodies=True)
                 except Exception:
                     self.db.purge(self.settings.retention_days)  # aufräumen auch nach einem Fehler davor
                     raise
@@ -484,6 +494,20 @@ class Fetcher:
                 log.info("Lauf fertig: %d neu, %d extrahiert, %d gelöscht", new, extracted, purged)
             finally:
                 self.state.update(running=False, last_finished=utcnow())
+
+    async def update_stories(self, only_if_new_bodies: bool = False) -> None:
+        """Geschichten neu gruppieren (app/stories.py): nach jedem Abruf der Feeds und einmal beim
+        Start. Mit `only_if_new_bodies` (nach der Extraktion) nur, wenn ein Artikel ohne brauchbaren
+        Anreißer gerade seinen Volltext bekam (den gruppiert erst der Volltext, siehe stories._fields).
+        Ein Fehler wird protokolliert und beendet nie den Sammellauf."""
+        try:
+            if only_if_new_bodies and not self.db.short_summaries_with_body(
+                    self._extracted_ids, stories.BODY_IF_SUMMARY_BELOW):
+                return
+            await stories.refresh(self.db, self.catalog)
+            self._stories_at = time.monotonic()
+        except Exception:  # noqa: BLE001
+            log.exception("Geschichten: Lauf fehlgeschlagen")
 
     async def _fetch_all_feeds(self) -> int:
         ids = set(self.db.enabled_source_ids())
@@ -664,6 +688,7 @@ class Fetcher:
         Ein unerwarteter Fehler bei einem Artikel bricht den Lauf nicht ab."""
         done = 0
         after: tuple[str, int] | None = None
+        self._extracted_ids = []
         while done < EXTRACT_MAX_PER_CYCLE:
             batch = self.db.pending_articles(min(EXTRACT_BATCH, EXTRACT_MAX_PER_CYCLE - done), before=after)
             if not batch:
@@ -675,6 +700,8 @@ class Fetcher:
             for row, res in zip(batch, results):
                 if isinstance(res, Exception):
                     log.error("Extraktion %s (%s) unerwartet gescheitert: %r", row["id"], row["url"], res)
+                else:
+                    self._extracted_ids.append(row["id"])
             done += len(batch)
         return done
 

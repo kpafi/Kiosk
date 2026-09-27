@@ -36,6 +36,13 @@ MAX_PROFILES = 50
 SETTINGS_DEFAULTS: dict[str, Any] = {
     "theme": "dark", "text_size": "m", "mark_read_on_open": True,
     "show_images": True, "free_only": True, "bar_order": [],
+    # Desktop: rechte Seite ohne offenen Artikel (Tagesübersicht oder Titelseite), Fokusmodus.
+    "desktop_empty": "overview", "focus_mode": False,
+}
+# Erlaubte Werte der Auswahl-Einstellungen; gespeicherte andere Werte zählen nicht (Standard gilt).
+SETTINGS_CHOICES: dict[str, tuple[str, ...]] = {
+    "theme": ("system", "dark", "light"), "text_size": ("s", "m", "l"),
+    "desktop_empty": ("overview", "frontpage"),
 }
 
 
@@ -75,6 +82,8 @@ def ui_settings(user_id: int) -> dict[str, Any]:
     out = dict(SETTINGS_DEFAULTS)
     for key, default in SETTINGS_DEFAULTS.items():
         if key in stored and type(stored[key]) is type(default):
+            if key in SETTINGS_CHOICES and stored[key] not in SETTINGS_CHOICES[key]:
+                continue
             out[key] = stored[key]
     return out
 
@@ -417,6 +426,8 @@ class SettingsPatch(BaseModel):
     show_images: StrictBool | None = None
     free_only: StrictBool | None = None
     bar_order: list[BarKey] | None = Field(None, max_length=400)
+    desktop_empty: Literal["overview", "frontpage"] | None = None
+    focus_mode: StrictBool | None = None
 
 
 @router.get("/settings")

@@ -45,12 +45,17 @@ function markIcon(item, mode) {
   return null;
 }
 
-function fillMeta(meta, item, mode) {
-  replace(meta,
+/** Meta-Zeile wie in der Liste ohne Markierung: Ungelesen-Punkt, QUELLE, „/ LAND / ZEIT“. */
+export function metaParts(item) {
+  return [
     !item.read ? h('span', { class: 'unread-dot', role: 'img', 'aria-label': 'Ungelesen' }) : null,
     h('span', { class: 'row-src', text: sourceLabel(item.source_id, item.source_name) }),
     h('span', { class: 'row-when', text: `/ ${item.country || '?'} / ${listTime(item.published_at)}` }),
-    markIcon(item, mode));
+  ];
+}
+
+function fillMeta(meta, item, mode) {
+  replace(meta, metaParts(item), markIcon(item, mode));
 }
 
 /**

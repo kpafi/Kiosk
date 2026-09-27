@@ -413,7 +413,7 @@ def test_migration_v1_to_v6_in_one_pass(tmp_path):
 
     db = Database(path, admin=("chef", "geheim-und-lang"))
     try:
-        assert db.admin_created and db.get_meta("schema_version") == "7" == str(SCHEMA_VERSION)
+        assert db.admin_created and db.get_meta("schema_version") == "8" == str(SCHEMA_VERSION)
         admin = db.get_user_by_name("chef")
         assert admin["is_admin"] == 1 and admin["display_name"] == "Chef"
         assert V4_TABLES <= _tables(db) and {"users", "user_articles"} <= _tables(db)
@@ -727,3 +727,36 @@ def test_record_fetch_validators(db):
     db.record_fetch("alpha", ok=False, error="HTTP 500")  # Fehlschlag löscht beide
     st = db.source_states()["alpha"]
     assert st["etag"] is None and st["last_modified"] is None and st["last_error"] == "HTTP 500"
+
+
+def test_same_article_under_a_new_guid_is_not_new(db):
+    """BBC führt denselben Artikel mit wechselnder Nummer in der GUID („…#1“, „…#8“): gleiche Quelle,
+    gleiche Adresse, gleicher Titel, weniger als 6 h auseinander ist kein zweiter Artikel. Andere Quelle,
+    anderer Titel unter derselben Adresse (tägliche Presseschau) oder genau 6 h später: neu."""
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    base = make_row("bbc", 1, (now - timedelta(hours=10)).isoformat())
+    url = base["url"]
+    assert db.upsert_articles([{**base, "guid": url + "#1"}]) == 1
+    assert db.upsert_articles([{**base, "guid": url + "#8", "title": "  " + base["title"].upper() + " ",
+                                "image_url": "https://img.example/b.jpg"}]) == 0
+    assert db.upsert_articles([{**make_row("guardian", 1, base["published_at"]), "url": url}]) == 1
+    assert db.upsert_articles([{**base, "guid": url + "#9", "title": "Presseschau 27.9."}]) == 1
+    edge = (now - timedelta(hours=4)).isoformat()            # genau 6 h später: nicht mehr „dasselbe“
+    assert db.upsert_articles([{**base, "guid": url + "#10", "published_at": edge}]) == 1
+    near = (now - timedelta(hours=10) + timedelta(hours=5, minutes=59)).isoformat()
+    assert db.upsert_articles([{**base, "guid": url + "#11", "published_at": near}]) == 0
+    assert db.one("SELECT COUNT(*) AS n FROM articles WHERE source_id='bbc'")["n"] == 3
+
+
+def test_hourly_bulletin_with_fixed_url_and_title_is_not_deduped(db):
+    """Nur das BBC-Muster („…#1“, „…#8“) gilt als derselbe Artikel: Eine stündliche Sendung einer anderen
+    Quelle mit fester Adresse und festem Titel, aber eigener GUID je Ausgabe, bleibt je Ausgabe neu."""
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    first = make_row("tagesschau", 1, (now - timedelta(hours=3)).isoformat(), title="tagesschau in 100 Sekunden")
+    url = "https://www.tagesschau.de/multimedia/sendung/tagesschau_in_100_sekunden"
+    assert db.upsert_articles([{**first, "url": url, "guid": "ts100-1800"}]) == 1
+    second = make_row("tagesschau", 2, (now - timedelta(hours=2)).isoformat(), title="tagesschau in 100 Sekunden")
+    assert db.upsert_articles([{**second, "url": url, "guid": "ts100-1900"}]) == 1
+    # ... auch mit „#“ in der GUID, solange ihr Stamm weder die Adresse noch der gespeicherte Stamm ist
+    third = make_row("tagesschau", 3, (now - timedelta(hours=1)).isoformat(), title="tagesschau in 100 Sekunden")
+    assert db.upsert_articles([{**third, "url": url, "guid": "ts100#2000"}]) == 1

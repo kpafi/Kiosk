@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from .config import DEFAULT_TZ
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS source_state (
@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS articles (
     read            INTEGER NOT NULL DEFAULT 0,
     starred         INTEGER NOT NULL DEFAULT 0,
     later           INTEGER NOT NULL DEFAULT 0,
+    story_id        INTEGER,                        -- Geschichte (v8): kleinste Artikel-ID der Gruppe, NULL = keine
     UNIQUE (source_id, guid)
 );
 CREATE INDEX IF NOT EXISTS idx_articles_published ON articles (published_at DESC, id DESC);
@@ -210,6 +211,10 @@ PREFIX_MIN_LEN = 3
 _TOKEN_RE = re.compile(r"[^\W_]+")
 # seen_guids.first_seen wird bei erneutem Auftauchen höchstens so oft aufgefrischt.
 SEEN_REFRESH = timedelta(days=1)
+# Leerraum am Rand eines Anreißers, wie stories._fields ihn abschneidet (Länge „kurzer Anreißer“ gleich
+# in SQL und Python): Leerzeichen, Tab, Zeilenumbrüche, geschütztes Leerzeichen.
+SUMMARY_TRIM = " \t\n\r\xa0"
+SAME_URL_WINDOW = timedelta(hours=6)  # gleiche Adresse und gleicher Titel so nah beieinander: derselbe Artikel
 
 # Lesestand des Benutzers aus user_articles (Alias ua, per LEFT JOIN; ohne Zeile: 0).
 FLAG_COLS = ("COALESCE(ua.read, 0) AS read, COALESCE(ua.starred, 0) AS starred, "
@@ -345,6 +350,14 @@ class Database:
                 existing = {r["name"] for r in c.execute("PRAGMA table_info(profiles)")}
                 if "in_chips" not in existing:
                     c.execute("ALTER TABLE profiles ADD COLUMN in_chips INTEGER NOT NULL DEFAULT 1")
+            if version < 8:
+                # Geschichten (app/stories.py): story_id füllt der erste Lauf nach dem Start. Der Index
+                # steht nicht in SCHEMA, weil SCHEMA vor der Migration läuft, wenn die Spalte fehlt.
+                existing = {r["name"] for r in c.execute("PRAGMA table_info(articles)")}
+                if "story_id" not in existing:
+                    c.execute("ALTER TABLE articles ADD COLUMN story_id INTEGER")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_articles_story ON articles (story_id) "
+                          "WHERE story_id IS NOT NULL")
             c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
                       (str(SCHEMA_VERSION),))
 
@@ -565,6 +578,22 @@ class Database:
                     c.execute("UPDATE seen_guids SET first_seen=? WHERE source_id=? AND guid=? AND first_seen < ?",
                               (r["fetched_at"], r["source_id"], r["guid"], refresh_before))
                     continue
+                # Derselbe Artikel unter neuer GUID (BBC hängt eine wechselnde Nummer an: „…#1“, „…#8“):
+                # nur dieses Muster (die GUID ohne „#…“ ist die Adresse oder die GUID ohne „#…“ des schon
+                # gespeicherten Artikels), dazu gleiche Quelle, gleiche Adresse, gleicher Titel, weniger als
+                # SAME_URL_WINDOW auseinander. Ein täglicher Eintrag unter fester Adresse („Presseschau
+                # 27.9.“ nach „26.9.“) oder eine stündliche Sendung mit fester Adresse und Titel ist neu.
+                base, frag, _ = r["guid"].partition("#")
+                if frag:
+                    when = datetime.fromisoformat(r["published_at"])
+                    title = _same_title(r["title"])
+                    if any(_same_title(o["title"]) == title and (base == r["url"] or o["guid"].partition("#")[0] == base)
+                           for o in c.execute(
+                               "SELECT guid, title FROM articles INDEXED BY idx_articles_source_counts WHERE "
+                               "source_id=? AND published_at > ? AND published_at < ? AND url=?",
+                               (r["source_id"], _iso(when - SAME_URL_WINDOW), _iso(when + SAME_URL_WINDOW),
+                                r["url"]))):
+                        continue
                 cur = c.execute(
                     "INSERT OR IGNORE INTO articles (source_id, guid, url, title, summary, author, "
                     "image_url, published_at, fetched_at) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -802,16 +831,17 @@ class Database:
                 (user_id, utcnow(), user_id, *params))
             return visible
 
-    def article_counts(self, user_id: int, unread_sources: list[str] | None = None) -> dict[str, int]:
+    def article_counts(self, user_id: int, unread_sources: list[str] | None = None, *,
+                       time_limit: float | None = _FROM_CONTEXT) -> dict[str, int]:
         """Zähler für Menü und Kopfzeilen. `unread` ohne Paywall-Artikel, nur von heute und nur aus
         `unread_sources` (None = alle Quellen); `later` und `starred` zählen alle gemerkten
         Artikel (Gemerkt zeigt auch Bezahlartikel und ausgeschaltete Quellen)."""
         where, params = _article_filter(sources=unread_sources, unread=True, starred=False,
                                         free_only=True, since=self.today_start(), cutoff=self.retention_cutoff())
         unread = self.one(f"SELECT COUNT(*) AS n FROM articles a {USER_JOIN} WHERE {' AND '.join(where)}",
-                          (user_id, *params))["n"]
+                          (user_id, *params), time_limit=time_limit)["n"]
         row = self.one("SELECT COALESCE(SUM(ua.later=1), 0) AS later, COALESCE(SUM(ua.starred=1), 0) AS starred "
-                       "FROM user_articles ua WHERE ua.user_id=?", (user_id,))
+                       "FROM user_articles ua WHERE ua.user_id=?", (user_id,), time_limit=time_limit)
         return {"unread": unread, **dict(row)}
 
     def max_article_id(self) -> int:
@@ -858,6 +888,184 @@ class Database:
             if p.exists():
                 size += p.stat().st_size
         return {**dict(row), "db_bytes": size}
+
+    # ---- Geschichten (app/stories.py) -------------------------------------
+
+    def story_window(self, since: str, body_chars: int, body_if_summary_below: int) -> list[sqlite3.Row]:
+        """Alle Artikel ab `since` für die Gruppierung: Titel, Anreißer, bisherige story_id und nur bei
+        kurzem Anreißer der Anfang des Volltexts (sonst NULL: die Texte bleiben ungelesen).
+        Hintergrundarbeit, ohne Zeitlimit."""
+        return self.q("SELECT id, source_id, url, title, summary, CASE WHEN length(trim(summary, ?)) < ? "
+                      "THEN substr(body_text, 1, ?) END AS body_text, published_at, story_id "
+                      "FROM articles WHERE published_at >= ?",
+                      (SUMMARY_TRIM, body_if_summary_below, body_chars + 200, since), time_limit=None)
+
+    def short_summaries_with_body(self, ids: list[int], below: int) -> int:
+        """Wie viele dieser Artikel haben einen kurzen Anreißer (unter `below` Zeichen) und schon
+        Volltext? (Deren Geschichte hängt am Volltext, siehe stories._fields.)"""
+        n = 0
+        for k in range(0, len(ids), 500):
+            chunk = ids[k:k + 500]
+            n += self.one(f"SELECT COUNT(*) AS n FROM articles WHERE id IN ({','.join('?' * len(chunk))}) "
+                          "AND length(trim(summary, ?)) < ? AND length(body_text) > 0",
+                          (*chunk, SUMMARY_TRIM, below), time_limit=None)["n"]
+        return n
+
+    def set_story_ids(self, changes: list[tuple[int | None, int]]) -> None:
+        """Schreibt (story_id, Artikel-ID) in einer Transaktion (die FTS-Trigger feuern dabei nicht)."""
+        if not changes:
+            return
+        with self.tx() as c:
+            c.executemany("UPDATE articles SET story_id=? WHERE id=?", changes)
+
+    def story_id_of(self, article_id: int) -> int | None:
+        r = self.one("SELECT story_id FROM articles WHERE id=?", (article_id,))
+        return r["story_id"] if r else None
+
+    def story_member_ids(self, story_id: int, time_limit: float | None = _FROM_CONTEXT) -> list[int]:
+        """Alle Artikel einer Geschichte (ohne Filter; zum Ausschließen bei verwandten Themen)."""
+        return [r["id"] for r in self.q("SELECT id FROM articles WHERE story_id=?", (story_id,),
+                                        time_limit=time_limit)]
+
+    def topic_candidates(self, query: str, since: str, limit: int,
+                         time_limit: float | None = _FROM_CONTEXT) -> list[sqlite3.Row]:
+        """Kandidaten für verwandte Themen aus dem Volltextindex (FTS5-Abfrage `query`, schon sicher
+        gebaut), ab `since`, nach bm25."""
+        return self.q(
+            "SELECT a.id, a.source_id, a.title, a.summary, a.published_at, a.story_id FROM articles_fts f "
+            "JOIN articles a ON a.id = f.rowid WHERE articles_fts MATCH ? AND a.published_at >= ? "
+            "ORDER BY bm25(articles_fts) LIMIT ?", (query, since, limit), time_limit=time_limit)
+
+    def story_articles(self, user_id: int, story_ids: list[int], *, sources: list[str] | None,
+                       since: str | None = None, until: str | None = None,
+                       time_limit: float | None = _FROM_CONTEXT) -> list[sqlite3.Row]:
+        """Artikel der Geschichten (Listenspalten plus story_id) ohne Paywall, im Quellenbereich und
+        innerhalb der Aufbewahrungsgrenze wie die Liste; mit `since`/`until` nur in diesem Zeitraum."""
+        if not story_ids:
+            return []
+        where, params = _article_filter(sources=sources, unread=False, starred=False, free_only=True,
+                                        since=since, cutoff=self.retention_cutoff())
+        if until:
+            where.append("a.published_at <= ?")
+            params.append(until)
+        where.append(f"a.story_id IN ({','.join('?' * len(story_ids))})")
+        # Über den Index der Geschichten (wenige Zeilen je Geschichte), nicht über Quelle und Zeit: Der
+        # Planer nähme sonst gern idx_articles_source_counts und läse das ganze Fenster.
+        return self.q(f"SELECT {ARTICLE_LIST_COLS}, a.story_id FROM articles a INDEXED BY idx_articles_story "
+                      f"{USER_JOIN} WHERE {' AND '.join(where)}", (user_id, *params, *story_ids),
+                      time_limit=time_limit)
+
+    def articles_by_ids(self, user_id: int, ids: list[int], *, sources: list[str] | None,
+                        time_limit: float | None = _FROM_CONTEXT) -> list[sqlite3.Row]:
+        """Artikel (Listenspalten plus story_id) mit diesen IDs, gefiltert wie die Liste (Quellen,
+        ohne Paywall, Aufbewahrungsgrenze); Reihenfolge beliebig."""
+        if not ids:
+            return []
+        where, params = _article_filter(sources=sources, unread=False, starred=False, free_only=True,
+                                        cutoff=self.retention_cutoff())
+        where.append(f"a.id IN ({','.join('?' * len(ids))})")
+        return self.q(f"SELECT {ARTICLE_LIST_COLS}, a.story_id FROM articles a {USER_JOIN} "
+                      f"WHERE {' AND '.join(where)}", (user_id, *params, *ids), time_limit=time_limit)
+
+    def top_stories(self, *, sources: list[str], since: str, min_sources: int, limit: int,
+                    publishers: dict[str, str] | None = None,
+                    time_limit: float | None = _FROM_CONTEXT) -> list[sqlite3.Row]:
+        """Geschichten mit Artikeln ohne Paywall ab `since` aus `sources`: story_id, Zahl der Zeitungen
+        (n; Quellen, die `publishers` einem Verlag zuordnet, zählen als einer) und neuester Artikel,
+        meiste Zeitungen zuerst. Eine Abfrage für alle Geschichten."""
+        if not sources:
+            return []
+        marks = ",".join("?" * len(sources))
+        cte, join, paper, pparams = _publisher_sql(publishers)
+        return self.q(
+            f"{cte}SELECT a.story_id, COUNT(DISTINCT {paper}) AS n, MAX(a.published_at) AS newest "
+            f"FROM articles a {join}"
+            f"WHERE a.story_id IS NOT NULL AND a.published_at >= ? AND a.paywalled=0 AND a.source_id IN ({marks}) "
+            "GROUP BY a.story_id HAVING n >= ? ORDER BY n DESC, newest DESC LIMIT ?",
+            (*pparams, since, *sources, min_sources, limit), time_limit=time_limit)
+
+    def published_since(self, *, sources: list[str], since: str,
+                        time_limit: float | None = _FROM_CONTEXT) -> list[sqlite3.Row]:
+        """(published_at, source_id) aller Artikel ohne Paywall ab `since` aus `sources`, nur aus dem
+        Index. Ohne Aufbewahrungsgrenze: `since` liegt bei den Aufrufern (heute) immer dahinter."""
+        if not sources:
+            return []
+        return self.q(f"SELECT a.published_at, a.source_id FROM articles a {COUNT_INDEX} "
+                      f"WHERE a.source_id IN ({','.join('?' * len(sources))}) AND a.published_at >= ? "
+                      "AND a.paywalled=0", (*sources, since), time_limit=time_limit)
+
+    def profile_story_groups(self, user_id: int, *, sources: list[str] | None, terms: list[str] | None,
+                             since: str, limit: int, publishers: dict[str, str] | None = None,
+                             time_limit: float | None = _FROM_CONTEXT) -> list[sqlite3.Row]:
+        """Geschichten (story_id, sonst -Artikel-ID als Einzelartikel) eines Profils seit `since`, je
+        Gruppe die Zahl der Zeitungen im Profil (siehe top_stories) und der neueste Artikel; meiste
+        zuerst. Gruppiert in SQL über den ganzen Zeitraum, nicht nur über die neuesten Artikel."""
+        where, params = _article_filter(sources=sources, unread=False, starred=False, free_only=True,
+                                        terms=terms, since=since, cutoff=self.retention_cutoff())
+        cte, join, paper, pparams = _publisher_sql(publishers)
+        return self.q(f"{cte}SELECT COALESCE(a.story_id, -a.id) AS k, COUNT(DISTINCT {paper}) AS n, "
+                      f"MAX(a.published_at) AS newest FROM articles a {USER_JOIN} {join}"
+                      f"WHERE {' AND '.join(where)} "
+                      "GROUP BY k ORDER BY n DESC, newest DESC LIMIT ?", (*pparams, user_id, *params, limit),
+                      time_limit=time_limit)
+
+    def profile_group_articles(self, user_id: int, keys: list[int], *, sources: list[str] | None,
+                               terms: list[str] | None, since: str,
+                               time_limit: float | None = _FROM_CONTEXT) -> list[sqlite3.Row]:
+        """Artikel der Gruppen aus profile_story_groups (Listenspalten plus story_id), gefiltert wie
+        das Profil."""
+        story_ids = [k for k in keys if k > 0]
+        ids = [-k for k in keys if k < 0]
+        if not story_ids and not ids:
+            return []
+        where, params = _article_filter(sources=sources, unread=False, starred=False, free_only=True,
+                                        terms=terms, since=since, cutoff=self.retention_cutoff())
+        where.append(f"(a.story_id IN ({','.join('?' * len(story_ids)) or 'NULL'}) "
+                     f"OR a.id IN ({','.join('?' * len(ids)) or 'NULL'}))")
+        return self.q(f"SELECT {ARTICLE_LIST_COLS}, a.story_id FROM articles a {USER_JOIN} "
+                      f"WHERE {' AND '.join(where)}", (user_id, *params, *story_ids, *ids), time_limit=time_limit)
+
+    def clear_story_ids(self, story_ids: list[int], before: str) -> int:
+        """Löst Geschichten auf, die es nicht mehr gibt: story_id NULL für Artikel vor `before` (außerhalb
+        des Fensters), die noch eine dieser IDs tragen."""
+        if not story_ids:
+            return 0
+        with self.tx() as c:
+            return c.execute(f"UPDATE articles SET story_id=NULL WHERE published_at < ? AND story_id IN "
+                             f"({','.join('?' * len(story_ids))})", (before, *story_ids)).rowcount
+
+    def story_oldest_before(self, story_ids: list[int], before: str) -> dict[int, str]:
+        """Je Geschichte die Zeit ihres ältesten Artikels vor `before` (nur Geschichten, die solche haben)."""
+        out: dict[int, str] = {}
+        for i in range(0, len(story_ids), 500):
+            chunk = story_ids[i:i + 500]
+            out.update((r["story_id"], r["at"]) for r in self.q(
+                f"SELECT story_id, MIN(published_at) AS at FROM articles INDEXED BY idx_articles_story "
+                f"WHERE story_id IN ({','.join('?' * len(chunk))}) AND published_at < ? GROUP BY story_id",
+                (*chunk, before), time_limit=None))
+        return out
+
+    def story_sources_before(self, story_ids: list[int], before: str) -> dict[int, set[str]]:
+        """Je Geschichte die Quellen ihrer Artikel vor `before`."""
+        out: dict[int, set[str]] = {}
+        for i in range(0, len(story_ids), 500):
+            chunk = story_ids[i:i + 500]
+            for r in self.q(f"SELECT DISTINCT story_id, source_id FROM articles INDEXED BY idx_articles_story "
+                            f"WHERE story_id IN ({','.join('?' * len(chunk))}) AND published_at < ?",
+                            (*chunk, before), time_limit=None):
+                out.setdefault(r["story_id"], set()).add(r["source_id"])
+        return out
+
+    def outside_story_ids(self, ids: list[int], before: str) -> set[int]:
+        """Welche dieser Artikel-IDs tragen Artikel vor `before` noch als story_id (Geschichten, die
+        aus dem Fenster gewandert sind)? Schützt vor der Wiederverwendung einer ID für etwas anderes."""
+        out: set[int] = set()
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            out.update(r["story_id"] for r in self.q(
+                f"SELECT DISTINCT story_id FROM articles WHERE published_at < ? AND story_id IN "
+                f"({','.join('?' * len(chunk))})", (before, *chunk), time_limit=None))
+        return out
 
     # ---- Profile ---------------------------------------------------------
 
@@ -1108,6 +1316,22 @@ def _article_filter(*, sources: list[str] | None, unread: bool, starred: bool, f
         where.append("a.id IN (SELECT rowid FROM articles_fts WHERE articles_fts MATCH ?)")
         params.append(_terms_query(terms))
     return where, params
+
+
+def _same_title(title: str | None) -> str:
+    """Titel zum Vergleich: klein, Leerraum zusammengefasst."""
+    return " ".join((title or "").casefold().split())
+
+
+def _publisher_sql(publishers: dict[str, str] | None) -> tuple[str, str, str, tuple]:
+    """Bausteine, um Zeitungen statt Quellen zu zählen: (WITH-Klausel, JOIN, Ausdruck, Parameter).
+    `publishers`: Quelle -> Verlag, nur für Quellen, deren Verlag anders heißt (The Local, heise)."""
+    pairs = sorted((s, p) for s, p in (publishers or {}).items() if s != p)
+    if not pairs:
+        return "", "", "a.source_id", ()
+    values = ",".join("(?, ?)" for _ in pairs)
+    return (f"WITH pubs(src, pub) AS (VALUES {values}) ", "LEFT JOIN pubs ON pubs.src = a.source_id ",
+            "COALESCE(pubs.pub, a.source_id)", tuple(x for pair in pairs for x in pair))
 
 
 def _phrase(text: str) -> str:

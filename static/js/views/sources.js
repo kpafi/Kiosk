@@ -4,7 +4,7 @@ import { clock } from '../ui/icons.js';
 import { iconButton, subHeader } from '../ui/header.js';
 import { chipGroup } from '../ui/chips.js';
 import { toggle } from '../ui/toggle.js';
-import { api } from '../api.js';
+import { api, refreshError } from '../api.js';
 import { ago, countryName, formatCount, groupByCountry } from '../format.js';
 import { isAdmin, loadBar, loadSources, loadStatus, state } from '../store.js';
 
@@ -56,7 +56,7 @@ export function sourcesView() {
       await api('refresh', { method: 'POST' });
       toast('Sammellauf gestartet');
     } catch (err) {
-      toast(err.status === 409 ? 'Läuft bereits' : errText(err));
+      toast(err.status === 409 ? 'Läuft bereits' : err.status === 503 ? refreshError(err) : errText(err));
     } finally {
       refreshBtn.disabled = false;
       loadStatus().catch(() => {});

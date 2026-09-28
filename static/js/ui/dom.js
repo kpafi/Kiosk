@@ -35,12 +35,17 @@ export function replace(el, ...children) {
   return append(el, ...children);
 }
 
-/** Kurzer Hinweis unten (Status-Rückmeldung). */
+/** Kurzer Hinweis unten (Status-Rückmeldung). Kurze Bestätigungen einzeilig; Fehler („Fehler: …“) und
+ *  längere Hinweise (über 28 Zeichen, etwa „Nur der Admin kann Zeitungen einschalten“) dürfen auf zwei
+ *  Zeilen umbrechen. */
+const TOAST_ONE_LINE = 28;
 let toastTimer = 0;
 export function toast(message) {
   const el = document.getElementById('toast');
   if (!el) return;
-  el.textContent = message;
+  // Innerer Text ohne Innenabstand: nur so schneidet die Zwei-Zeilen-Grenze der Fehler sauber ab.
+  el.replaceChildren(h('span', { class: 'toast-text', text: String(message) }));
+  el.classList.toggle('toast--wrap', /^Fehler\b/.test(String(message)) || String(message).length > TOAST_ONE_LINE);
   el.classList.add('show');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove('show'), 2600);
@@ -51,8 +56,11 @@ export function hint(text, extraClass = '') {
   return h('p', { class: `hint t-caption ${extraClass}`.trim(), text });
 }
 
+/** Eine gemeinsame Abfrage für die Desktop-Breite (ab 900 px), statt je Aufruf eine neue. */
+export const desktopQuery = window.matchMedia('(min-width: 900px)');
+
 export function isDesktop() {
-  return window.matchMedia('(min-width: 900px)').matches;
+  return desktopQuery.matches;
 }
 
 /** Eingabefelder, in denen Tastenkürzel nicht greifen dürfen. */

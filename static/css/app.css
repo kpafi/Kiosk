@@ -24,6 +24,7 @@ h1, h2, h3, p { margin: 0; }
 
 :focus { outline: none; }
 :focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+::selection { background: var(--signal); color: var(--on-signal); }
 
 .visually-hidden {
   position: absolute !important; width: 1px; height: 1px; overflow: hidden;
@@ -38,7 +39,7 @@ h1, h2, h3, p { margin: 0; }
 #reader { display: none; }
 #shell[data-layout="article"] #view { display: none; }
 #shell[data-layout="article"] #reader { display: block; }
-#shell.has-bar #view { padding-bottom: calc(var(--bar) + 32px + env(safe-area-inset-bottom)); }
+#shell.has-bar #view { padding-bottom: calc(var(--bar) + 32px + var(--update-space, 0px) + env(safe-area-inset-bottom)); }
 .view-page { max-width: var(--measure); margin: 0 auto; }
 /* Nur unter 900px verstecken; ab 900px behalten die Elemente ihr eigenes display (z. B. .pill). */
 @media (max-width: 899.98px) {
@@ -76,7 +77,7 @@ h1, h2, h3, p { margin: 0; }
     overflow-y: auto;
     overscroll-behavior: contain;
   }
-  #shell.has-bar #view { padding-bottom: calc(var(--bar) + 40px); }
+  #shell.has-bar #view { padding-bottom: calc(var(--bar) + 40px + var(--update-space, 0px)); }
   #shell[data-layout="page"] #view { padding-top: var(--space-4); }
 }
 
@@ -210,7 +211,14 @@ svg { display: block; flex-shrink: 0; }
   color: var(--ink);
   text-decoration: none;
 }
-.row { scroll-margin: 16px 0 calc(var(--bar) + 40px); }
+.row { scroll-margin: 16px 0 calc(var(--bar) + 40px + var(--update-space, 0px)); }
+/* Lange Listen: Zeilen außerhalb des Bildes nicht zeichnen (Höhe geschätzt, danach gemerkt). Die
+   Angabe ist die Inhaltshöhe ohne Innenabstand und Linie (33 px): echte Zeilen am Handy ~163 px,
+   ab 900 px ~136 px. */
+.list > .row { content-visibility: auto; contain-intrinsic-block-size: auto 128px; }
+@media (min-width: 900px) {
+  .list > .row { contain-intrinsic-block-size: auto 103px; }
+}
 .row:focus-visible { outline-offset: -2px; border-radius: var(--radius-md); }
 .row-main { flex-grow: 1; display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; }
 .row-meta {
@@ -275,7 +283,6 @@ mark {
 }
 
 .sentinel { height: 1px; }
-.list-end { padding: 24px 0; text-align: center; color: var(--muted); }
 .hint { padding: 16px 0; color: var(--muted); }
 .hint--pad { padding: 16px var(--gutter); }
 .hint--admin { padding-top: 8px; }
@@ -638,6 +645,20 @@ mark {
 /* Bildzeile unter dem Titelbild: 8px Abstand statt der Spalten-Lücke (gap) von .art. */
 .art > .art-caption { margin: calc(var(--space-2) - var(--art-gap)) 0 0; }
 .article-body figure + *, .article-body figcaption + * { margin-top: 8px; }
+/* Liveblog-Uhrzeit (<p><strong>28.09. 14:43</strong></p>, Klasse aus buildBody): Mono wie andere
+   Zeitangaben, mehr Luft darüber, dicht an der Überschrift des eigenen Eintrags. */
+.article-body .art-time {
+  margin-top: var(--space-8);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 18px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--ink);
+}
+.article-body .art-time:first-child { margin-top: 0; }
+.article-body .art-time strong, .article-body .art-time b { font-weight: 400; }
+.article-body .art-time + * { margin-top: 4px; }
 .article-body a { color: var(--ink); text-decoration: underline; text-underline-offset: 2px; }
 .article-body table { border-collapse: collapse; display: block; overflow-x: auto; }
 .article-body td, .article-body th { border-top: 1px solid var(--hairline); padding: 6px 8px; text-align: left; }
@@ -792,8 +813,12 @@ mark {
   bottom: calc(96px + env(safe-area-inset-bottom));
   transform: translateX(-50%);
   z-index: 60;
+  width: max-content;
   max-width: calc(100vw - 32px);
   padding: 10px 16px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   border-radius: var(--radius-pill);
   background: var(--ink);
   color: var(--on-ink);
@@ -806,8 +831,133 @@ mark {
   transition: opacity 0.2s;
 }
 #toast.show { opacity: 1; }
+/* Fehler und längere Hinweise dürfen auf zwei Zeilen umbrechen; die Grenze sitzt am inneren Text (ohne
+   Innenabstand), sonst schiene eine angeschnittene dritte Zeile durch. */
+#toast.toast--wrap { white-space: normal; }
+#toast.toast--wrap .toast-text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  max-height: 32px;   /* 2 × line-height */
+}
 @media (prefers-reduced-motion: reduce) {
   #toast { transition: none; }
+}
+/* Neue Version (ui/update.js, liegt in #shell): bleibt stehen, bis man neu lädt oder „Später“
+   tippt. Lage je Layout: Handy über der Leiste bzw. unten, Desktop in der Listenspalte über der
+   Leiste bzw. unten, Fokusmodus als schmale Säule in der Leiste links (nie über dem Text). Knöpfe
+   44 px hoch. Listen und Leseansicht bekommen unten Platz (--update-space), der Toast rückt darüber. */
+body.has-update { --update-space: 64px; }
+.update-pill {
+  position: fixed;
+  left: 50%;
+  bottom: calc(16px + env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  z-index: 45;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: calc(100vw - 32px);
+  height: 52px;
+  padding: 3px 3px 3px 16px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-pill);
+  background: var(--raised);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 16px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+#shell.has-bar > .update-pill { bottom: calc(16px + var(--bar) + 12px + env(safe-area-inset-bottom)); }
+.update-dot { width: var(--dot); height: var(--dot); flex-shrink: 0; border-radius: var(--radius-pill); background: var(--signal); }
+.update-text { overflow: hidden; text-overflow: ellipsis; min-width: 0; margin: 0 8px 0 6px; }
+.update-reload {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  height: 44px;
+  padding: 0 18px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--ink);
+  color: var(--on-ink);
+  font: inherit;
+  text-transform: inherit;
+}
+.update-reload svg { display: none; }
+.update-reload:disabled { opacity: 0.5; cursor: default; }
+.update-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  flex-shrink: 0;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--muted);
+}
+/* Toast über die Pille heben, wo sie in seiner Höhe liegt (über der Leiste: Handy-Liste, Desktop-Liste
+   und Artikel neben der Liste) und kein Blatt offen ist. */
+body.has-update:not(.sheet-open) #shell.has-bar ~ #toast { bottom: calc(96px + 64px + env(safe-area-inset-bottom)); }
+/* Sehr schmal (Handy unter 360 px, Liste am Desktop unter 360 px): nur Punkt, Neu laden, Später. */
+@media (min-width: 900px) {
+  #shell.list-narrow > .update-pill .update-text {
+    position: absolute; width: 1px; height: 1px; overflow: hidden;
+    clip: rect(0 0 0 0); white-space: nowrap; margin: -1px; padding: 0; border: 0;
+  }
+}
+@media (max-width: 359.98px) {
+  .update-pill .update-text {
+    position: absolute; width: 1px; height: 1px; overflow: hidden;
+    clip: rect(0 0 0 0); white-space: nowrap; margin: -1px; padding: 0; border: 0;
+  }
+}
+/* Ohne Leiste (Leseansicht, Suche, Seiten): Platz unter dem Inhalt, damit die Pille nichts verdeckt. */
+body.has-update #shell:not(.has-bar) #view { padding-bottom: calc(var(--update-space) + 16px + env(safe-area-inset-bottom)); }
+@media (max-width: 899.98px) {
+  body.has-update #reader { padding-bottom: calc(var(--update-space) + 16px + env(safe-area-inset-bottom)); }
+}
+@media (min-width: 900px) {
+  #shell[data-layout="list"] > .update-pill, #shell[data-layout="article"] > .update-pill {
+    left: calc(var(--list-w, 520px) / 2);
+    bottom: 20px;
+    max-width: calc(var(--list-w, 520px) - 48px);
+  }
+  #shell.has-bar[data-layout="list"] > .update-pill, #shell.has-bar[data-layout="article"] > .update-pill {
+    bottom: calc(20px + var(--bar) + 12px);
+  }
+  #shell[data-layout="page"] > .update-pill { bottom: 20px; }
+  /* Fokusmodus: Säule mittig in der 76 px breiten Leiste, Punkt, Neu laden (Symbol), Später. */
+  html[data-focus="on"] #shell[data-layout="article"] > .update-pill {
+    left: 12px;
+    bottom: 20px;
+    transform: none;
+    flex-direction: column;
+    width: 52px;
+    height: auto;
+    max-width: none;
+    padding: 12px 3px 3px;
+    gap: 8px;
+  }
+  html[data-focus="on"] #shell[data-layout="article"] > .update-pill .update-text,
+  html[data-focus="on"] #shell[data-layout="article"] > .update-pill .update-reload-label {
+    position: absolute; width: 1px; height: 1px; overflow: hidden;
+    clip: rect(0 0 0 0); white-space: nowrap; margin: -1px; padding: 0; border: 0;
+  }
+  /* Ruhiger als eine weiße Fläche: Kreis mit Kontur, Signal bleibt der blaue Punkt darüber. */
+  html[data-focus="on"] #shell[data-layout="article"] > .update-pill .update-reload {
+    width: 44px; padding: 0; border: 1px solid var(--rule); background: transparent; color: var(--ink);
+  }
+  html[data-focus="on"] #shell[data-layout="article"] > .update-pill .update-reload svg { display: block; }
+  /* Zähler der Leiste rückt über die Säule. */
+  html[data-focus="on"] body.has-update #shell[data-layout="article"] .focus-rail { padding-bottom: 164px; }
 }
 
 .status-slot { padding: 0 var(--gutter); }
@@ -1177,6 +1327,8 @@ mark {
     font-size: calc(21px * var(--scale));
     line-height: calc(28px * var(--scale));
   }
+  /* Liveblog-Uhrzeit bleibt Mono-Zeitzeile (sonst gewänne die Absatzgröße oben). */
+  html[data-focus="on"] .article-body .art-time { font-size: 13px; line-height: 18px; }
   /* Bildzeilen bleiben klein (sonst gewänne die Absatzgröße oben). */
   html[data-focus="on"] .article-body .art-caption, html[data-focus="on"] .article-body figcaption {
     font-size: 12px;

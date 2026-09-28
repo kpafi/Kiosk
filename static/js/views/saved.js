@@ -42,7 +42,13 @@ export function savedView(route) {
 
   buildChips();
   feed.start();
-  const off = on('flags', () => loadCounts().then(buildChips).catch(() => {}));
+  // Zahlen der Reiter nur bei Später/Favorit neu holen (nicht bei Gelesen), gebündelt.
+  let countsTimer = 0;
+  const off = on('flags', (patch) => {
+    if (!('later' in patch) && !('starred' in patch)) return;
+    clearTimeout(countsTimer);
+    countsTimer = setTimeout(() => loadCounts().then(buildChips).catch(() => {}), 400);
+  });
 
   const el = h('div', { class: 'view-list' },
     subHeader({ title: 'GEMERKT', fallback: '#/' }),
@@ -50,6 +56,6 @@ export function savedView(route) {
 
   return {
     el, layout: 'list', bar: false, title: 'Gemerkt',
-    destroy() { feed.destroy(); off(); },
+    destroy() { clearTimeout(countsTimer); feed.destroy(); off(); },
   };
 }

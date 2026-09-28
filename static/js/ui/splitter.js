@@ -33,6 +33,7 @@ export function installListResizer() {
   function apply(value) {
     width = clampListWidth(value ?? LIST_DEFAULT, window.innerWidth);
     shell.style.setProperty('--list-w', `${width}px`);
+    shell.classList.toggle('list-narrow', width < 360);   // schmale Liste: Pille ohne Beschriftung
     handle.setAttribute('aria-valuemin', String(LIST_MIN));
     handle.setAttribute('aria-valuemax', String(listMax(window.innerWidth)));
     handle.setAttribute('aria-valuenow', String(width));

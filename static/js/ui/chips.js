@@ -1,4 +1,4 @@
-// Chips (Filter, Reiter) und die Chipzeile.
+// Chips (Filter, Reiter).
 import { h } from './dom.js';
 
 export function chip(label, { on = false, onClick, href, ariaPressed = true } = {}) {
@@ -7,10 +7,6 @@ export function chip(label, { on = false, onClick, href, ariaPressed = true } = 
   return h('button', {
     ...attrs, type: 'button', 'aria-pressed': ariaPressed ? String(on) : null, on: { click: onClick },
   });
-}
-
-export function chipRow(...children) {
-  return h('div', { class: 'chips' }, ...children);
 }
 
 /** Gruppe sich gegenseitig ausschließender Chips. options: [{value, label}] */

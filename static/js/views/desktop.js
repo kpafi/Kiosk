@@ -2,7 +2,7 @@
 // F Fokusmodus (Desktop, Artikel offen), Esc beendet ihn.
 import { h, isDesktop, isTyping, toast } from '../ui/dom.js';
 import { isSheetOpen } from '../ui/sheet.js';
-import { navigate, setFlag, state } from '../store.js';
+import { openSearch, setFlag, state } from '../store.js';
 import { focusActive, setFocusMode, toggleFocusMode } from './focus.js';
 
 /** Tastenhinweise am Desktop (rechte Seite ohne Artikel, wie im Board). */
@@ -59,7 +59,12 @@ export function installKeyboard() {
       moveFocus(key === 'j' ? 1 : -1);
     } else if (key === '/') {
       e.preventDefault();
-      navigate('#/suche');
+      // Suche schon zu sehen (auch neben einem offenen Artikel): nur ins Feld, Anfrage bleibt. Nimmt
+      // das Feld den Fokus nicht (Fokusmodus: Liste unsichtbar), zur Suche wechseln.
+      const input = document.querySelector('#view .search-field input');
+      if (input && input.getClientRects().length) input.focus();
+      if (input && document.activeElement === input) input.select();
+      else openSearch();
     } else if ((key === 'f' || key === 'F') && !e.shiftKey && state.openArticleId && isDesktop()) {
       e.preventDefault();
       if (!e.repeat) toggleFocusMode();   // gehaltene Taste schaltet nicht dauernd um

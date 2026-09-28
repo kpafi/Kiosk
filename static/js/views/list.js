@@ -7,10 +7,10 @@ import { articlesLoader, createFeed } from '../ui/feed.js';
 import { emptyState, nextRunSentence } from '../ui/empty.js';
 import { openMenu } from './menu.js';
 import {
-  chipProfiles, ctxParams, isActiveProfile, isAdmin, keepWatermark, loadBar, loadStatus, on, profileById, replaceHash,
+  beginCtxList, chipProfiles, ctxPageShown, ctxParams, isActiveProfile, isAdmin, keepWatermark, loadBar, loadStatus, on, profileById, replaceHash,
   setUnreadFilter, state,
 } from '../store.js';
-import { api } from '../api.js';
+import { api, refreshError } from '../api.js';
 
 /** Pille „HOLE NEUE ARTIKEL · 25 ZEITUNGEN“, solange ein Sammellauf läuft. */
 export function statusPill() {
@@ -106,12 +106,13 @@ export function listView(route) {
   }
   if (pid && state.profiles && !profile) profileGone();
 
-  const chipsEl = h('div', { class: 'chips', role: 'toolbar', 'aria-label': 'Filter' });
+  const chipsEl = h('div', { class: 'chips', role: 'group', 'aria-label': 'Filter' });
   const statusSlot = h('div', { class: 'status-slot' });
   const makeFeed = () => createFeed({
     dayGroups: true,
     load: withGoneCheck(articlesLoader({ ...ctxParams(), unread: state.unread ? 'true' : undefined },
       { onResponse: keepWatermark })),
+    onPage: ctxPageShown,
     empty: buildEmpty,
   });
   function withGoneCheck(load) {
@@ -125,8 +126,7 @@ export function listView(route) {
     };
   }
   let feed = makeFeed();
-  state.listItems = feed.items;
-  state.listIsCtx = true;
+  beginCtxList(feed.items);
 
   function buildChips() {
     // Aktives Profil an Stelle 2, die übrigen (nur mit „Oben bei den Filtern“) in ihrer Reihenfolge.
@@ -159,8 +159,7 @@ export function listView(route) {
     feed.destroy();
     feed = makeFeed();
     feedHolder.replaceChildren(feed.el);
-    state.listItems = feed.items;
-    state.listIsCtx = true;
+    beginCtxList(feed.items);
     feed.start();
   }
 
@@ -186,7 +185,12 @@ export function listView(route) {
         on: {
           click: async () => {
             refreshBtn.disabled = true;
-            try { await api('refresh', { method: 'POST' }); } catch { /* läuft schon */ }
+            try {
+              await api('refresh', { method: 'POST' });
+            } catch (err) {
+              // 409: läuft schon (still); sonst die Meldung des Servers (503 „Der Sammler ist ausgeschaltet“).
+              if (err.status !== 409) toast(refreshError(err));
+            }
             refreshBtn.disabled = false;
             poll();
           },

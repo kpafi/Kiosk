@@ -1,8 +1,9 @@
 // Endlos-Liste: lädt Seiten (Keyset-Cursor oder Offset), gruppiert nach Tagen, zeigt Leerzustand.
-import { h, hint, isDesktop } from './dom.js';
-import { articleRow } from './row.js';
+import { desktopQuery, h, hint, isDesktop } from './dom.js';
+import { articleRow, refreshRowTime } from './row.js';
 import { dayLabel } from '../format.js';
 import { api } from '../api.js';
+import { on } from '../store.js';
 
 /**
  * @param {object} opts
@@ -21,10 +22,11 @@ export function createFeed(opts) {
   let cursor = null, done = false, loading = false, lastDay = null, gen = 0;
   const items = [];
   let observer = null;
+  let resized = null;   // ResizeObserver: Sentinel wird wieder gerendert (Liste nach Artikel wieder da)
   let errorEl = null;
   // Handy scrollt das Fenster, Desktop die Spalte #view: Beobachter beim Umschalten neu anlegen.
-  const desktopQuery = window.matchMedia('(min-width: 900px)');
   const onLayout = () => { if (observer) observe(); };
+  let offClock = null;
 
   function append(list) {
     const frag = document.createDocumentFragment();
@@ -35,7 +37,9 @@ export function createFeed(opts) {
         const label = dayLabel(item.published_at);
         if (label !== lastDay) {
           lastDay = label;
-          frag.append(h('h2', { class: 'day t-section', text: label }));
+          const head = h('h2', { class: 'day t-section', text: label });
+          head._iso = item.published_at;   // für relabel(): dieselbe Gruppe heißt morgen GESTERN
+          frag.append(head);
         }
       }
       frag.append(articleRow(item, opts));
@@ -86,8 +90,25 @@ export function createFeed(opts) {
   }
 
   function isVisible() {
+    // Nicht gerendert (Handy mit offenem Artikel: #view ist display:none, das Rechteck wäre 0,0,0,0
+    // und gälte als sichtbar): nicht nachladen; der ResizeObserver meldet sich, sobald die Liste wieder da ist.
+    if (!sentinel.isConnected || !sentinel.getClientRects().length) return false;
     const r = sentinel.getBoundingClientRect();
     return r.top < window.innerHeight + 600 && r.bottom > -600;
+  }
+
+  /** Zeiten („5 MIN“) und Tagesüberschriften („HEUTE“) neu schreiben (lange offene App, Mitternacht). */
+  function relabel() {
+    let label = null;
+    for (const node of el.children) {
+      if (node.classList.contains('day')) {
+        label = dayLabel(node._iso);
+        if (node.textContent !== label) node.textContent = label;
+      } else if (node.classList.contains('row')) {
+        refreshRowTime(node);
+      }
+    }
+    if (opts.dayGroups) lastDay = label;   // nächste Seite hängt an die umbenannte Gruppe an
   }
 
   function finish() {
@@ -106,6 +127,13 @@ export function createFeed(opts) {
     if (!observer) {
       observe();
       desktopQuery.addEventListener('change', onLayout);
+      offClock = on('clock', relabel);
+      // Ohne Box gilt der Sentinel für den IntersectionObserver als „schneidend“ (Rechteck 0,0), beim
+      // Wiedereinblenden meldet er dann nichts Neues. Die Größe wechselt dabei aber 0 ↔ 1 px.
+      if (typeof ResizeObserver === 'function') {
+        resized = new ResizeObserver(() => { if (!errorEl && isVisible()) more(); });
+        resized.observe(sentinel);
+      }
     }
     return more();
   }
@@ -113,7 +141,7 @@ export function createFeed(opts) {
   function observe() {
     observer?.disconnect();
     observer = new IntersectionObserver((entries) => {
-      if (entries.some((e) => e.isIntersecting) && !errorEl) more();
+      if (entries.some((e) => e.isIntersecting) && !errorEl && isVisible()) more();
     }, { root: isDesktop() ? document.getElementById('view') : null, rootMargin: '600px 0px' });
     observer.observe(sentinel);
   }
@@ -121,7 +149,11 @@ export function createFeed(opts) {
   function destroy() {
     observer?.disconnect();
     observer = null;
+    resized?.disconnect();
+    resized = null;
     desktopQuery.removeEventListener('change', onLayout);
+    offClock?.();
+    offClock = null;
     gen++;
   }
 

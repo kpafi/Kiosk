@@ -13,6 +13,7 @@ const SHAPES = {
   star: { body: '<path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2L12 17.3 6.4 20.2l1.1-6.2L3 9.6l6.2-.9z"/>', cap: false },
   checkCheck: { body: '<path d="M18 6 7 17l-5-5M22 10l-7.5 7.5L13 16"/>' },
   close: { body: '<path d="M18 6 6 18M6 6l12 12"/>', join: false },
+  refresh: { body: '<path d="M21 12a9 9 0 1 1-9-9c2.5 0 4.9 1 6.7 2.7L21 8"/><path d="M21 3v5h-5"/>' },
   chevronRight: { body: '<path d="m9 6 6 6-6 6"/>' },
   chevronUp: { body: '<path d="m6 15 6-6 6 6"/>' },
   chevronDown: { body: '<path d="m6 9 6 6 6-6"/>' },

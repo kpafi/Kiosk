@@ -6,7 +6,7 @@ import {
   applySettings, emit, loadBar, loadBasics, loadSession, loadSources, on, replaceHash, resetUserState,
   setSession, state,
 } from './store.js';
-import { isDesktop } from './ui/dom.js';
+import { desktopQuery, isDesktop } from './ui/dom.js';
 import { showBar } from './ui/bar.js';
 import { installListResizer } from './ui/splitter.js';
 import { closeSheet, isSheetOpen } from './ui/sheet.js';
@@ -27,6 +27,8 @@ import { loginView } from './views/login.js';
 import { offlineView } from './views/offline.js';
 import { installKeyboard } from './views/desktop.js';
 import { parseHash } from './route.js';
+import { buildWatcher } from './version.js';
+import { setUpdatePillAllowed, showUpdatePill } from './ui/update.js';
 
 const shell = document.getElementById('shell');
 const viewEl = document.getElementById('view');
@@ -88,6 +90,8 @@ function setLayout(layout) {
   shell.dataset.layout = layout;
   showBar(barWanted());
   syncHome();
+  // Hinweis „Neue Version“ nur in der App, nicht auf Anmelde- oder Offline-Bildschirm.
+  setUpdatePillAllowed(state.authed === true && current.key !== 'login' && current.key !== 'offline');
 }
 
 function closeReader() {
@@ -107,11 +111,16 @@ function setTitle(view) {
 }
 
 function showLogin() {
-  if (current.key === 'login') return;
+  const r = parseHash(location.hash);
+  if (current.key === 'login') {
+    // Adresse auf dem Anmeldebildschirm gewechselt (z. B. geteilter Link #/a/5): danach dorthin.
+    // afterLoginUser bleibt der Benutzer, dem die Sitzung zuvor gehörte.
+    if (r.name !== 'login' && location.hash) afterLogin = location.hash;
+    return;
+  }
   closeSheet({ silent: true });
   closeReader();
   home.reset();
-  const r = parseHash(location.hash);
   if (r.name !== 'login') {
     afterLogin = location.hash || '#/';
     // Die Adresse gehört dem bisherigen Benutzer (null = niemand war angemeldet).
@@ -154,6 +163,7 @@ function route() {
   if (location.hash !== routedHash) state.prevHash = routedHash;
   routedHash = location.hash;
   const r = parseHash(location.hash);
+  if (r.name !== 'search') state.focusSearch = false;   // openSearch() führte nicht zur Suche
   if (state.authed === null) return;           // Start läuft noch
   if (!state.authed) { showLogin(); return; }
   if (r.name === 'login') { replaceHash('#/'); return; }
@@ -195,6 +205,8 @@ function route() {
   const fresh = current.key !== r.key;
   const view = fresh ? mount(r, factory) : current.view;
   if (!fresh && view.layout === 'list') state.lastListHash = r.hash;
+  // Wiederverwendete Ansicht (z. B. Zurück auf eine ältere Suche): Parameter aus der Adresse nachziehen.
+  if (!fresh) view.update?.(r);
   setLayout(view.layout);
   setTitle(view);
   if (fresh) {
@@ -232,28 +244,62 @@ let unreadTimer = 0;
 function refreshCounters() {
   clearTimeout(unreadTimer);
   unreadTimer = setTimeout(() => {
-    loadBar().catch(() => {});
-    // Danach Leiste und Zeitungskopf nachziehen: Beide lesen auch Zahlen aus /api/sources.
-    loadSources().then(() => emit('bar')).catch(() => {});
+    // Leiste und /api/sources zusammen, dann einmal 'bar': Leiste, Zeitungskopf und Zeitungsblock
+    // der Suche lesen beide Zahlen.
+    Promise.allSettled([loadBar({ silent: true }), loadSources()]).then(() => emit('bar'));
   }, 800);
 }
 
-/** Einmal kurz nach der nächsten lokalen Mitternacht die Zähler neu holen, dann für den Tag darauf.
- *  Ein einzelner Zeitgeber pro Tag, kein Abfragen; im Hintergrund übernimmt visibilitychange. */
+/** Einmal kurz nach der nächsten lokalen Mitternacht die Zähler neu holen und Zeiten/Tagesgruppen
+ *  der Listen neu beschriften, dann für den Tag darauf. Ein einzelner Zeitgeber pro Tag, kein
+ *  Abfragen; im Hintergrund übernimmt visibilitychange. */
 function scheduleMidnightRefresh() {
   const now = new Date();
   const next = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 5);
   setTimeout(() => {
     if (state.authed) refreshCounters();
+    emit('clock');
     scheduleMidnightRefresh();
   }, next - now);
 }
 
+/** Neue Version (Deploy) erkennen: Stand beim Start merken, beim Zurückkommen in den Vordergrund
+ *  und alle paar Stunden nachfragen, dann die Pille „Neue Version · Neu laden“ zeigen. */
+const fetchBuild = async () => ((await api('build')) || {}).build || '';
+const versions = buildWatcher({ fetchBuild, onNew: () => showUpdatePill() });
+
+/** Version, mit der der aktive Service Worker registriert wurde (?v=…): Beim Start ohne Netz kommt
+ *  die Seite aus seinem Cache. Eine eigene Build-Kennung hat die Seite nicht (index.html ist statisch). */
+function workerBuild() {
+  try {
+    const url = navigator.serviceWorker && navigator.serviceWorker.controller
+      ? new URL(navigator.serviceWorker.controller.scriptURL) : null;
+    const v = url ? url.searchParams.get('v') : null;
+    return v && v !== 'dev' ? v : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Service Worker einmal beim Start registrieren, auch ohne Anmeldung (Version aus /api/build). */
 async function registerServiceWorker() {
-  if (!('serviceWorker' in navigator)) return;
   let build = '';
-  try { build = ((await api('build')) || {}).build || ''; } catch { /* offline: bisherige Version bleibt */ return; }
+  try {
+    build = await fetchBuild();
+  } catch (err) {
+    // Offline oder Serverfehler (5xx): Dann lieferte der Service Worker die Seite aus seinem Cache
+    // (sw.js fällt bei Netzfehler und 5xx darauf zurück), also dessen Stand merken, damit ein Deploy
+    // in der Zwischenzeit auffällt. Nur bei abgelaufener Frist kam die Seite frisch vom Netz: dann
+    // nichts merken (die erste spätere Antwort gilt), sonst meldete das ältere ?v= fälschlich eine
+    // neue Version.
+    const fromCache = navigator.onLine === false || (err && err.status >= 500)
+      || (err && err.status === 0 && !err.timedOut);
+    const own = fromCache ? workerBuild() : null;
+    if (own) versions.setKnown(own);
+    return;
+  }
+  versions.setKnown(build);
+  if (!('serviceWorker' in navigator)) return;
   navigator.serviceWorker.register(`/sw.js?v=${encodeURIComponent(build || 'dev')}`).catch(() => {});
 }
 
@@ -277,6 +323,7 @@ async function start() {
   }
   setSession(session);
   if (state.authed) await loadBasics();
+  current.view?.destroy?.();   // z. B. die Offline-Ansicht (horcht auf „online“)
   current = { key: null, view: null };
   route();
 }
@@ -312,11 +359,19 @@ async function boot() {
   on('flags', (patch) => { if ('read' in patch) refreshCounters(); });
   // Die Zähler zählen nur heute (ab 00:00): Kommt die App wieder in den Vordergrund, etwa am
   // nächsten Morgen, Leiste und Zeitungen neu holen; bleibt sie offen, kurz nach Mitternacht.
+  // Relative Zeiten („5 MIN“) und Tagesgruppen veralten in einer lange offenen App: beim Zurückkommen
+  // und alle 5 Minuten (nur sichtbar) neu beschriften, dazu kurz nach Mitternacht.
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && state.authed) refreshCounters();
+    if (document.visibilityState !== 'visible') return;
+    if (state.authed) refreshCounters();
+    emit('clock');
+    versions.check();
   });
+  setInterval(() => { if (document.visibilityState === 'visible') emit('clock'); }, 5 * 60 * 1000);
+  setInterval(() => versions.check({ force: true }), 3 * 60 * 60 * 1000);
+  window.addEventListener('online', () => versions.check({ force: true }));
   scheduleMidnightRefresh();
-  window.matchMedia('(min-width: 900px)').addEventListener('change', () => {
+  desktopQuery.addEventListener('change', () => {
     showBar(barWanted());
     syncHome();
   });

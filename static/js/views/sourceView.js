@@ -6,10 +6,10 @@ import { chip } from '../ui/chips.js';
 import { articlesLoader, createFeed } from '../ui/feed.js';
 import { emptyState, nextRunSentence } from '../ui/empty.js';
 import { markAllRead } from './menu.js';
-import { api } from '../api.js';
+import { api, refreshError } from '../api.js';
 import { ago } from '../format.js';
 import {
-  emit, isAdmin, keepWatermark, loadBar, loadSources, loadStatus, on, readAllWatermark, state,
+  beginCtxList, ctxPageShown, isAdmin, keepWatermark, loadBar, loadSources, loadStatus, on, readAllWatermark, state,
 } from '../store.js';
 
 export function sourceView(route) {
@@ -23,7 +23,17 @@ export function sourceView(route) {
 
   const titles = h('div', { class: 'hdr-titles' });
   const favBtn = iconButton(star(20), 'Lieblingszeitung', { onClick: toggleFavorite });
-  const readBtn = iconButton(checkCheck(20), 'Alle gelesen', { onClick: () => { confirming = !confirming; confirmMaxId = readAllWatermark(); paintConfirm(); } });
+  const readBtn = iconButton(checkCheck(20), 'Alle gelesen', {
+    onClick: () => {
+      confirmMaxId = readAllWatermark();
+      if (!confirmMaxId) return;
+      confirming = !confirming;
+      paintConfirm();
+    },
+  });
+  // Erst mit Wasserstand (erste Seite da) bedienbar, sonst meldete read-all „Liste noch nicht geladen“.
+  const paintReadBtn = () => { readBtn.disabled = !readAllWatermark(); };
+  paintReadBtn();
   const confirmSlot = h('div', {});
   const chipsEl = h('div', { class: 'chips', 'aria-label': 'Filter' });
   const feedHolder = h('div', { class: 'feed-holder' });
@@ -79,7 +89,6 @@ export function sourceView(route) {
       else await api(`favorites/sources/${encodeURIComponent(id)}`, { method: 'DELETE' });
       toast(next ? 'Lieblingszeitung, in der Leiste' : 'Aus Lieblingszeitungen entfernt');
       await loadBar();
-      emit('bar');
     } catch (err) {
       s.is_favorite = !next;
       paintHeader();
@@ -129,10 +138,13 @@ export function sourceView(route) {
 
   function rebuild() {
     if (!alive) return;   // sonst überschriebe die alte Ansicht listItems und Wasserstand der neuen
+    // Offene Rückfrage gehört zur alten Liste (ihr Wasserstand): schließen.
+    if (confirming) { confirming = false; paintConfirm(); }
     feed?.destroy();
     feed = createFeed({
       dayGroups: true,
       load: articlesLoader({ source: id, unread: mode === 'unread' ? 'true' : undefined }, { onResponse: keepWatermark }),
+      onPage: ctxPageShown,
       filter: mode === 'images' ? (it) => !!it.image_url : null,
       empty: () => {
         const s = src();
@@ -154,7 +166,9 @@ export function sourceView(route) {
                 onBtn.disabled = true;
                 try {
                   const updated = await api(`sources/${encodeURIComponent(id)}`, { method: 'PATCH', body: { enabled: true } });
-                  Object.assign(s, updated || { enabled: true });
+                  // s kann veraltet sein (/api/sources inzwischen neu geladen): auch das aktuelle Objekt
+                  // in state.sourceMap nachziehen, sonst zeigt die Ansicht weiter „AUSGESCHALTET“.
+                  for (const obj of new Set([s, src()])) if (obj) Object.assign(obj, updated || { enabled: true });
                   paintHeader();
                   toast(`${name} eingeschaltet`);
                   loadBar().catch(() => {});
@@ -162,7 +176,8 @@ export function sourceView(route) {
                     await api('refresh', { method: 'POST' });
                     loadStatus().catch(() => {});
                   } catch (err) {
-                    toast(err.status === 409 ? 'Wird im nächsten Lauf geholt' : `Fehler: ${err.detail || err.message}`);
+                    toast(err.status === 409 ? 'Wird im nächsten Lauf geholt'
+                      : refreshError(err));
                   }
                   rebuild();
                 } catch (err) {
@@ -190,8 +205,7 @@ export function sourceView(route) {
         return emptyState({ text, actions });
       },
     });
-    state.listItems = feed.items;
-    state.listIsCtx = true;
+    beginCtxList(feed.items);
     feedHolder.replaceChildren(feed.el);
     feed.start();
   }
@@ -203,7 +217,8 @@ export function sourceView(route) {
 
   const offs = [
     on('reload-list', () => rebuild()),
-    on('unread-changed', () => refreshSource()),
+    on('watermark', paintReadBtn),
+    // Gelesen-Änderungen: refreshCounters (app.js) lädt /api/sources gebündelt nach und meldet 'bar'.
     on('bar', () => paintHeader()),
   ];
 

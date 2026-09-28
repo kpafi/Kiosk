@@ -1,6 +1,7 @@
 // Globaler Zustand, Ladefunktionen und Navigation. Views importieren von hier, app.js routet.
 
 import { api } from './api.js';
+import { parseHash } from './route.js';
 
 export const DEFAULT_SETTINGS = {
   theme: 'dark',
@@ -39,10 +40,16 @@ export const state = {
   listItems: [],                // Artikel der sichtbaren Liste (Tastatur, Fallback für „Nächster“)
   listIsCtx: false,             // listItems gehört zum Kontext ctx (Liste, Zeitung), nicht Suche/Gemerkt
   listWatermark: null,          // max_id der ersten Seite der Kontext-Liste (für read-all)
+  listComplete: false,          // Kontext-Liste ist ganz geladen (letzte Seite ohne Fortsetzung)
   lastListHash: '#/',           // letzte Listenansicht (für Zurück und Desktop-Spalte)
-  prevHash: null,              // vorige Adresse (vor dem letzten Adresswechsel)
+  prevHash: null,               // vorige Adresse (vor dem letzten Adresswechsel)
+  nextCtx: null,                // Parameter für „Nächster“ (/next) oder 'local' (aus listItems)
   openArticleId: null,
+  openArticle: null,            // geladener Artikel der Leseansicht (Tastatur m/s/l)
+  focusSearch: false,           // Suchfeld beim nächsten Zeigen der Suche fokussieren (openSearch)
 };
+
+let userGen = 0;   // Benutzerwechsel: späte Antworten des vorigen Benutzers zählen nicht
 
 /** Darf der angemeldete Benutzer Zeitungen schalten und Sammelläufe starten? */
 export function isAdmin() {
@@ -66,8 +73,9 @@ export function resetUserState() {
   state.settings = { ...DEFAULT_SETTINGS };
   Object.assign(state, {
     user: null, status: null, sources: null, sourceMap: new Map(), profiles: null,
-    favorites: null, bar: null, counts: null, listItems: [], listIsCtx: false, listWatermark: null,
-    lastListHash: '#/', openArticleId: null, unread: true, ctx: { type: 'all' },
+    favorites: null, bar: null, counts: null, listItems: [], listIsCtx: false, listWatermark: null, listComplete: false,
+    lastListHash: '#/', prevHash: null, nextCtx: null, openArticleId: null, openArticle: null,
+    focusSearch: false, unread: true, ctx: { type: 'all' },
   });
   userGen += 1;
   applySettings();
@@ -89,8 +97,13 @@ export function emit(name, detail) {
 
 // ---- Laden ------------------------------------------------------------------
 
+// Alle Lader: Kommt die Antwort erst nach einem Benutzerwechsel (Abmelden/Anmelden), wird sie
+// verworfen; der Aufrufer bekommt dann den aktuellen Stand.
+
 export async function loadSettings() {
+  const gen = userGen;
   const data = await api('settings');
+  if (gen !== userGen) return state.settings;
   if (data) {
     state.settings = { ...DEFAULT_SETTINGS, ...data };
     lsSet(LS_SETTINGS, state.settings);
@@ -100,36 +113,49 @@ export async function loadSettings() {
 }
 
 export async function loadStatus() {
-  state.status = await api('status');
+  const gen = userGen;
+  const data = await api('status');
+  if (gen === userGen) state.status = data;
   return state.status;
 }
 
 export async function loadSources() {
+  const gen = userGen;
   const list = await api('sources');
+  if (gen !== userGen) return state.sources;
   state.sources = list;
   state.sourceMap = new Map(list.map((s) => [s.id, s]));
   return list;
 }
 
 export async function loadProfiles() {
-  state.profiles = await api('profiles');
+  const gen = userGen;
+  const data = await api('profiles');
+  if (gen === userGen) state.profiles = data;
   return state.profiles;
 }
 
 export async function loadFavorites() {
-  state.favorites = await api('favorites/sources');
+  const gen = userGen;
+  const data = await api('favorites/sources');
+  if (gen === userGen) state.favorites = data;
   return state.favorites;
 }
 
-export async function loadBar() {
+/** Leiste laden und 'bar' melden; silent: true meldet nicht (der Aufrufer meldet selbst, einmal). */
+export async function loadBar({ silent = false } = {}) {
+  const gen = userGen;
   const data = await api('bar');
+  if (gen !== userGen) return state.bar;
   state.bar = data ? data.items : null;
-  emit('bar');
+  if (!silent) emit('bar');
   return state.bar;
 }
 
 export async function loadCounts() {
-  state.counts = await api('counts');
+  const gen = userGen;
+  const data = await api('counts');
+  if (gen === userGen) state.counts = data;
   return state.counts;
 }
 
@@ -170,7 +196,6 @@ export function setLocalSettings(patch) {
 }
 
 const settingsSeq = {};   // je Schlüssel: nur die Antwort des letzten Speicherns dieses Schlüssels zählt
-let userGen = 0;          // Benutzerwechsel: späte Antworten des vorigen Benutzers zählen nicht
 
 /** Sofort anwenden, dann speichern (Fehler gehen an den Aufrufer). Aus der Antwort werden nur die
  *  eigenen Schlüssel übernommen (focus_mode z. B. speichert focus.js selbst, nacheinander). */
@@ -269,9 +294,35 @@ export function readAllWatermark() {
   return state.listIsCtx && state.listWatermark ? state.listWatermark : undefined;
 }
 
-/** onResponse für articlesLoader in Kontext-Listen: Wasserstand je Laden der Liste merken. */
+/** Neue Kontext-Liste (Liste, Profil, Zeitung) beginnt: ihre Artikel merken, Wasserstand und
+ *  „ganz geladen“ vergessen, bis ihre erste Seite da ist (nicht den der vorigen Liste nutzen). */
+export function beginCtxList(items) {
+  Object.assign(state, { listItems: items, listIsCtx: true, listWatermark: null, listComplete: false });
+  emit('watermark');
+}
+
+/** onResponse für articlesLoader in Kontext-Listen: Wasserstand je Laden der Liste merken, dazu ob
+ *  die Liste ganz geladen ist. Gemeldet wird erst mit ctxPageShown (die Artikel sind dann in listItems). */
 export function keepWatermark(res, cursor) {
   if (cursor == null) state.listWatermark = res && res.max_id ? res.max_id : null;
+  state.listComplete = !!res && !res.next_before && !res.next_offset;
+}
+
+/** onPage für Kontext-Listen: Seite ist angehängt (listItems vollständig), Wasserstand melden
+ *  (z. B. offenes Menü: „Alles als gelesen markieren“ an/aus). */
+export function ctxPageShown() {
+  emit('watermark');
+}
+
+/** Ziel für „Suchen“ (Taste /, Fokus-Leiste): die zuletzt gezeigte Suche mit ihrer Anfrage, sonst leer. */
+export function searchHash() {
+  return parseHash(state.lastListHash).name === 'search' ? state.lastListHash : '#/suche';
+}
+
+/** Zur Suche (mit ihrer Anfrage), danach steht der Fokus im Suchfeld (Taste /, Fokus-Leiste). */
+export function openSearch() {
+  state.focusSearch = true;
+  navigate(searchHash());
 }
 
 export function goBack(fallback = state.lastListHash || '#/') {

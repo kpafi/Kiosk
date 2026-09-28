@@ -50,8 +50,20 @@ export function metaParts(item) {
   return [
     !item.read ? h('span', { class: 'unread-dot', role: 'img', 'aria-label': 'Ungelesen' }) : null,
     h('span', { class: 'row-src', text: sourceLabel(item.source_id, item.source_name) }),
-    h('span', { class: 'row-when', text: `/ ${item.country || '?'} / ${listTime(item.published_at)}` }),
+    h('span', { class: 'row-when', text: whenText(item) }),
   ];
+}
+
+function whenText(item) {
+  return `/ ${item.country || '?'} / ${listTime(item.published_at)}`;
+}
+
+/** Relative Zeit einer Listenzeile neu schreiben (sie veraltet in einer lange offenen App). */
+export function refreshRowTime(row) {
+  const when = row._item && row.querySelector('.row-when');
+  if (!when) return;
+  const text = whenText(row._item);
+  if (when.textContent !== text) when.textContent = text;
 }
 
 function fillMeta(meta, item, mode) {

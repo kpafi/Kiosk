@@ -9,7 +9,7 @@ import { setToggle } from '../ui/toggle.js';
 import { openMenu } from './menu.js';
 import { api } from '../api.js';
 import { serialSaver } from '../saver.js';
-import { on, setLocalSettings, state } from '../store.js';
+import { on, openSearch, setLocalSettings, state } from '../store.js';
 
 const byId = (id) => document.getElementById(id);
 
@@ -81,6 +81,17 @@ export function toggleFocusMode() {
   return setFocusMode(state.settings.focus_mode !== true);
 }
 
+/** „Suchen“ in der Leiste: zur zuletzt gezeigten Suche mit ihrer Anfrage (wie Taste /). */
+function searchLink() {
+  const a = iconButton(search(20), 'Suchen', { href: '#/suche' });
+  a.addEventListener('click', (e) => {
+    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    e.preventDefault();
+    openSearch();
+  });
+  return a;
+}
+
 /** Schmale Leiste links (76 px) anstelle der Liste; nur sichtbar, solange der Fokusmodus wirkt. */
 export function installFocusRail() {
   const shell = byId('shell');
@@ -92,7 +103,7 @@ export function installFocusRail() {
   const el = h('nav', { id: 'focus-rail', class: 'focus-rail', 'aria-label': 'Seitenleiste' },
     h('div', { class: 'focus-rail-mark', 'aria-hidden': 'true', text: 'K' }),
     iconButton(listIcon(20), 'Liste einblenden', { onClick: () => setFocusMode(false) }),
-    iconButton(search(20), 'Suchen', { href: '#/suche' }),
+    searchLink(),
     iconButton(bookmark(20), 'Gemerkt', { href: '#/gemerkt' }),
     iconButton(dots(20), 'Menü', { onClick: openMenu }),
     counter);

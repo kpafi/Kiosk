@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -291,7 +292,7 @@ globalThis.document = { createElement: (t) => new FakeEl(t), createElementNS: (n
   querySelector: () => null, querySelectorAll: () => [], documentElement: new FakeEl('html'), body: new FakeEl('body'),
   activeElement: null, visibilityState: 'visible' };
 let desktop = true;
-globalThis.window = { matchMedia: () => ({ get matches() { return desktop; }, addEventListener() {} }) };
+globalThis.window = { matchMedia: () => ({ get matches() { return desktop; }, addEventListener() {}, removeEventListener() {} }) };
 globalThis.location = { origin: 'http://kiosk.test', hash: '#/' };
 globalThis.localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
 globalThis.CSS = { escape: (s) => s };
@@ -850,3 +851,566 @@ console.log(JSON.stringify({
                              # dreistellig immer noch gleich: Stelle, an der sie sich trennen
                              "tagesschau": "TSC", "tagesspiegel": "TSP", "derstandard": "SAN", "newstatesman": "SAT"}
     assert got["dedupeNone"] == []
+
+
+def test_api_timeout_and_caller_abort():
+    """Hängende Anfrage → nach der Frist ApiError(0, 'Keine Verbindung'); bricht der Aufrufer ab,
+    bleibt es ein AbortError (unterscheidbar von der Frist). Die Frist wird nach Erfolg aufgeräumt."""
+    script = """
+globalThis.location = { origin: 'http://kiosk.test' };
+let mode = 'hang';
+globalThis.fetch = (url, init) => new Promise((resolve, reject) => {
+  if (mode === 'ok') { resolve(new Response('{"ok":1}', { headers: { 'content-type': 'application/json' } })); return; }
+  if (mode === 'net') { reject(new TypeError('Failed to fetch')); return; }
+  if (init.signal.aborted) { reject(new DOMException('aborted', 'AbortError')); return; }
+  init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+});
+const { api, ApiError, fetchFailure, deadlineFor, refreshError } = await import(process.argv[1] + '/api.js');
+const outcome = async (p) => { try { return ['ok', await p]; } catch (e) {
+  return [e instanceof ApiError ? 'ApiError' : e.name, e.status ?? null, e.detail ?? null]; } };
+const t0 = Date.now();
+const timeout = await outcome(api('x', { timeout: 30 }));
+const waited = Date.now() - t0;
+const ctrl = new AbortController();
+setTimeout(() => ctrl.abort(), 10);
+const caller = await outcome(api('x', { signal: ctrl.signal, timeout: 5000 }));
+const pre = new AbortController(); pre.abort();
+const already = await outcome(api('x', { signal: pre.signal, timeout: 5000 }));
+mode = 'net';
+const net = await outcome(api('x'));
+mode = 'ok';
+const ok = await outcome(api('x'));   // Standardfrist 15 s: nach Erfolg aufgeräumt, node endet sofort
+const abortErr = new DOMException('a', 'AbortError');
+console.log(JSON.stringify({ timeout, waited, caller, already, net, ok,
+  deadlines: ['GET', 'HEAD', 'POST', 'PATCH', 'PUT', 'DELETE', undefined].map((m) => deadlineFor(m)),
+  map: [fetchFailure(abortErr, false) === abortErr, fetchFailure(abortErr, true) instanceof ApiError,
+        fetchFailure(new TypeError('x'), false).detail],
+  timedOutFlag: [fetchFailure(abortErr, true).timedOut, fetchFailure(new TypeError('x'), false).timedOut],
+  refresh: [refreshError(new ApiError(503, 'Der Sammler ist ausgeschaltet')), refreshError(new ApiError(503)),
+            refreshError(new ApiError(502)), refreshError(new ApiError(403, 'Nur Admin'))] }));
+"""
+    t0 = time.monotonic()
+    res = subprocess.run([NODE, "--input-type=module", "-e", script, str(JS.as_uri())],
+                         capture_output=True, text=True, timeout=30, env={"PATH": ""})
+    elapsed = time.monotonic() - t0
+    assert res.returncode == 0, res.stderr
+    got = json.loads(res.stdout)
+    assert got["timeout"] == ["ApiError", 0, "Keine Verbindung"]
+    assert got["timedOutFlag"] == [True, False]
+    # 503 mit Meldung des Servers als solche; ohne Meldung (Caddy beim Deploy) „Fehler: HTTP …“
+    assert got["refresh"] == ["Der Sammler ist ausgeschaltet", "Fehler: HTTP 503", "Fehler: HTTP 502", "Fehler: Nur Admin"]   # Frist ≠ Netzfehler (Start: nur echter Netzfehler = offline)
+    assert 25 <= got["waited"] < 2000
+    assert got["caller"][0] == "AbortError"
+    assert got["already"][0] == "AbortError"
+    assert got["net"] == ["ApiError", 0, "Keine Verbindung"]
+    assert got["ok"] == ["ok", {"ok": 1}]
+    assert got["map"] == [True, True, "Keine Verbindung"]
+    # Schreiben darf länger dauern (der Server könnte es sonst nach dem Abbruch doch tun)
+    assert got["deadlines"] == [15000, 15000, 45000, 45000, 45000, 45000, 15000]
+    assert elapsed < 10   # keine offene 15-s-Frist nach den Anfragen
+
+
+def test_build_watcher_reports_new_build_once():
+    """Neue Version nach einem Deploy: nur bei echter Änderung (lokal leer: nie), einmal je Version,
+    höchstens alle minGapMs (force übergeht das), Fehler bleiben still."""
+    script = """
+const { buildChanged, buildWatcher } = await import(process.argv[1] + '/version.js');
+let t = 0, build = 'a', fail = false;
+const seen = [];
+const w = buildWatcher({ fetchBuild: async () => { if (fail) throw new Error('offline'); return build; },
+  onNew: (b) => seen.push(b), minGapMs: 1000, now: () => t });
+w.setKnown('a');
+const r = [];
+r.push(await w.check());            // zu früh
+t = 2000; r.push(await w.check());  // gleiche Version
+build = 'b'; r.push(await w.check());   // zu früh (eben gefragt)
+r.push(await w.check({ force: true }));  // neu → melden
+t = 5000; r.push(await w.check());  // schon gemeldet
+fail = true; t = 9000; r.push(await w.check());
+fail = false; build = 'c'; t = 12000; r.push(await w.check());
+// „Später“: dieselbe neue Version erst nach remindMs wieder melden
+const seen3 = [];
+let t3 = 0;
+const w3 = buildWatcher({ fetchBuild: async () => 'n', onNew: (b) => seen3.push([b, t3]), minGapMs: 0,
+  remindMs: 1000, now: () => t3 });
+w3.setKnown('o');
+const remind = [await w3.check()];
+t3 = 500; remind.push(await w3.check());
+t3 = 1500; remind.push(await w3.check());
+// Start offline: erste Antwort gilt als bekannt
+const seen2 = [];
+const w2 = buildWatcher({ fetchBuild: async () => 'x', onNew: (b) => seen2.push(b), now: () => 0 });
+const first = await w2.check({ force: true });
+console.log(JSON.stringify({ r, seen, first, seen2, remind, seen3,
+  changed: [buildChanged('a', 'b'), buildChanged('a', 'a'), buildChanged('', 'b'), buildChanged('a', ''),
+            buildChanged(null, 'b'), buildChanged('a', undefined)] }));
+"""
+    res = subprocess.run([NODE, "--input-type=module", "-e", script, str(JS.as_uri())],
+                         capture_output=True, text=True, timeout=30, env={"PATH": ""})
+    assert res.returncode == 0, res.stderr
+    got = json.loads(res.stdout)
+    assert got["r"] == [False, False, False, True, False, False, True]
+    assert got["seen"] == ["b", "c"]
+    assert got["first"] is False and got["seen2"] == []
+    assert got["remind"] == [True, False, True] and got["seen3"] == [["n", 0], ["n", 1500]]
+    assert got["changed"] == [True, False, False, False, False, False]
+
+
+def test_feed_does_not_load_ahead_while_hidden():
+    """Handy mit offenem Artikel: #view ist ausgeblendet, der Sentinel hat keine Box. Dann nach der
+    ersten Seite nicht weiterladen (vorher lud jede fertige Seite die nächste, bis alles da war)."""
+    script = """
+let rendered = false;
+FakeEl.prototype.getClientRects = function () { return rendered ? [{}] : []; };
+FakeEl.prototype.getBoundingClientRect = () => ({ top: 10, bottom: 11 });   // wäre „sichtbar“
+Object.defineProperty(FakeEl.prototype, 'isConnected', { get() { return true; } });
+globalThis.window.innerHeight = 800;
+globalThis.IntersectionObserver = class { observe() {} disconnect() {} };
+document.createDocumentFragment = () => new FakeEl('fragment');   // genügt hier: Zeilen landen im Behälter
+const { createFeed } = await import(process.argv[1] + '/ui/feed.js');
+const run = async () => {
+  let pages = 0;
+  const feed = createFeed({ empty: () => null, load: async (cursor) => { pages += 1;
+    return { items: [{ id: pages, published_at: '2026-09-26T10:00:00Z' }], next: pages < 5 ? pages : null }; } });
+  await feed.start();
+  for (let i = 0; i < 20; i++) await tick();
+  const failed = feed.el.querySelector('.feed-error');
+  feed.destroy();
+  return failed ? 'Fehler' : pages;
+};
+const hidden = await run();
+rendered = true;
+const visible = await run();
+console.log(JSON.stringify({ hidden, visible }));
+"""
+    got = _run_fake_dom(script)
+    assert got == {"hidden": 1, "visible": 5}
+
+
+def test_mark_all_read_needs_watermark_and_loaders_ignore_old_user():
+    """read-all nur mit Wasserstand (sonst würde alles markiert); späte Antworten des vorigen
+    Benutzers (Leiste, Zeitungen, Profile, Zähler) überschreiben den Zustand nach dem Wechsel nicht."""
+    script = """
+const store = await import(process.argv[1] + '/store.js');
+const { markAllRead } = await import(process.argv[1] + '/views/menu.js');
+let err = null;
+const start = calls.length;
+try { await markAllRead({ type: 'all' }, undefined); } catch (e) { err = e.message; }
+const before = calls.length;
+route = () => ({ marked: 3 });
+await markAllRead({ type: 'source', id: 'taz' }, 42);
+const readAll = calls.slice(before).find((c) => c[1] === '/api/articles/read-all');
+// Späte Antworten nach resetUserState
+const gates = {};
+route = (path) => { const d = defer(); gates[path] = d; return d.p; };
+const pending = [store.loadBar(), store.loadSources(), store.loadProfiles(), store.loadCounts()];
+await tick();
+store.resetUserState();
+gates['/api/bar'].resolve({ items: [{ type: 'all', unread: 9 }] });
+gates['/api/sources'].resolve([{ id: 'old' }]);
+gates['/api/profiles'].resolve([{ id: 1 }]);
+gates['/api/counts'].resolve({ later: 1 });
+await Promise.all(pending);
+const s = store.state;
+let marks = 0;
+store.on('watermark', () => { marks += 1; });
+store.keepWatermark({ max_id: 9, next_before: 'x' }, null);
+const wm1 = [s.listWatermark, s.listComplete];
+store.keepWatermark({ max_id: 12, next_before: null }, 'x');   // Folgeseite: Wasserstand bleibt
+const wm2 = [s.listWatermark, s.listComplete, marks];   // gemeldet wird erst nach dem Anhängen (ctxPageShown)
+console.log(JSON.stringify({ err, callsWithout: before - start, readAll, wm: [wm1, wm2], late: [s.bar, s.sources, s.profiles, s.counts, s.sourceMap.size],
+  reset: [s.nextCtx, s.openArticle, s.prevHash] }));
+"""
+    got = _run_fake_dom(script)
+    assert got["err"] == "Liste noch nicht geladen" and got["callsWithout"] == 0
+    assert got["readAll"] == ["POST", "/api/articles/read-all", {"source": "taz", "max_id": 42}]
+    assert got["late"] == [None, None, None, None, 0]
+    assert got["reset"] == [None, None, None]
+    assert got["wm"] == [[9, False], [9, True, 0]]
+
+
+def test_feed_relabels_times_and_day_groups_on_clock():
+    """Lange offene App: Nach Mitternacht heißt die Gruppe von gestern GESTERN (nicht mehr HEUTE),
+    „5 MIN“ wird zur aktuellen Zeit, und die nächste Seite hängt an die umbenannte Gruppe an."""
+    script = """
+const RealDate = Date;
+let fakeNow = new RealDate(2026, 8, 26, 23, 50).getTime();
+globalThis.Date = class extends RealDate {
+  constructor(...a) { super(...(a.length ? a : [fakeNow])); }
+  static now() { return fakeNow; }
+};
+let rendered = false;
+Object.defineProperty(FakeEl.prototype, 'isConnected', { get() { return true; } });
+FakeEl.prototype.getClientRects = () => (rendered ? [{}] : []);
+FakeEl.prototype.getBoundingClientRect = () => ({ top: 10, bottom: 11 });
+globalThis.window.innerHeight = 800;
+globalThis.IntersectionObserver = class { observe() {} disconnect() {} };
+let resized = null;
+globalThis.ResizeObserver = class { constructor(fn) { resized = fn; } observe() {} disconnect() {} };
+// Fragment: Kinder beim Einfügen direkt in den Behälter (wie im Browser)
+document.createDocumentFragment = () => { const f = new FakeEl('fragment'); f.isFragment = true; return f; };
+const origInsert = FakeEl.prototype.insertBefore;
+FakeEl.prototype.insertBefore = function (k, ref) {
+  if (k.isFragment) { for (const c of [...k.childNodes]) origInsert.call(this, c, ref); return k; }
+  return origInsert.call(this, k, ref);
+};
+const store = await import(process.argv[1] + '/store.js');
+const { createFeed } = await import(process.argv[1] + '/ui/feed.js');
+const at = (d, h, m) => new RealDate(2026, 8, d, h, m).toISOString();
+const pages = [
+  [{ id: 1, published_at: at(26, 23, 45), country: 'DE' }, { id: 2, published_at: at(26, 9, 0), country: 'DE' }],
+  [{ id: 3, published_at: at(26, 8, 0), country: 'DE' }, { id: 4, published_at: at(25, 8, 0), country: 'DE' }],
+];
+let page = 0;
+const feed = createFeed({ dayGroups: true, empty: () => null,
+  load: async () => ({ items: pages[page++], next: page < pages.length ? page : null }) });
+await feed.start();
+const read = () => feed.el.children.filter((n) => n.cls().includes('day') || n.cls().includes('row'))
+  .map((n) => n.cls().includes('day') ? n.textContent : n.querySelector('.row-when').textContent);
+const before = read();
+fakeNow = new RealDate(2026, 8, 27, 0, 10).getTime();
+store.emit('clock');
+const after = read();
+rendered = true;   // Liste wieder zu sehen: nächste Seite
+resized();
+for (let i = 0; i < 10; i++) await tick();
+console.log(JSON.stringify({ before, after, next: read() }));
+"""
+    got = _run_fake_dom(script)
+    assert got["before"] == ["HEUTE", "/ DE / 5 MIN", "/ DE / 14 STD"]
+    assert got["after"] == ["GESTERN", "/ DE / 25 MIN", "/ DE / 15 STD"]
+    assert got["next"] == ["GESTERN", "/ DE / 25 MIN", "/ DE / 15 STD", "/ DE / 16 STD",
+                           "25. SEP", "/ DE / 25. SEP"]
+
+
+def test_heise_and_spiegel_image_variants_count_as_same_image():
+    """Größenvarianten mit Hash-Endung (heise, auch über den Proxy cloudimg.io und .jpg/.jpeg) gelten im
+    Browser als dasselbe Bild, damit die Kopie des Titelbilds im Text entfällt; reine Zahlen-/Datums-
+    Endungen und andere Namen nicht. urlWidth liest die Breite aus der URL."""
+    script = """
+const fmt = await import(process.argv[1] + '/format.js');
+const H = 'https://www.heise.de/imgs/18/4/9/0/2/7/1/5/';
+const C = 'https://heise.cloudimg.io/width/610/q85.png-lossy-85.webp-lossy-85.foil1/_www-heise-de_/imgs/18/4/9/0/2/7/1/5/';
+const pairs = {
+  hash: [H + 'Daimler_E-lkw-86ffab972e33a670.jpg', H + 'Daimler_E-lkw-a55055d4fc8ac0e5.jpeg'],
+  proxy: [H + 'Daimler_E-lkw-86ffab972e33a670.jpg', C + 'Daimler_E-lkw-a55055d4fc8ac0e5.jpeg'],
+  proxyQuery: [H + 'Daimler_E-lkw-86ffab972e33a670.jpg', C + 'Daimler_E-lkw-a55055d4fc8ac0e5.jpeg?force_format=avif'],
+  otherStem: [H + 'Daimler_E-lkw-86ffab972e33a670.jpg', H + 'Daimler_Bus-a55055d4fc8ac0e5.jpg'],
+  digitsOnly: [H + 'Bahnstreik-202609281200.jpg', H + 'Bahnstreik-202609281215.jpg'],
+  otherSite: [H + 'Daimler_E-lkw-86ffab972e33a670.jpg', 'https://www.golem.de/imgs/18/4/9/0/2/7/1/5/Daimler_E-lkw-a55055d4fc8ac0e5.jpg'],
+  otherIdFolder: ['https://www.heise.de/imgs/18/4/9/2/6/1/1/5/Tesla-Model-Y-86ffab972e33a670.jpeg',
+                  'https://www.heise.de/imgs/18/4/9/3/0/7/2/2/Tesla-Model-Y-a55055d4fc8ac0e5.jpeg'],
+  // gleicher Name mit Hash in Größen-Ordnern (Ziffern im ganzen Namen): dasselbe Bild
+  sizeFolders: ['https://cdn.x.de/800/Daimler_E-lkw-86ffab972e33a670.jpg', 'https://cdn.x.de/400/Daimler_E-lkw-86ffab972e33a670.jpg'],
+  // kurzer Rest ohne Hash (pic-<hash>): gleicher Name bleibt unscharf gleich, anderer Hash nicht
+  shortSame: ['https://cdn.x.de/800/pic-86ffab972e33a670.jpg', 'https://cdn.x.de/400/pic-86ffab972e33a670.jpg'],
+  shortOther: ['https://cdn.x.de/imgs/1/2/3/pic-86ffab972e33a670.jpg', 'https://cdn.x.de/imgs/1/2/3/pic-a55055d4fc8ac0e5.jpg'],
+  flatCms: ['https://cms.example/uploads/article-image-86ffab972e33a670.jpg',
+            'https://cms.example/uploads/article-image-a55055d4fc8ac0e5.jpg'],
+  wpScreenshot: ['https://blog.example/wp-content/uploads/2026/09/screenshot-a1b2c3d4e5f6.png',
+                 'https://blog.example/wp-content/uploads/2026/09/screenshot-9f8e7d6c5b4a.png'],
+  spiegel: ['https://cdn.prod.www.spiegel.de/images/0f9a3c1e-0001-0002-0000-000000000001_w520_r1.77_fpx50_fpy40.jpg',
+            'https://cdn.prod.www.spiegel.de/images/0f9a3c1e-0001-0002-0000-000000000001_w960_r1.77_fpx50_fpy40.jpg'],
+};
+const same = Object.fromEntries(Object.entries(pairs).map(([k, [a, b]]) => [k, [fmt.sameImage(a, b), fmt.sameImage(b, a)]]));
+const seen = fmt.imageSeen();
+const seenRun = [pairs.proxy[0], pairs.proxy[1], pairs.otherStem[1]].map((u) => seen(u));
+console.log(JSON.stringify({ same, seenRun,
+  width: [fmt.urlWidth(pairs.spiegel[0]), fmt.urlWidth(pairs.spiegel[1]), fmt.urlWidth('https://x.example/a.jpg?width=800&q=1'),
+          fmt.urlWidth('https://x.example/a.jpg?w=640'), fmt.urlWidth('https://x.example/2026/a.jpg'), fmt.urlWidth(null),
+          fmt.urlWidth(C + 'Daimler_E-lkw-a55055d4fc8ac0e5.jpeg'), fmt.urlWidth('https://taz.de/picture/8763231/14/bild.webp'),
+          fmt.urlWidth('https://taz.de/picture/8763231/948/bild.jpeg'), fmt.urlWidth('https://x.example/picture/2026/09/bild.jpg'),
+          fmt.urlWidth('https://x.example/foto_w2026_r1.jpg'), fmt.urlWidth('https://x.example/foto_w1999.jpg'),
+          fmt.urlWidth('https://x.example/foto_w1200.jpg')] }));
+"""
+    res = subprocess.run([NODE, "--input-type=module", "-e", script, str(JS.as_uri())],
+                         capture_output=True, text=True, timeout=30, env={"PATH": ""})
+    assert res.returncode == 0, res.stderr
+    got = json.loads(res.stdout)
+    assert got["same"] == {"hash": [True, True], "proxy": [True, True], "proxyQuery": [True, True],
+                           "otherStem": [False, False], "digitsOnly": [False, False],
+                           # gleicher Name, andere Bild-ID-Ordner bzw. kurze WordPress-Endung: andere Bilder
+                           "otherIdFolder": [False, False], "wpScreenshot": [False, False],
+                           "flatCms": [False, False],   # ohne Bild-ID-Ordner: Hash trennt Bilder
+                           "sizeFolders": [True, True], "shortSame": [True, True], "shortOther": [False, False],
+                           "otherSite": [False, False], "spiegel": [True, True]}
+    assert got["seenRun"] == [False, True, False]
+    # Datumsordner und Jahreszahlen (_w2026) sind keine Breite
+    assert got["width"] == [520, 960, 800, 640, 0, 0, 610, 14, 948, 0, 0, 0, 1200]
+
+
+def test_caption_credit_title_echo_and_hero_source():
+    """Leseansicht: „Bild:“ und „(Bild: …)“ gelten als Bildquelle; eine Überschrift, die mit dem ganzen
+    Titel endet (Spiegel-Dachzeile), ist eine Titel-Wiederholung; das Titelbild nimmt eine breitere
+    Fassung aus dem Text statt des kleineren Feed-Bilds."""
+    script = """
+const a = await import(process.argv[1] + '/views/article.js');
+const title = 'Evonik schlägt BASF-Übernahmeangebot aus';
+const W = (w) => `https://cdn.prod.www.spiegel.de/images/abc-def_w${w}_r1.77_fpx50_fpy40.jpg`;
+console.log(JSON.stringify({
+  credit: ['Bild: Daimler Truck', '(Bild: Daimler Truck)', 'Bilder: dpa', 'Foto: AP', 'Quelle: heise',
+           'Bildung ist wichtig', 'Der Bildband: schön', 'Fotograf Max'].map((t) => a.isCreditLine(t)),
+  separate: ['(Bild: Daimler Truck)', 'Foto: AP', 'Photo: Reuters', '© dpa', '(© Hersteller)', 'Quelle: Destatis',
+             '(Quelle: Destatis)', '(dpa) Berlin', 'Bildung ist wichtig'].map((t) => a.isSeparateCredit(t)),
+  echo: [a.headingEchoesTitle('Verhandlungen in der Chemiebranche Evonik schlägt BASF-Übernahmeangebot aus', title),
+         a.headingEchoesTitle(title, title),
+         a.headingEchoesTitle('Evonik schlägt BASF-Übernahmeangebot aus – und was jetzt aus den Tarifverhandlungen der Chemie wird', title),
+         a.headingEchoesTitle('Was Evonik jetzt vorhat', title),
+         a.headingEchoesTitle('Eine sehr lange Überschrift, die mit einem ganz anderen Thema beginnt und viel zu viel davor hat, bevor ' + title, title)],
+  hero: [a.heroSource(W(520), [W(960)]), a.heroSource(W(960), [W(520)]), a.heroSource(W(520), []),
+         a.heroSource('https://x.example/feed.jpg', [W(960)]), a.heroSource('https://x.example/a/240/b.jpg', ['https://x.example/big.jpg'])],
+}));
+"""
+    got = _run_fake_dom(script)
+    assert got["credit"] == [True, True, True, True, True, False, False, False]
+    # Eigener Bildquellen-Absatz nach dem Bildtext: nur Bildquellen, nicht „Quelle:“ (Grafik)
+    assert got["separate"] == [True, True, True, True, True, False, False, False, False]
+    assert got["echo"] == [True, True, False, False, False]
+    assert got["hero"] == [
+        "https://cdn.prod.www.spiegel.de/images/abc-def_w960_r1.77_fpx50_fpy40.jpg",
+        "https://cdn.prod.www.spiegel.de/images/abc-def_w960_r1.77_fpx50_fpy40.jpg",
+        "https://cdn.prod.www.spiegel.de/images/abc-def_w520_r1.77_fpx50_fpy40.jpg",
+        "https://x.example/feed.jpg",   # Breite unbekannt: Feed-Bild bleibt
+        "https://x.example/big.jpg",    # Feed nur Vorschau (/240/): große Fassung
+    ]
+
+
+def test_watermark_is_reported_after_the_page_is_in_list_items():
+    """Kurze (einseitige) Liste: 'watermark' kommt erst, wenn die Artikel in listItems stehen; sonst
+    hielte das offene Menü die Liste für „nichts ungelesen“ und blendete read-all aus."""
+    script = """
+Object.defineProperty(FakeEl.prototype, 'isConnected', { get() { return true; } });
+FakeEl.prototype.getClientRects = () => [];
+globalThis.IntersectionObserver = class { observe() {} disconnect() {} };
+document.createDocumentFragment = () => new FakeEl('fragment');
+const store = await import(process.argv[1] + '/store.js');
+const { articlesLoader, createFeed } = await import(process.argv[1] + '/ui/feed.js');
+route = () => ({ items: [{ id: 1, read: 0, published_at: '2026-09-26T10:00:00Z' }], next_before: null, max_id: 7 });
+const seen = [];
+store.on('watermark', () => seen.push([store.state.listItems.length, store.state.listWatermark, store.state.listComplete]));
+const feed = createFeed({ load: articlesLoader({}, { onResponse: store.keepWatermark }), onPage: store.ctxPageShown,
+  empty: () => null });
+store.beginCtxList(feed.items);
+await feed.start();
+console.log(JSON.stringify({ seen }));
+"""
+    got = _run_fake_dom(script)
+    # beginCtxList (leer, ohne Wasserstand), dann nach dem Anhängen: 1 Artikel, Wasserstand, ganz geladen
+    assert got["seen"] == [[0, None, False], [1, 7, True]]
+
+
+def test_update_pill_keeps_label_across_quick_layout_changes():
+    """Die Beschriftung „Neue Version“ kommt auch, wenn die Pille kurz nach dem Zeigen erneut
+    abgeglichen wird (Layoutwechsel innerhalb von 100 ms); verborgen ist sie leer."""
+    script = """
+const { showUpdatePill, setUpdatePillAllowed } = await import(process.argv[1] + '/ui/update.js');
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+setUpdatePillAllowed(true);
+showUpdatePill(() => {});
+await wait(40);
+setUpdatePillAllowed(true);   // Layoutwechsel
+await wait(40);
+setUpdatePillAllowed(true);
+await wait(150);
+const pill = document.getElementById('shell').children.find((c) => c.cls().includes('update-pill'));
+const text = () => pill.querySelector('.update-text').textContent;
+const shown = [pill.hidden, text(), document.body.classList.contains('has-update')];
+setUpdatePillAllowed(false);   // Anmeldung
+const hidden = [pill.hidden, text(), document.body.classList.contains('has-update')];
+setUpdatePillAllowed(true);
+await wait(150);
+console.log(JSON.stringify({ shown, hidden, again: [pill.hidden, text()] }));
+"""
+    got = _run_fake_dom(script)
+    assert got["shown"] == [False, "Neue Version", True]
+    assert got["hidden"] == [True, "", False]
+    assert got["again"] == [False, "Neue Version"]
+
+
+def test_live_blog_time_lines_and_lead_caption_rule():
+    """Liveblog: eine fett gesetzte Uhrzeit-Zeile ist kein Rubrik-Absatz (sie und die Überschrift danach
+    bleiben stehen). Bildzeile nach dem Titelbild nach derselben Regel wie das Backend (_image_end)."""
+    script = """
+const a = await import(process.argv[1] + '/views/article.js');
+const { h } = await import(process.argv[1] + '/ui/dom.js');
+const time = (t, tag = 'strong') => h('p', {}, h(tag, { text: t }));
+console.log(JSON.stringify({
+  time: [a.isTimeLine(time('28.09. 14:43')), a.isTimeLine(time('14:43')), a.isTimeLine(time('28.09.2026 9:05 Uhr', 'b')),
+         a.isTimeLine(h('p', { text: '14:43' })), a.isTimeLine(h('p', {}, h('strong', { text: '14:43' }), ' Uhr: neu')),
+         a.isTimeLine(time('Wichtig')), a.isTimeLine(null)],
+  lead: ['Präsident Biden in Washington', 'Foto: AP', '(Bild: Tesla)', '© dpa', 'Der Präsident sprach lange.',
+         'Was sagte er? ', '„Wir schaffen das“', 'x'.repeat(251), ''].map((t) => a.isLeadCaptionText(t)),
+  // Wie _plain_caption: keine Bildzeile bei Doppelpunkt, Auslassung, Klammer, Ortsmarke, „+++“ oder
+  // wenn der nächste Absatz genauso aussieht (Gedicht, Aufzählung).
+  guards: [a.isLeadCaptionText('Die wichtigsten Punkte:'), a.isLeadCaptionText('Und dann kam alles anders …'),
+           a.isLeadCaptionText('Merz in Berlin (Archiv)'), a.isLeadCaptionText('Berlin (dpa) – Die Regierung plant neue Regeln'),
+           a.isLeadCaptionText('München (dpa) – Der Stadtrat plant neue Regeln'),
+           a.isLeadCaptionText('Streik bei der Bahn +++ Merz in Paris +++ Wetter'),
+           a.isLeadCaptionText('Rosen sind rot', 'Veilchen sind blau'),
+           a.isLeadCaptionText('Rosen sind rot', 'Der Text beginnt hier mit einem Satz.'),
+           a.isLeadCaptionText('Rosen sind rot', 'Foto: dpa')],
+}));
+"""
+    got = _run_fake_dom(script)
+    assert got["time"] == [True, True, True, False, False, False, False]
+    assert got["lead"] == [True, True, True, True, False, False, False, False, False]   # Zitat: keine Bildzeile
+    assert got["guards"] == [False, False, False, False, False, False, False, True, True]
+
+
+def test_enable_source_updates_current_source_object():
+    """„Einschalten“ in einer ausgeschalteten Zeitung: Wurde /api/sources inzwischen neu geladen, ist das
+    Objekt der Ansicht veraltet; auch das aktuelle in state.sourceMap muss eingeschaltet werden, sonst
+    zeigt die Ansicht weiter AUSGESCHALTET."""
+    script = """
+Object.defineProperty(FakeEl.prototype, 'isConnected', { get() { return true; } });
+FakeEl.prototype.getClientRects = () => [];
+globalThis.IntersectionObserver = class { observe() {} disconnect() {} };
+document.createDocumentFragment = () => new FakeEl('fragment');
+globalThis.document.body.classList.add = () => {};
+const store = await import(process.argv[1] + '/store.js');
+const { sourceView } = await import(process.argv[1] + '/views/sourceView.js');
+store.state.user = { id: 1, is_admin: true };
+const off = () => ({ id: 'taz', name: 'taz', country: 'DE', enabled: false, total: 5, unread: 0, unread_all: 0 });
+store.state.sources = [off()];
+store.state.sourceMap = new Map(store.state.sources.map((s) => [s.id, s]));
+route = (path, method) => {
+  if (path === '/api/sources') return [off()];   // neu geladen: neue Objekte, noch aus
+  if (path === '/api/sources/taz' && method === 'PATCH') return { ...off(), enabled: true };
+  if (path === '/api/refresh') return {};
+  if (path === '/api/bar') return { items: [] };
+  if (path === '/api/status') return {};
+  return { items: [], next_before: null, max_id: 3 };
+};
+const view = sourceView({ id: 'taz', params: new URLSearchParams() });
+for (let i = 0; i < 10; i++) await tick();
+const btn = view.el.all().find((e) => e.tagName === 'BUTTON' && e.textContent === 'Einschalten');
+const before = !!btn;
+await store.loadSources();   // z. B. Zähler nachgeladen: sourceMap hat neue Objekte, die Ansicht hält das alte
+await btn.listeners.click[0]();
+for (let i = 0; i < 10; i++) await tick();
+const titles = view.el.all().filter((e) => e.cls().includes('t-section')).map((e) => e.textContent);
+console.log(JSON.stringify({ before, enabled: store.state.sourceMap.get('taz').enabled, off: titles.includes('AUSGESCHALTET') }));
+view.destroy();
+"""
+    got = _run_fake_dom(script)
+    assert got == {"before": True, "enabled": True, "off": False}
+
+
+# Schein-DOM-Erweiterung für die Leseansicht: Tag-Selektoren, closest(Tag), previousElementSibling.
+ARTICLE_DOM = """
+const origQSA = FakeEl.prototype.querySelectorAll;
+FakeEl.prototype.querySelectorAll = function (sel) {
+  if (/^[a-z]+$/i.test(sel)) return this.all().filter((e) => e.tagName === sel.toUpperCase());
+  return origQSA.call(this, sel);
+};
+FakeEl.prototype.closest = function (sel) {
+  for (let x = this; x; x = x.parentNode) if (x.tagName === String(sel).toUpperCase()) return x;
+  return null;
+};
+Object.defineProperty(FakeEl.prototype, 'previousElementSibling', { get() {
+  const p = this.parentNode; if (!p) return null; const c = p.children; return c[c.indexOf(this) - 1] || null; } });
+const a = await import(process.argv[1] + '/views/article.js');
+const { h } = await import(process.argv[1] + '/ui/dom.js');
+const cls = (el) => el.className;
+"""
+
+
+def test_plan_hero_lead_image_captions_and_placeholders():
+    """planHero/adoptLeadImage im Schein-DOM: Bildzeile als <figcaption> (in <figure> oder lose daneben)
+    bleibt allein; ohne sie nur der erste passende Absatz (nicht Liveblog-Uhrzeit, nicht Vorspann mit
+    „+++“, nicht „Wie die Bild berichtet“); taz-Platzhalter (14 px) wird durch das Feed-Bild ersetzt,
+    ebenso ein Bild unbekannter Breite, das winzig lädt."""
+    script = ARTICLE_DOM + """
+const T = 'https://taz.de/picture/8763231/';
+const out = {};
+// 1. <figure><img><figcaption>
+{ const img = h('img', { src: 'https://x.example/a/bild-gross.jpg' });
+  const body = h('div', {}, h('figure', {}, img, h('figcaption', { text: 'Bildtext · Foto: dpa' })),
+    h('p', { text: 'Kurzer Absatz ohne Punkt' }), h('p', { text: 'Text beginnt.' }));
+  out.figure = [a.planHero(body, null, ''), body.children.map(cls)]; }
+// 2. lose <img><figcaption> nebeneinander
+{ const body = h('div', {}, h('p', {}, h('img', { src: 'https://x.example/a/bild-gross.jpg' })),
+    h('figcaption', { text: 'Bildtext' }), h('p', { text: 'Kurz ohne Punkt' }), h('p', { text: 'Satz.' }));
+  a.planHero(body, null, ''); out.loose = body.children.map(cls); }
+// 3. Liveblog: Uhrzeit direkt nach dem Bild ist keine Bildzeile
+{ const body = h('div', {}, h('p', {}, h('img', { src: 'https://x.example/a/bild-gross.jpg' })),
+    h('p', {}, h('strong', { text: '28.09. 14:43' })), h('h2', { text: 'Merz in Paris' }), h('p', { text: 'Satz.' }));
+  a.planHero(body, null, ''); out.live = body.children.map(cls); }
+// 4. BBC: kurzer Bildtext ohne Punkt, danach Bildquelle mit Präfix; „Wie die Bild berichtet“ nicht
+{ const body = h('div', {}, h('p', {}, h('img', { src: 'https://x.example/a/bild-gross.jpg' })),
+    h('p', { text: 'Joe Biden in Washington' }), h('p', { text: 'Foto: Reuters' }), h('p', { text: 'Satz.' }));
+  a.planHero(body, null, ''); out.bbc = body.children.map(cls); }
+{ const body = h('div', {}, h('p', {}, h('img', { src: 'https://x.example/a/bild-gross.jpg' })),
+    h('p', { text: 'Joe Biden in Washington' }), h('p', { text: 'Wie die Bild berichtet, plant Merz eine Reise.' }),
+    h('p', { text: 'Satz.' }));
+  a.planHero(body, null, ''); out.bild = body.children.map(cls); }
+// 5. FAZ-Vorspann mit +++
+{ const body = h('div', {}, h('p', {}, h('img', { src: 'https://x.example/a/bild-gross.jpg' })),
+    h('p', { text: 'Streik bei der Bahn +++ Merz in Paris +++ Wetter' }), h('p', { text: 'Satz.' }));
+  a.planHero(body, null, ''); out.faz = body.children.map(cls); }
+// 6. taz-Platzhalter 14 px vorn, Feed-Bild 948 px: Feed-Bild an seine Stelle, figcaption bleibt
+{ const img = h('img', { src: T + '14/taz-bild.webp' });
+  const body = h('div', {}, h('figure', {}, img, h('figcaption', { text: 'FOTO: Max Muster' })), h('p', { text: 'Satz.' }));
+  const plan = a.planHero(body, T + '948/taz-bild.jpeg', '');
+  out.taz = [plan, img.getAttribute('src'), img.dataset.fallbackSrc || null, body.children[0].children.map((c) => c.tagName)]; }
+// 6b. echtes kleines Bild (200 px laut URL) mit anderem Feed-Bild: bleibt samt Bildzeile
+{ const img = h('img', { src: 'https://x.example/a/portraet_w200.jpg' });
+  const body = h('div', {}, h('figure', {}, img, h('figcaption', { text: 'Anna Muster' })), h('p', { text: 'Satz.' }));
+  a.planHero(body, 'https://x.example/feed/anders_w1200.jpg', '');
+  out.smallReal = img.getAttribute('src'); }
+// 7. Breite unbekannt, lädt winzig: Feed-Bild; lädt groß: bleibt
+for (const [key, nw] of [['tinyLoad', 14], ['bigLoad', 1200], ['smallLoad', 200]]) {
+  const img = h('img', { src: 'https://x.example/a/bild-ohne-breite.jpg' });
+  const body = h('div', {}, h('figure', {}, img), h('p', { text: 'Satz.' }));
+  a.planHero(body, 'https://x.example/feed/anders.jpg', '');
+  const flagged = img.dataset.leadCheck === '1';
+  img.naturalWidth = nw;
+  const before = (img.listeners.load || []).length;
+  for (const fn of [...(img.listeners.load || [])]) fn();
+  out[key] = [flagged, img.getAttribute('src'), img.dataset.leadCheck || null, img.dataset.fallbackSrc || null,
+              (img.listeners.load || []).length - before];
+}
+console.log(JSON.stringify(out));
+"""
+    got = _run_fake_dom(script)
+    assert got["figure"] == [None, ["", "", ""]]            # figcaption allein, Absätze bleiben Text
+    assert got["loose"] == ["", "", "", ""]
+    assert got["live"] == ["", "", "", ""]                  # Uhrzeit keine Bildzeile
+    assert got["bbc"] == ["", "art-caption", "art-caption", ""]
+    assert got["bild"] == ["", "art-caption", "", ""]     # zweiter Absatz nur mit Präfix-Bildquelle
+    assert got["faz"] == ["", "", ""]
+    # Platzhalter: Feed-Bild, bei Ladefehler zurück zum Original
+    assert got["taz"] == [None, "https://taz.de/picture/8763231/948/taz-bild.jpeg",
+                          "https://taz.de/picture/8763231/14/taz-bild.webp", ["IMG", "FIGCAPTION"]]
+    assert got["smallReal"] == "https://x.example/a/portraet_w200.jpg"
+    # winzig geladen: getauscht, mit Rückfall und neuer Winzig-Prüfung für das eingesetzte Bild
+    assert got["tinyLoad"] == [True, "https://x.example/feed/anders.jpg", None,
+                               "https://x.example/a/bild-ohne-breite.jpg", 1]
+    assert got["bigLoad"] == [True, "https://x.example/a/bild-ohne-breite.jpg", None, None, 0]
+    assert got["smallLoad"] == [True, "https://x.example/a/bild-ohne-breite.jpg", None, None, 0]   # echtes kleines Bild
+
+
+def test_toast_wrap_rule_and_sheet_dispose():
+    """Toast: kurze Bestätigung einzeilig, Fehler und längere Hinweise (über 28 Zeichen) zweizeilig.
+    Blatt: onDispose kommt bei jedem Schließen (auch still und beim Ersetzen durch ein anderes Blatt),
+    damit z. B. das Menü seinen 'watermark'-Beobachter abmeldet."""
+    script = """
+ids.toast = new FakeEl('div');
+ids.sheet = new FakeEl('div');
+document.contains = () => false;
+const { toast } = await import(process.argv[1] + '/ui/dom.js');
+const { openSheet, closeSheet } = await import(process.argv[1] + '/ui/sheet.js');
+const wrap = (m) => { toast(m); return [ids.toast.cls().includes('toast--wrap'), ids.toast.textContent]; };
+const toasts = [wrap('Alles gelesen'), wrap('Nur der Admin kann Zeitungen einschalten'), wrap('Fehler: kaputt')];
+const log = [];
+openSheet(() => {}, { onDispose: () => log.push('a-dispose'), onClose: () => log.push('a-close') });
+openSheet(() => {}, { onDispose: () => log.push('b-dispose'), onClose: () => log.push('b-close') });   // ersetzt a still
+closeSheet({ silent: true });
+openSheet(() => {}, { onDispose: () => log.push('c-dispose'), onClose: () => log.push('c-close') });
+closeSheet();
+console.log(JSON.stringify({ toasts, log }));
+"""
+    got = _run_fake_dom(script)
+    assert got["toasts"] == [[False, "Alles gelesen"], [True, "Nur der Admin kann Zeitungen einschalten"],
+                             [True, "Fehler: kaputt"]]
+    assert got["log"] == ["a-dispose", "b-dispose", "c-dispose", "c-close"]

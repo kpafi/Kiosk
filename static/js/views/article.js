@@ -1,10 +1,10 @@
 // Leseansicht (E2Lese, rechts in E2Desktop): Kopf mit Flags, Meta, Titel, Bild, Volltext, Nächster.
-import { h, hint, isDesktop, replace } from '../ui/dom.js';
+import { desktopQuery, h, hint, isDesktop, replace } from '../ui/dom.js';
 import { arrowRight, back, bookmark, checkCheck, collapse, expand, external, star } from '../ui/icons.js';
 import { iconButton } from '../ui/header.js';
 import { markOpenRow } from '../ui/row.js';
 import {
-  articleTime, cleanText, imageSeen, isSmallImageUrl, listTime, readMinutes, sameImage,
+  articleTime, cleanText, imageSeen, isSmallImageUrl, listTime, readMinutes, sameImage, urlWidth,
 } from '../format.js';
 import { api } from '../api.js';
 import {
@@ -70,11 +70,24 @@ function dropPaywalledRow(id) {
   emit('unread-changed');
 }
 
-// Gleiche Regel wie CAPTION_RE in app/extract.py.
-const CAPTION_RE = /^\s*(?:Fotos?|Bilder?|Quelle|Photo|Image)\s*:/i;
-// Bildunterschrift, die mit der Bildquelle endet („… Foto: dpa“, „… Bild: AP“).
-const CREDIT_END_RE = /(?:Fotos?|Bilder?)\s*:\s*[^:]{1,80}$/i;
-const CREDIT_START_RE = /^\s*(?:Fotos?|Bilder?)\s*:/i;
+// Gleiche Regel wie CAPTION_RE in app/extract.py: „Foto:“, „Bild:“, „Bilder:“ …, auch in Klammern
+// (heise: „(Bild: Daimler Truck)“).
+const CAPTION_RE = /^\s*\(?\s*(?:Fotos?|Bild(?:er)?|Quelle|Photo|Image)\s*:/i;
+// Bildunterschrift, die mit der Bildquelle endet („… Foto: dpa“, „… Bild: AP“, „… (Bild: AP)“).
+const CREDIT_END_RE = /(?:Fotos?|Bild(?:er)?)\s*:\s*[^:]{1,80}$/i;
+const CREDIT_START_RE = /^\s*\(?\s*(?:Fotos?|Bild(?:er)?)\s*:/i;
+// Eigener Absatz mit der Bildquelle nach dem Bildtext: „(Bild: …)“, „Foto: …“, „Photo: …“, „© …“.
+const PHOTO_CREDIT_RE = /^\s*(?:\(\s*)?(?:(?:Fotos?|Bild(?:er)?|Photo|Image)\s*:|©)/i;
+
+/** Ist der Absatz eine Bildquelle, die mit dem Bildtext davor zusammengefasst wird (nicht „Quelle:“)? */
+export function isSeparateCredit(text) {
+  return PHOTO_CREDIT_RE.test(text || '');
+}
+
+/** Nennt der Text (Absatz) die Bildquelle am Anfang („Foto: …“, „(Bild: …)“)? */
+export function isCreditLine(text) {
+  return CAPTION_RE.test(text || '');
+}
 const CAPTION_MAX = 160;   // längere Absätze sind Artikeltext
 const CREDIT_MAX = 80;     // Absatz, der nach einem losen „Foto:“ nur die Quelle nennt
 const SHORT_P_MAX = 40;    // Rubrik-/Leerabsatz („War“, „Prefer“): kürzer als 40 Zeichen
@@ -85,9 +98,22 @@ const HERO_CAPTION_MAX = 200;
 const HERO_MIN_WIDTH = 300;   // kleineres Feed-Bild (Vorschau) wird nicht hochskaliert, sondern weggelassen
 const INLINE_MIN_WIDTH = 120;   // kleinere Bilder im Text (ohne Grund klein) werden weggelassen
 
-/** Leerer oder kurzer Rubrik-Absatz ohne Bild. */
+// Zeitzeile eines Liveblog-Eintrags (Backend: <p><strong>28.09. 14:43</strong></p>).
+const TIME_LINE_RE = /^(?:\d{1,2}\.\d{1,2}\.(?:\d{2,4})?\s*)?\d{1,2}:\d{2}(?:\s*Uhr)?$/;
+
+/** Absatz, der nur aus einer fett gesetzten Uhrzeit besteht (Liveblog-Eintrag). */
+export function isTimeLine(node) {
+  if (!node || node.tagName !== 'P' || node.children.length !== 1) return false;
+  const bold = node.firstElementChild;
+  if (!['STRONG', 'B'].includes(bold.tagName)) return false;
+  const text = (node.textContent || '').trim();
+  return text === (bold.textContent || '').trim() && TIME_LINE_RE.test(text);
+}
+
+/** Leerer oder kurzer Rubrik-Absatz ohne Bild (nicht die Zeitzeile eines Liveblog-Eintrags). */
 function isFiller(node) {
-  return node.tagName === 'P' && !node.querySelector('img') && (node.textContent || '').trim().length < SHORT_P_MAX;
+  return node.tagName === 'P' && !node.querySelector('img') && (node.textContent || '').trim().length < SHORT_P_MAX
+    && !isTimeLine(node);
 }
 
 /** Absatz direkt nach einem Bild (auch nach dem Absatz/Link, der nur das Bild umschließt). */
@@ -103,6 +129,19 @@ function isCreditCaption(p) {
   return !p.querySelector('img') && text.length < HERO_CAPTION_MAX && HERO_CREDIT_RE.test(text);
 }
 
+/** <figcaption> der <figure> eines Bilds (Backend setzt Bildtext und -quelle dort hinein), sonst null. */
+function figcaptionOf(img) {
+  const fig = img.closest('figure');
+  const inFig = fig ? [...fig.children].find((c) => c.tagName === 'FIGCAPTION') : null;
+  if (inFig) return inFig;
+  // Gespeicherte Texte mit loser Bildzeile: <img><figcaption> bzw. <p><img></p><figcaption>.
+  let node = img;
+  while (!node.nextElementSibling && node.parentElement && ['P', 'A'].includes(node.parentElement.tagName)
+    && !(node.parentElement.textContent || '').trim()) node = node.parentElement;
+  const next = node.nextElementSibling;
+  return next && next.tagName === 'FIGCAPTION' ? next : null;
+}
+
 /** Absatz direkt nach einem Bild, der nur die Bildquelle nennt („Foto: …“). */
 function captionAfter(node) {
   const next = paragraphAfter(node);
@@ -113,12 +152,24 @@ function captionAfter(node) {
  *  „<p>Bildtext</p>Foto: dpa“ bzw. „<p>Bildtext</p>Foto:<p>dpa</p>“), wird als Bildzeile gesetzt;
  *  die lose Quelle kommt mit hinein. */
 function markCaption(img) {
+  if (figcaptionOf(img)) return;   // Bildzeile steht schon in <figcaption>
   const p = paragraphAfter(img);
   if (!p || p.querySelector('img')) return;
   const text = (p.textContent || '').trim();
   if (!text || text.length >= CAPTION_MAX) return;
   const loose = p.nextSibling && p.nextSibling.nodeType === Node.TEXT_NODE && CREDIT_START_RE.test(p.nextSibling.textContent)
     ? p.nextSibling : null;
+  // Bildtext und Bildquelle als zwei Absätze (heise: „<p>Bildtext</p><p>(Bild: Daimler Truck)</p>“):
+  // zu einer Bildzeile zusammenfassen. Nur Bildquellen (Klammer, Foto/Bild/Photo, ©), nicht „Quelle:“
+  // (Quellenangabe einer Grafik nach einem kurzen echten Absatz).
+  const sep = !loose && !CAPTION_RE.test(text) ? p.nextElementSibling : null;
+  if (sep && sep.tagName === 'P' && !sep.querySelector('img') && (sep.textContent || '').trim().length < CREDIT_MAX
+      && PHOTO_CREDIT_RE.test(sep.textContent || '')) {
+    p.classList.add('art-caption');
+    p.append(` ${sep.textContent.trim()}`);
+    sep.remove();
+    return;
+  }
   if (!loose && !CAPTION_RE.test(text) && !CREDIT_END_RE.test(text)) return;
   p.classList.add('art-caption');
   if (!loose) return;
@@ -213,45 +264,108 @@ function leadingImage(bodyEl) {
 }
 
 const TITLE_ECHO_WITHIN = 4;   // nur unter den ersten vier Elementen
-const TITLE_ECHO_EXTRA = 20;   // „Rubrik • Titel“: höchstens 20 Zeichen mehr als der Titel
+const TITLE_ECHO_EXTRA = 20;   // „Rubrik • Titel“: höchstens 20 Zeichen mehr als der Titel …
+const TITLE_ECHO_KICKER = 80;  // … endet die Überschrift mit dem ganzen Titel (Spiegel-Dachzeile davor), bis 80
 const TITLE_ECHO_MIN = 12;     // „enthält den Titel“ nur bei Titeln ab 12 Zeichen
 const TITLE_ECHO_PART = 0.6;   // Teil des Titels (Überschrift bzw. Kern nach „: “): mind. 60 % der Länge
 const normTitle = (t) => (t || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
 
-/** Überschriften (H1–H3) und Absätze am Textanfang, die nur den Titel wiederholen, entfallen samt
- *  direkt davor stehender kurzer Rubrik- oder Leerabsätze. Als Wiederholung zählt eine Überschrift,
- *  die dem Titel gleicht, ihn (mit höchstens 20 Zeichen Rubrik) enthält, ein großer Teil von ihm ist
- *  oder seinen Kern nach dem letzten „: “ enthält (Feed „Österreich: Wie die FPÖ …“, Überschrift
- *  „meinung • Die Lage: Inside Austria Wie die FPÖ …“); ein Absatz nur, wenn er genau dem Titel oder
- *  dem Kern gleicht. */
-function dropTitleEcho(bodyEl, title) {
+/** Titel-Vergleich (normalisiert): { t: Titel, core: Kern nach dem letzten „: “ oder '' }. */
+function titleParts(title) {
   const t = normTitle(title);
-  if (!t) return;
   const cut = (title || '').lastIndexOf(': ');
   const core = cut === -1 ? '' : normTitle(title.slice(cut + 2));
   const hasCore = core.length >= TITLE_ECHO_MIN && core.length >= t.length * TITLE_ECHO_PART;
+  return { t, core: hasCore ? core : '' };
+}
+
+/** Wiederholt eine Überschrift (H1–H3) am Textanfang den Titel? Gleich; enthält ihn mit höchstens 20
+ *  Zeichen Rubrik; endet mit dem ganzen Titel (Dachzeile davor, bis 80 Zeichen, Spiegel
+ *  „Verhandlungen in der Chemiebranche Evonik schlägt …“); ist ein großer Teil von ihm; oder enthält
+ *  seinen Kern nach dem letzten „: “ (Feed „Österreich: Wie die FPÖ …“, Überschrift
+ *  „meinung • Die Lage: Inside Austria Wie die FPÖ …“). */
+export function headingEchoesTitle(text, title) {
+  const { t, core } = titleParts(title);
+  const n = normTitle(text);
+  if (!n || !t) return false;
+  if (n === t || (core && n.includes(core))) return true;
+  if (t.length < TITLE_ECHO_MIN) return false;
+  return (n.includes(t) && n.length - t.length <= TITLE_ECHO_EXTRA)
+    || (n.endsWith(t) && n.length - t.length <= TITLE_ECHO_KICKER)
+    || (t.includes(n) && n.length >= t.length * TITLE_ECHO_PART);
+}
+
+/** Überschriften (H1–H3) und Absätze am Textanfang, die nur den Titel wiederholen, entfallen samt
+ *  direkt davor stehender kurzer Rubrik- oder Leerabsätze (Überschriften siehe headingEchoesTitle);
+ *  ein Absatz nur, wenn er genau dem Titel oder dem Kern gleicht. */
+function dropTitleEcho(bodyEl, title) {
+  const { t, core } = titleParts(title);
+  if (!t) return;
   const isEcho = (el) => {
     const n = normTitle(el.textContent);
     if (!n) return false;
-    if (el.tagName === 'P') return !el.querySelector('img') && (n === t || (hasCore && n === core));
-    if (!/^H[1-3]$/.test(el.tagName)) return false;
-    if (n === t || (hasCore && n.includes(core))) return true;
-    if (t.length < TITLE_ECHO_MIN) return false;
-    return (n.includes(t) && n.length - t.length <= TITLE_ECHO_EXTRA)
-      || (t.includes(n) && n.length >= t.length * TITLE_ECHO_PART);
+    // Überschrift eines Liveblog-Eintrags (direkt nach seiner Zeitzeile) ist keine Titel-Wiederholung.
+    if (isTimeLine(el.previousElementSibling)) return false;
+    if (el.tagName === 'P') return !el.querySelector('img') && (n === t || (!!core && n === core));
+    return /^H[1-3]$/.test(el.tagName) && headingEchoesTitle(el.textContent, title);
   };
-  for (const echo of [...bodyEl.children].slice(0, TITLE_ECHO_WITHIN).filter(isEcho)) {
+  // Liveblog (Zeitzeilen im Text): nur das erste Element kann den Titel wiederholen.
+  const children = [...bodyEl.children];
+  const within = children.some(isTimeLine) ? 1 : TITLE_ECHO_WITHIN;
+  for (const echo of children.slice(0, within).filter(isEcho)) {
     while (echo.previousElementSibling && isFiller(echo.previousElementSibling)) echo.previousElementSibling.remove();
     echo.remove();
   }
 }
 
-/** Ein Bild am Textanfang wird Titelbild: davor übersprungene Rubrik-/Leerabsätze entfallen, und ein
- *  kurzer Absatz direkt danach, der eine Bildquelle nennt, wird als Bildzeile gesetzt. */
+const LEAD_CAPTION_MAX = 250;   // wie _CAPTION_MAX in app/extract.py
+// Wie _NOT_CAPTION_RE in app/extract.py: Zitat (Anfang/Ende), Auslassung oder Klammer am Ende,
+// Ortsmarke „Berlin (dpa) –“; dazu FAZ-Vorspann mit „+++“.
+const NOT_CAPTION_RE = /^[„“"«»‚‘]|[„“"«»‚‘’…)]$|^\p{Lu}[\p{L}\d./ -]{0,40}\((?:dpa|AP|AFP|Reuters|KNA|epd|dts|rtr|sda|apa)[^)]*\)\s*[-–—]|\+\+\+/u;
+const endsSentence = (t) => /[.!?]$/.test(t.replace(/["“”„«»‘’']+$/, ''));
+const squashSpace = (t) => (t || '').replace(/\s+/g, ' ').trim();
+
+/** Bildnachweis am Anfang („Foto: …“, „(Bild: …)“, „© …“). */
+function isCreditText(t) {
+  return CAPTION_RE.test(t) || /^\(?\s*©/.test(t);
+}
+
+/** Kurzer Absatz ohne Satzzeichen am Ende als Bildzeile direkt nach dem Titelbild (BBC: Bildtext ohne
+ *  „Foto:“)? Wie _plain_caption in app/extract.py: nicht bei Zitat, Auslassung, Klammer, Ortsmarke,
+ *  Doppelpunkt, „+++“, und nicht, wenn der nächste Absatz genauso aussieht (Gedicht, Aufzählung). */
+export function isLeadCaptionText(text, nextText = '') {
+  const t = squashSpace(text);
+  if (!t) return false;
+  if (isCreditText(t)) return true;
+  if (t.length > LEAD_CAPTION_MAX || t.endsWith(':') || NOT_CAPTION_RE.test(t) || endsSentence(t)) return false;
+  const n = squashSpace(nextText);
+  return !(n && n.length <= LEAD_CAPTION_MAX && !endsSentence(n) && !isCreditText(n));
+}
+
+/** Nur fett gesetzter Absatz (Zwischenzeile, Liveblog-Uhrzeit): nie Bildzeile. */
+function isBoldOnly(p) {
+  return p.children.length === 1 && ['STRONG', 'B'].includes(p.firstElementChild.tagName)
+    && squashSpace(p.textContent) === squashSpace(p.firstElementChild.textContent);
+}
+
+/** Ein Bild am Textanfang wird Titelbild: davor übersprungene Rubrik-/Leerabsätze entfallen. Seine
+ *  Bildzeile bleibt bei ihm: eine <figcaption> (vom Backend) ist sie allein; sonst nur der erste Absatz
+ *  direkt danach (isLeadCaptionText, oder kurz mit Bildquelle ohne Satzende wie „… Suarez/AP POOL“) und
+ *  danach höchstens eine Bildquelle mit Präfix (isSeparateCredit). Nie eine Liveblog-Uhrzeit oder ein
+ *  nur fetter Absatz. */
 function adoptLeadImage(bodyEl, lead) {
   while (bodyEl.firstElementChild && isFiller(bodyEl.firstElementChild)) bodyEl.firstElementChild.remove();
-  const p = paragraphAfter(lead);
-  if (p && isCreditCaption(p)) p.classList.add('art-caption');
+  if (figcaptionOf(lead)) return;
+  const first = paragraphAfter(lead);
+  if (!first || first.querySelector('img') || isTimeLine(first) || isBoldOnly(first)) return;
+  const next = first.nextElementSibling && first.nextElementSibling.tagName === 'P' ? first.nextElementSibling : null;
+  const text = squashSpace(first.textContent);
+  const ok = first.classList.contains('art-caption') || isLeadCaptionText(text, next ? next.textContent : '')
+    || (isCreditCaption(first) && !endsSentence(text) && !NOT_CAPTION_RE.test(text));
+  if (!ok) return;
+  first.classList.add('art-caption');
+  if (isCreditText(text)) return;   // nach der Bildquelle ist die Bildzeile zu Ende
+  if (next && !next.querySelector('img') && isSeparateCredit(next.textContent)) next.classList.add('art-caption');
 }
 
 /**
@@ -266,12 +380,65 @@ export function planHero(bodyEl, imageUrl, author) {
   const lead = bodyEl ? leadingImage(bodyEl) : null;
   if (lead && big(lead)) {
     adoptLeadImage(bodyEl, lead);
+    const leadSrc = lead.getAttribute('src');
+    const leadWidth = urlWidth(leadSrc);
+    // Ein kleines Bild (unter 300 px) nur gegen das Feed-Bild tauschen, wenn es ein Platzhalter ist (unter
+    // 120 px) oder dasselbe Bild zeigt; ein echtes kleines Bild (Porträt, Grafik) behält seine Bildzeile.
+    const swappable = (w) => w < INLINE_MIN_WIDTH || sameImage(leadSrc, imageUrl);
+    if (imageUrl && leadSrc !== imageUrl) {
+      if (leadWidth && leadWidth < HERO_MIN_WIDTH) {
+        // Platzhalter (taz: 14 px breites Vorschaubild /picture/<id>/14/): Feed-Bild an seine Stelle, die
+        // Bildzeile (figcaption) bleibt darunter. Lädt es nicht, zurück zum Original (dann greift dropIfTiny).
+        if (swappable(leadWidth)) useFeedImage(lead, imageUrl, leadSrc);
+      } else if (leadWidth && urlWidth(imageUrl) > leadWidth && sameImage(leadSrc, imageUrl)) {
+        // Dasselbe Bild als Feed-Bild laut URL breiter (heise: im Text /width/610/, im Feed 1200): das
+        // größere zeigen; lädt es nicht, wieder die Fassung aus dem Text (buildBody).
+        useFeedImage(lead, imageUrl, leadSrc);
+      } else if (!leadWidth) {
+        // Breite unbekannt: Ist das geladene Bild winzig (Platzhalter), das Feed-Bild nehmen statt es
+        // wegzuwerfen (dropIfTiny überspringt es dafür, siehe leadCheck).
+        lead.dataset.leadCheck = '1';
+        lead.addEventListener('load', () => {
+          delete lead.dataset.leadCheck;
+          const w = lead.naturalWidth;
+          if (!w || w >= HERO_MIN_WIDTH || !swappable(w)) {
+            dropIfTiny(lead, captionAfter(lead), author);   // übersprungene Prüfung nachholen
+            return;
+          }
+          useFeedImage(lead, imageUrl, leadSrc);
+          // Die Prüfung aus buildBody ist verbraucht: für das eingesetzte Bild (bzw. nach einem Ladefehler
+          // das Original) neu.
+          lead.addEventListener('load', () => dropIfTiny(lead, captionAfter(lead), author), { once: true });
+        }, { once: true });
+      }
+    }
     return null;
   }
   if (!imageUrl) return null;
   const copies = bodyEl ? [...bodyEl.querySelectorAll('img')].filter((i) => sameImage(i.getAttribute('src'), imageUrl)) : [];
-  const large = isLowResUrl(imageUrl) ? copies.find(big) : null;
-  return { src: large ? large.getAttribute('src') : imageUrl, copies };
+  return { src: heroSource(imageUrl, copies.filter(big).map((i) => i.getAttribute('src'))), copies };
+}
+
+/** Quelle des Titelbilds: das Feed-Bild, außer es ist nur eine Vorschau (dann die erste große Fassung
+ *  im Text) oder eine Fassung im Text ist laut URL breiter (Spiegel: Feed _w520, im Text _w960). */
+export function heroSource(imageUrl, bigCopies) {
+  if (!bigCopies.length) return imageUrl;
+  if (isLowResUrl(imageUrl)) return bigCopies[0];
+  const feedWidth = urlWidth(imageUrl);
+  if (!feedWidth) return imageUrl;
+  let best = imageUrl, bestWidth = feedWidth;
+  for (const src of bigCopies) {
+    const w = urlWidth(src);
+    if (w > bestWidth) { best = src; bestWidth = w; }
+  }
+  return best;
+}
+
+/** Bild im Text durch das Feed-Bild ersetzen; fallback: Adresse, auf die ein Ladefehler zurückfällt. */
+function useFeedImage(img, imageUrl, fallback) {
+  if (fallback) img.dataset.fallbackSrc = fallback;
+  img.removeAttribute('srcset');
+  img.setAttribute('src', imageUrl);
 }
 
 const heroOf = (img) => img.closest('.art')?.querySelector(':scope > .art-hero') || null;
@@ -285,7 +452,7 @@ const heroOf = (img) => img.closest('.art')?.querySelector(':scope > .art-hero')
  * @returns {boolean} entfernt?
  */
 export function dropIfTiny(img, caption, author, findHero = heroOf) {
-  if (img.dataset.heroCopy || !img.parentNode || !img.naturalWidth || img.naturalWidth >= INLINE_MIN_WIDTH
+  if (img.dataset.heroCopy || img.dataset.leadCheck || !img.parentNode || !img.naturalWidth || img.naturalWidth >= INLINE_MIN_WIDTH
       || isSmallImage(img, author)) return false;
   const credit = !!caption && (CAPTION_RE.test(caption.textContent || '') || isCreditCaption(caption));
   const hero = credit ? findHero(img) : null;
@@ -318,6 +485,8 @@ export function buildBody(html, title, author = '') {
   tpl.innerHTML = html;
   const frag = tpl.content;
   dropDuplicateImages(frag);
+  // Liveblog-Uhrzeiten als Zeitzeile setzen (Mono, gehört zum Eintrag darunter).
+  for (const p of frag.querySelectorAll('p')) if (isTimeLine(p)) p.classList.add('art-time');
   for (const a of frag.querySelectorAll('a')) {
     a.target = '_blank';
     a.rel = 'noopener noreferrer';
@@ -333,10 +502,18 @@ export function buildBody(html, title, author = '') {
     img.loading = 'lazy';
     img.decoding = 'async';
     img.referrerPolicy = 'no-referrer';
-    img.addEventListener('error', () => {
+    const onError = () => {
+      // Titelbild aus dem größeren Feed-Bild (planHero) lädt nicht: auf die Fassung im Text zurück.
+      if (img.dataset.fallbackSrc) {
+        img.src = img.dataset.fallbackSrc;
+        delete img.dataset.fallbackSrc;
+        return;
+      }
+      img.removeEventListener('error', onError);
       if (caption) caption.classList.add('art-caption');
       img.remove();
-    }, { once: true });
+    };
+    img.addEventListener('error', onError);
     dropWhenTiny(img, caption, author);
   }
   const bodyEl = h('div', { class: 'article-body t-article' });
@@ -349,6 +526,7 @@ export function articleView(id) {
   const el = h('article', { class: 'art-view', 'aria-busy': 'true' });
   let item = null;
   let alive = true;
+  const ctrl = new AbortController();   // destroy() bricht laufende Anfragen (Artikel, Nächster) ab
   let pollTimer = 0;
   let pollUntil = 0;        // Ende des Nachfragens (Zeitstempel), 0 = noch nicht begonnen
   let polling = false;      // fragt gerade nach, ob der Text da ist
@@ -406,7 +584,6 @@ export function articleView(id) {
     }
   }
   ensureRail();
-  const desktopQuery = window.matchMedia('(min-width: 900px)');
   const onWidth = () => { if (desktopQuery.matches) ensureRail(); };
   desktopQuery.addEventListener('change', onWidth);
 
@@ -529,6 +706,16 @@ export function articleView(id) {
         }
         if (!copies.length) return;
         hero.alt = copies[0].getAttribute('alt') || '';
+        // Bildzeile der Kopie wandert unter das Titelbild: <figcaption> (als Absatz, sie fiele sonst mit
+        // der <figure> weg), sonst der Bildtext-Absatz danach.
+        const figcap = figcaptionOf(copies[0]);
+        const figText = figcap ? (figcap.textContent || '').replace(/\s+/g, ' ').trim() : '';
+        if (figText) {
+          hero.after(h('p', { class: 'art-caption', text: figText }));
+          figcap.remove();   // auch eine lose <figcaption> neben dem Bild
+          copies.forEach(removeImage);
+          return;
+        }
         const caption = paragraphAfter(copies[0]);
         if (caption && (caption.classList.contains('art-caption') || isCreditCaption(caption))
             && !CAPTION_RE.test(caption.textContent || '')) {
@@ -590,7 +777,7 @@ export function articleView(id) {
     let next = null;
     if (state.nextCtx === 'local') next = nextFromList(item.id);
     else try {
-      const res = await api(`articles/${item.id}/next`, { params: nextParams() });
+      const res = await api(`articles/${item.id}/next`, { params: nextParams(), signal: ctrl.signal });
       next = res ? res.item : null;
     } catch {
       return;   // ohne „Nächster“ weiterlesen
@@ -617,7 +804,7 @@ export function articleView(id) {
 
   async function load(first = true) {
     try {
-      const data = await api(`articles/${id}`);
+      const data = await api(`articles/${id}`, { signal: ctrl.signal });
       if (!alive) return;
       const before = item || cachedItem(numId);
       item = data;
@@ -674,6 +861,7 @@ export function articleView(id) {
     toggle,
     destroy() {
       alive = false;
+      ctrl.abort();
       if (state.openArticle === item) state.openArticle = null;
       clearTimeout(pollTimer);
       cancelAnimationFrame(progressFrame);

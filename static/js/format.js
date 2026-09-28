@@ -235,21 +235,53 @@ function siteOf(host) {
   return labels.slice(-n).join('.');
 }
 
+// Hash-Endung im Dateinamen (heise: Daimler_E-lkw-86ffab972e33a670 und -a55055d4fc8ac0e5 sind zwei
+// Größen desselben Bilds): 16–32 Hex-Zeichen mit Ziffer und Buchstabe (kein reines Datum/keine Zahl).
+// Kürzere Endungen (WordPress screenshot-a1b2c3d4e5f6) unterscheiden eher verschiedene Bilder.
+const HASH_SUFFIX_RE = /-(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{16,32}$/i;
+// Bild-Proxy cloudimg.io: /<Bearbeitung…>/_<alias>_/<Pfad am Ursprung>, Alias = Host mit „-“ statt „.“
+// (heise: …cloudimg.io/width/610/q85…/_www-heise-de_/imgs/18/… zeigt www.heise.de/imgs/18/…).
+const CLOUDIMG_HOST_RE = /\.cloudimg\.io$/;
+const CLOUDIMG_ALIAS_RE = /^_[a-z0-9-]+_$/i;
+
+/** Pfadsegmente am Ursprung hinter einem Bild-Proxy (Host am Anfang), oder null (kein Proxy). */
+function unproxied(segs) {
+  if (!CLOUDIMG_HOST_RE.test(segs[0])) return null;
+  const at = segs.findIndex((seg, i) => i > 0 && CLOUDIMG_ALIAS_RE.test(seg));
+  return at === -1 ? null : [segs[at].slice(1, -1).replace(/-/g, '.').toLowerCase(), ...segs.slice(at + 1)];
+}
+
 /** Teile eines Schlüssels für den unscharfen Vergleich, oder null (kann nie unscharf gleich sein).
  *  bucket fasst zusammen, was gleich sein muss (Website, Segmentzahl, Dateiname, Query): Nur
  *  Schlüssel mit gleichem bucket müssen Segment für Segment verglichen werden. */
 function fuzzyParts(key) {
-  const [path, query = ''] = key.full.split('?');
-  const segs = path.split('/');
+  const [path, rawQuery = ''] = key.full.split('?');
+  let query = rawQuery;
+  let segs = path.split('/');
+  const origin = unproxied(segs);
+  if (origin) { segs = origin; query = ''; }   // Query des Proxys sind nur Bearbeitungsschritte
   if (segs.length < 2) return null;
-  const stem = segs.pop().replace(VARIANT_RE, '');
+  const named = segs.pop().replace(VARIANT_RE, '');
+  // Ohne Hash-Endung; bleibt davon zu wenig (pic-<hash>), zählt der ganze Name (dann nur gleiche Namen).
+  const stripped = named.replace(HASH_SUFFIX_RE, '');
+  const stem = stripped.length >= IMAGE_BASE_MIN ? stripped : named;
   if (stem.length < IMAGE_BASE_MIN) return null;
-  return { segs, stem, bucket: JSON.stringify([siteOf(segs[0]), segs.length, stem, query]) };   // [0] = Host
+  // named: Dateiname mit Hash-Endung; gleicht er erst ohne sie, muss der Pfad ganz gleich sein.
+  return { segs, stem, named, bucket: JSON.stringify([siteOf(segs[0]), segs.length, stem, query]) };   // [0] = Host
 }
 
 /** Unscharfer Vergleich zweier fuzzyParts mit gleichem bucket. */
 function fuzzyMatch(a, b) {
   const sa = a.segs, sb = b.segs;
+  // Gleich erst ohne Hash-Endung (heise -86ffab…/-a550…): Größen desselben Bilds liegen im selben
+  // Ordner (heise: Bild-ID als Ordnerkette imgs/18/4/9/…); in anderen Ordnern ist es ein anderes Bild
+  // gleichen Namens (Tesla-Model-Y, screenshot).
+  // Nur mit Bild-ID als Ordnerkette (mindestens drei Zahlen-Ordner wie heise imgs/18/4/9/…); flache
+  // CMS-Ordner (/uploads/article-image-<hash>.jpg) trennen verschiedene Bilder allein über den Hash.
+  if (a.named !== b.named) {
+    return a.named.length === b.named.length && sa.filter((seg) => NUM_SEG_RE.test(seg)).length >= 3
+      && sa.every((seg, i) => i === 0 || seg === sb[i]);
+  }
   let differs = false, onlyNumbers = true;
   for (let i = 1; i < sa.length; i++) {
     if (sa[i] === sb[i]) continue;
@@ -260,13 +292,23 @@ function fuzzyMatch(a, b) {
   // Nur Zahlen-Ordner verschieden (2025/10 statt 2026/09), Dateiname ohne Ziffern („screenshot“) und
   // kein gemeinsames Pfadsegment mit Ziffern (Bild-ID wie taz /picture/8763231/948/): eher ein
   // anderes Bild gleichen Namens als eine andere Größe.
-  if (differs && onlyNumbers && !/\d/.test(a.stem)) return sa.some((seg, i) => i > 0 && seg === sb[i] && /\d/.test(seg));
+  if (differs && onlyNumbers && !/\d/.test(a.named)) return sa.some((seg, i) => i > 0 && seg === sb[i] && /\d/.test(seg));
   return true;
 }
 
 function fuzzySame(a, b) {
   const pa = fuzzyParts(a), pb = fuzzyParts(b);
   return !!pa && !!pb && pa.bucket === pb.bucket && fuzzyMatch(pa, pb);
+}
+
+// Breite laut URL (Spiegel _w520/_w960, ?width=, ?w=, cloudimg /width/610/, taz /picture/<id>/<breite>/
+// mit Bild-ID ab 5 Ziffern, damit Datumsordner nicht zählen), 0 = unbekannt.
+const URL_WIDTH_RE = /_w(?!(?:19|20)\d\d(?![\d]))(\d{2,4})(?=[_.@-]|$)|[?&](?:width|w)=(\d{2,4})(?=&|$)|\/width\/(\d{2,4})(?=\/)|\/picture\/\d{5,}\/(\d{1,4})(?=\/)/;
+
+/** Bildbreite aus der URL (für „größere Fassung im Text statt kleinem Feed-Bild“), 0 = unbekannt. */
+export function urlWidth(url) {
+  const m = URL_WIDTH_RE.exec(String(url || '').toLowerCase());
+  return m ? Number(m[1] || m[2] || m[3] || m[4]) : 0;
 }
 
 /** true, wenn beide URLs dasselbe Bild (ggf. in anderer Größe) zeigen: gleicher Schlüssel oder unscharf gleich. */

@@ -148,12 +148,6 @@ html[data-text="l"] { --scale: 1.1; }
   line-height: calc(27px * var(--scale));
   font-weight: 400;
 }
-.t-article-h {
-  font-family: var(--font-sans);
-  font-size: calc(19px * var(--scale));
-  line-height: calc(25px * var(--scale));
-  font-weight: 600;
-}
 .t-teaser {
   font-family: var(--font-sans);
   font-size: calc(15px * var(--scale));

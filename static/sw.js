@@ -20,6 +20,7 @@ const SHELL = [
   '/js/saver.js',
   '/js/listwidth.js',
   '/js/sourceMatch.js',
+  '/js/version.js',
   '/js/ui/dom.js',
   '/js/ui/icons.js',
   '/js/ui/row.js',
@@ -31,6 +32,7 @@ const SHELL = [
   '/js/ui/sheet.js',
   '/js/ui/header.js',
   '/js/ui/empty.js',
+  '/js/ui/update.js',
   '/js/views/login.js',
   '/js/views/offline.js',
   '/js/views/list.js',
@@ -87,9 +89,42 @@ function fromCache(req) {
     .then((hit) => hit || (req.mode === 'navigate' ? caches.match('/index.html') : undefined));
 }
 
-// Netzwerk zuerst, Cache nur als Rückfall: offline und bei Serverfehlern (5xx, etwa 502/503 von
-// Caddy während eines Deploys). Gibt es keine Kopie, geht die Fehlerseite durch. Gecacht werden nur
-// erfolgreiche Antworten. /api/, /healthz, API-Doku und fremde Hosts gehen direkt durch.
+// Hängt das Netz (Funkloch, halbe Verbindung) bei einem Seitenaufruf, nach so vielen ms die
+// gecachte index.html zeigen; die Anfrage läuft weiter und legt ihre Antwort für das nächste Mal in
+// den Cache. Nur für Seitenaufrufe: JS/CSS bleiben reines „Netzwerk zuerst“, sonst könnten sich nach
+// einem Deploy alte (Cache) und neue Module (Netz) mischen („does not provide an export named …“).
+const NAV_TIMEOUT_MS = 6000;
+
+// Netzwerk zuerst, Cache als Rückfall: offline, bei Serverfehlern (5xx, etwa 502/503 von Caddy
+// während eines Deploys) und bei Seitenaufrufen, die länger als NAV_TIMEOUT_MS brauchen. Gibt es
+// keine Kopie, geht die Antwort des Netzes (oder die Fehlerseite) durch. Gecacht werden nur
+// erfolgreiche Antworten. Liefert die Antwort und das Ende von Netzanfrage und Cache-Eintrag (für
+// waitUntil: der Worker bleibt wach, bis die Kopie im Cache liegt, auch wenn schon die alte
+// Kopie ausgeliefert wurde).
+function networkFirst(req) {
+  let timer = 0;
+  let stored = Promise.resolve();
+  const net = fetch(req)
+    .then((res) => {
+      if (res.status >= 500) return fromCache(req).then((hit) => hit || res);
+      if (res.ok && res.type === 'basic') {
+        const copy = res.clone();
+        stored = caches.open(CACHE).then((cache) => cache.put(req, copy)).catch(() => {});
+      }
+      return res;
+    })
+    .catch(() => fromCache(req).then((hit) => hit || Response.error()))
+    .finally(() => clearTimeout(timer));
+  const settled = net.then(() => stored);
+  if (req.mode !== 'navigate') return { response: net, settled };
+  // Frist abgelaufen: Kopie aus dem Cache, ohne Kopie weiter auf das Netz warten.
+  const slow = new Promise((resolve) => { timer = setTimeout(resolve, NAV_TIMEOUT_MS); })
+    .then(() => fromCache(req))
+    .then((hit) => hit || net);
+  return { response: Promise.race([net, slow]), settled };
+}
+
+// /api/, /healthz, API-Doku und fremde Hosts gehen direkt durch.
 self.addEventListener('fetch', (event) => {
   const req = event.request;
   if (req.method !== 'GET') return;
@@ -97,16 +132,7 @@ self.addEventListener('fetch', (event) => {
   if (url.origin !== self.location.origin) return;
   const p = url.pathname;
   if (p.startsWith('/api/') || p === '/healthz' || p === '/openapi.json' || p === '/docs' || p.startsWith('/docs/')) return;
-  event.respondWith(
-    fetch(req)
-      .then((res) => {
-        if (res.status >= 500) return fromCache(req).then((hit) => hit || res);
-        if (res.ok && res.type === 'basic') {
-          const copy = res.clone();
-          caches.open(CACHE).then((cache) => cache.put(req, copy)).catch(() => {});
-        }
-        return res;
-      })
-      .catch(() => fromCache(req).then((hit) => hit || Response.error())),
-  );
+  const { response, settled } = networkFirst(req);
+  event.respondWith(response);
+  event.waitUntil(settled);
 });

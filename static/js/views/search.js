@@ -11,6 +11,7 @@ import { emptyState } from '../ui/empty.js';
 import { api } from '../api.js';
 import { loadSources, on, state } from '../store.js';
 import { matchSources, monograms } from '../sourceMatch.js';
+import { parseHash } from '../route.js';
 
 const RANGES = [
   { value: '1', label: '1 Tag' },
@@ -56,6 +57,28 @@ function paperRow(m) {
     h('span', { class: 'paper-go', 'aria-hidden': 'true' }, arrowRight(18)));
 }
 
+/** Suchparameter aus einer Route (#/suche?q=…&tage=…&s=…). */
+function routeParams(route) {
+  return {
+    q: (route.params.get('q') || '').trim(),
+    days: route.params.get('tage') || '',
+    source: route.params.get('s') || '',
+  };
+}
+
+/** Vergleichsschlüssel für Suchparameter. */
+const paramsKey = ({ q, days, source }) => JSON.stringify([q, days, source]);
+
+/** Adresse der Suche zu Anfrage, Zeitraum und Zeitung. */
+function searchHashFor(q, days, source) {
+  const p = new URLSearchParams();
+  if (q) p.set('q', q);
+  if (days) p.set('tage', days);
+  if (source) p.set('s', source);
+  const s = p.toString();
+  return `#/suche${s ? `?${s}` : ''}`;
+}
+
 /** Wörter der Anfrage für die Hervorhebung (ohne FTS-Operatoren). */
 export function queryWords(q) {
   return [...new Set(
@@ -65,10 +88,12 @@ export function queryWords(q) {
 }
 
 export function searchView(route) {
-  let q = (route.params.get('q') || '').trim();
-  let days = route.params.get('tage') || '';
-  let source = route.params.get('s') || '';
-  const fromSource = source; // Zeitung, aus deren Ansicht die Suche kam
+  let { q, days, source } = routeParams(route);
+  let fromSource = source; // Zeitung, aus deren Ansicht die Suche kam
+  // Parameter, die diese Ansicht zuletzt aus der Adresse übernommen oder in sie geschrieben hat. Bringt
+  // der Router genau diese zurück (Zurück aus einem Artikel, in dem weitergetippt wurde), ist das
+  // nur die Rückkehr zur Liste: dann bleibt die aktuelle Anfrage.
+  let urlKey = paramsKey({ q, days, source });
   state.nextCtx = 'local';
 
   let timer = 0;
@@ -111,15 +136,17 @@ export function searchView(route) {
       RANGES.map((r) => chip(r.label, { on: days === r.value, onClick: () => { days = r.value; update(); } })));
   }
 
+  // Adresse nur ersetzen, solange die Suche selbst in der Adresse steht. Am Desktop kann daneben ein
+  // Artikel offen sein (#/a/N): dessen Eintrag bleibt, gemerkt wird die Suche nur als Liste (Zurück
+  // aus dem Artikel, Taste /).
   function syncUrl() {
-    const p = new URLSearchParams();
-    if (q) p.set('q', q);
-    if (days) p.set('tage', days);
-    if (source) p.set('s', source);
-    const s = p.toString();
-    const tagged = !!(history.state && history.state.kiosk);
-    history.replaceState({ kiosk: tagged }, '', `#/suche${s ? `?${s}` : ''}`);
-    state.lastListHash = location.hash;
+    const hash = searchHashFor(q, days, source);
+    if (parseHash(location.hash).name === 'search') {
+      const tagged = !!(history.state && history.state.kiosk);
+      history.replaceState({ kiosk: tagged }, '', hash);
+      urlKey = paramsKey({ q, days, source });
+    }
+    state.lastListHash = hash;
   }
 
   // Zeitungsblock: nur mit „Alle Zeitungen“; die Zeitraum-Chips gelten nur für Artikel.
@@ -265,7 +292,33 @@ export function searchView(route) {
 
   return {
     el, layout: 'list', bar: false, title: 'Suche',
-    onShow() { if (!q) input.focus(); },
+    // Der Router nutzt die Ansicht wieder (gleicher Schlüssel), etwa bei Zurück auf eine ältere
+    // Anfrage: Parameter neu aus der Adresse lesen, bei Änderung neu suchen.
+    update(r) {
+      const next = routeParams(r);
+      const key = paramsKey(next);
+      if (key === paramsKey({ q, days, source })) { urlKey = key; return; }
+      if (key === urlKey) {
+        // Nur zurück zur Liste: Anfrage bleibt, die Adresse folgt ihr.
+        syncUrl();
+        return;
+      }
+      // Echte andere Adresse: übernehmen.
+      clearTimeout(timer);
+      ({ q, days, source } = next);
+      urlKey = key;
+      if (source) fromSource = source;
+      input.value = q;
+      buildChips();
+      run();
+    },
+    onShow() {
+      // Über Taste / oder die Fokus-Leiste gekommen (openSearch): Feld fokussieren, auch mit Anfrage.
+      const asked = state.focusSearch;
+      state.focusSearch = false;
+      if (!q || asked) input.focus();
+      if (asked) input.select();
+    },
     destroy() { alive = false; clearTimeout(timer); feed?.destroy(); offBar(); },
   };
 }

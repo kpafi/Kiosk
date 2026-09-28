@@ -334,21 +334,24 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
 - Die Textextraktion (trafilatura) läuft in eigenen Worker-Prozessen, einer je Auftrag (vom Forkserver
   geforkt, höchstens 2 gleichzeitig), und darf höchstens 90 s reine Laufzeit brauchen (die Wartezeit auf
   einen freien Platz zählt nicht mit). Hängt sie, wird nur dieser Prozess beendet; der Artikel gilt als
-  vorübergehend gescheitert (`Extraktion Zeitüberschreitung`, zählt als Versuch), andere Aufträge laufen
-  ungestört weiter. Jeder Prozess hat höchstens 384 MB Adressraum (mehr: `zu viel Speicher`, endgültig
-  `failed`) und eine CPU-Zeit-Grenze knapp über dem Zeitlimit; stirbt er ohne Ergebnis (Signal, z. B.
-  OOM-Killer), zählt das als Versuch nur für diesen Artikel.
-- Vor trafilatura prüft eine lineare Vorprüfung die Seite: höchstens 60 000 Tags außerhalb von
-  script/style/Kommentaren, 100 000 `<` insgesamt und 256 Attribute in einem Tag (Werte in einfachen
-  oder doppelten Anführungszeichen zählen nicht mit; was nicht sauber endet, zählt ab dort wieder) (echte Seiten, auch
-  große Live-Blogs von Guardian und FAZ: bis ca. 4 600 Tags). Darüber ist die Seite sofort endgültig
-  `failed` (`Seite abgelehnt: …`): trafilatura/lxml brauchen für solche Seiten quadratisch Zeit oder
-  Gigabytes Speicher.
+  vorübergehend gescheitert (`Extraktion: Zeitüberschreitung`, zählt als Versuch), andere Aufträge
+  laufen ungestört weiter. Jeder Prozess hat höchstens 320 MB Adressraum (mehr: `zu viel Speicher`,
+  endgültig `failed`; 3 × 320 MB plus App passen in `mem_limit: 1280m`) und eine CPU-Zeit-Grenze knapp
+  über dem Zeitlimit; stirbt er ohne Ergebnis (Signal, z. B. OOM-Killer), zählt das als Versuch nur für
+  diesen Artikel. Lässt sich kein Prozess starten (z. B. `pids_limit`), wird der Artikel ohne gezählten
+  Versuch neu eingeplant; andere Fehler der Worker-Mechanik zählen als vorübergehender Fehlschlag.
+- Vor trafilatura prüft eine lineare Vorprüfung (nach den Regeln des HTML5-Tokenizers: Kommentare,
+  script/style, Textelemente wie title/textarea, Attributwerte in einfachen oder doppelten
+  Anführungszeichen; was nicht sauber endet, zählt ab dort wieder) die Seite: höchstens 100 000 Tags,
+  250 000 `<` insgesamt und 256 Attribute in einem Tag. Echte Seiten haben bis ca. 36 000 Tags
+  (heise-Bestenliste, 2 MB); die ungünstigste bekannte Form kostet trafilatura bei 100 000 Tags ca. 50 s.
+  Darüber ist die Seite sofort endgültig `failed` (`Seite abgelehnt: …`): trafilatura/lxml brauchen für
+  solche Seiten quadratisch Zeit oder Gigabytes Speicher.
 - Leistungsschalter je Quelle: Nach 2 Zeitüberschreitungen bzw. Abstürzen einer Quelle in einem
   Sammellauf werden ihre übrigen Artikel in diesem Lauf nicht mehr versucht (kein Versuch gezählt,
   bleiben fällig); der nächste Lauf beginnt von vorn. Geprüft wird auch noch einmal, sobald ein Auftrag
-  seinen Worker-Platz hat. Öffnet jemand einen Artikel einer solchen Quelle (Abruf auf Anforderung),
-  gibt es trotzdem einen Versuch.
+  seinen Worker-Platz hat; übersprungene Artikel zählen nicht als extrahiert. Öffnet jemand einen
+  Artikel einer solchen Quelle (Abruf auf Anforderung), gibt es trotzdem einen Versuch.
 - Ungültige URLs (z. B. kaputte IPv6-Klammer, Port außerhalb des Bereichs, nicht unterstütztes Schema,
   auch in einer Umleitung) sind sofort endgültig `failed`.
 - Bereits gesehene Feed-Einträge (Quelle + GUID) stehen in `seen_guids` und werden nicht erneut angelegt,

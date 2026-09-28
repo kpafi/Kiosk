@@ -914,3 +914,11 @@ def test_caddy_csp_replaces_the_app_fallback():
     csp = BLOCK.split("header @app {")[1].split("}")[0]
     assert "Content-Security-Policy" in csp and "defer" in csp
     assert "interest-cohort" not in BLOCK
+
+
+def test_worker_memory_limits_fit_the_container():
+    import app.fetcher as f
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    limit_mb = int(re.search(r"mem_limit: (\d+)m", compose).group(1))
+    workers = (f.EXTRACT_WORKERS + f.FEED_PARSE_WORKERS) * f.JOB_MEMORY_LIMIT // 2**20
+    assert workers + 320 <= limit_mb     # Reserve für die App selbst

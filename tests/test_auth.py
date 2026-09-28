@@ -340,3 +340,43 @@ def test_needs_rehash():
     assert not auth_mod.needs_rehash(hash_password("richtig-langes-passwort"))
     assert auth_mod.needs_rehash("scrypt$16384$8$1$AAAAAAAAAAAAAAAAAAAAAA==$" + "A" * 43 + "=")
     assert auth_mod.needs_rehash("kaputt")
+
+
+def test_legacy_hash_check_costs_as_much_as_a_current_one(monkeypatch):
+    """Prüfung eines alten Hashes (p=1) plus Ausgleich = so viel scrypt-Arbeit wie p=5 (wie der
+    Blindhash für unbekannte Namen), auch wenn die Mindestdauer des Logins überschritten wird."""
+    import base64
+    import hashlib
+    salt = b"s" * 16
+    legacy = "scrypt$16384$8$1$" + base64.b64encode(salt).decode() + "$" + base64.b64encode(
+        hashlib.scrypt(b"pw-alt-und-lang", salt=salt, n=2**14, r=8, p=1, dklen=32)).decode()
+    current = hash_password("pw-neu-und-lang")
+    work = []
+    real = hashlib.scrypt
+
+    def counting(password, *, salt, n, r, p, dklen, maxmem=0):
+        work.append(n * r * p)
+        return real(password, salt=salt, n=n, r=r, p=p, dklen=dklen, maxmem=maxmem)
+
+    monkeypatch.setattr(auth_mod.hashlib, "scrypt", counting)
+    for stored, pw in ((legacy, "pw-alt-und-lang"), (legacy, "falsch"), (current, "falsch"), ("kaputt", "x")):
+        work.clear()
+        auth_mod.verify_password_evenly(pw, stored)
+        assert sum(work) == 2**14 * 8 * auth_mod.SCRYPT_P, stored[:20]
+    assert auth_mod.verify_password_evenly("pw-alt-und-lang", legacy)
+    work.clear()
+    auth_mod.burn_time("egal")
+    assert sum(work) == 2**14 * 8 * auth_mod.SCRYPT_P
+
+
+def test_device_cookie_is_checked_fully_for_unknown_names(settings, monkeypatch):
+    a = Auth(settings)
+    token = a.issue_device("anna", "h")
+    calls = []
+    real = a._device_signer.unsign
+    monkeypatch.setattr(a._device_signer, "unsign", lambda *args, **kw: calls.append(1) or real(*args, **kw))
+    cookies = {auth_mod.SECURE_DEVICE_COOKIE_NAME: token}
+    assert a.device_id(cookies, "gibtsnicht", None) is None
+    assert a.device_id(cookies, None, None) is None
+    assert a.device_id(cookies, "anna", "h")
+    assert len(calls) == 3

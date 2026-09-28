@@ -787,8 +787,7 @@ def test_list_over_many_sources_runs_in_time_order_without_sorting(db):
     db.retention_days = 90
     sources = [f"s{i}" for i in range(28)]
     db.upsert_articles([make_row(sources[i % 28], i, ago(minutes=i)) for i in range(300)])
-    for kw in ({"unread": True}, {"unread": False}, {"unread": True, "terms": ["Titel"]},
-               {"unread": True, "before": (ago(minutes=100), 10**9)}):
+    for kw in ({"unread": True}, {"unread": False}, {"unread": True, "before": (ago(minutes=100), 10**9)}):
         params = dict(sources=sources, query=None, starred=False, free_only=True, before=None, limit=50)
         params.update(kw)
         sql, args = db.list_articles_sql(UID, **params)
@@ -799,7 +798,7 @@ def test_list_over_many_sources_runs_in_time_order_without_sorting(db):
     assert [r["id"] for r in rows] == [r["id"] for r in db.q(
         "SELECT id FROM articles WHERE source_id IN ('s0','s1','s2') ORDER BY published_at DESC, id DESC")]
     # Eine Quelle, Suche und Gemerkt behalten ihren eigenen Plan.
-    for kw in ({"sources": ["s1"]}, {"query": "Titel"}, {"starred": True}, {"later": True}):
+    for kw in ({"sources": ["s1"]}, {"query": "Titel"}, {"starred": True}, {"later": True}, {"terms": ["Titel"]}):
         params = dict(sources=sources, query=None, unread=False, starred=False, free_only=False, before=None,
                       limit=50)
         params.update(kw)
@@ -889,3 +888,32 @@ def test_mark_all_read_with_terms_queries_fts_once(db, monkeypatch):
     assert sum("MATCH" in s for s in stmts) == 1
     read = {r["title"] for r in db.q("SELECT a.title FROM user_articles ua JOIN articles a ON a.id = ua.article_id")}
     assert read == {f"Wetter {i}" for i in range(1, 10, 2)}
+
+
+def test_profile_terms_use_time_index_only_when_frequent(db, monkeypatch):
+    """Seltene Profil-Begriffe: der Volltextindex liefert die wenigen Kandidaten (kein Zeitindex);
+    häufige: Zeitreihenfolge über idx_articles_list, ohne alle Treffer zu sortieren."""
+    sources = [f"s{i}" for i in range(5)]
+    db.upsert_articles([make_row(sources[i % 5], i, ago(minutes=i), title=f"Titel {i}"
+                                 + (" Selten" if i < 3 else "")) for i in range(60)])
+    params = dict(sources=sources, query=None, unread=True, starred=False, free_only=True, before=None, limit=50)
+    sql, _ = db.list_articles_sql(UID, **params, terms=["Selten"])
+    assert "idx_articles_list" not in sql
+    monkeypatch.setattr(db_mod, "TERM_HITS_FOR_INDEX", 10)
+    sql, args = db.list_articles_sql(UID, **params, terms=["Titel"])
+    assert "idx_articles_list" in sql and "USE TEMP B-TREE FOR ORDER BY" not in _plan(db, sql, args)
+    assert len(list_all(db, sources=sources, unread=True, free_only=True, terms=["Selten"])) == 3
+
+
+def test_old_published_index_is_dropped(tmp_path):
+    import sqlite3
+    path = tmp_path / "alt.db"
+    Database(path).close()
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE INDEX idx_articles_published ON articles (published_at DESC, id DESC)")
+    conn.commit()
+    conn.close()
+    d = Database(path)
+    names = {r["name"] for r in d.q("SELECT name FROM sqlite_master WHERE type='index'")}
+    d.close()
+    assert "idx_articles_published" not in names and "idx_articles_list" in names

@@ -122,7 +122,7 @@ def test_login_brake_holds_under_parallel_requests(app_env, monkeypatch):
     import app.main as main_mod
     calls, running, peak = [], [0], [0]
     lock = threading.Lock()
-    real_verify, real_burn = main_mod.verify_password, main_mod.burn_time
+    real_verify, real_burn = main_mod.verify_password_evenly, main_mod.burn_time
 
     def counted(fn):
         def wrapper(*args):
@@ -138,7 +138,7 @@ def test_login_brake_holds_under_parallel_requests(app_env, monkeypatch):
                     running[0] -= 1
         return wrapper
 
-    monkeypatch.setattr(main_mod, "verify_password", counted(real_verify))
+    monkeypatch.setattr(main_mod, "verify_password_evenly", counted(real_verify))
     monkeypatch.setattr(main_mod, "burn_time", counted(real_burn))
 
     async def run():

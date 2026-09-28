@@ -22,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .auth import (COOKIE_NAMES, DEVICE_MAX_AGE, INVALID_NAME_KEY, LOGIN_ERROR, Auth, burn_time, hash_password,
-                   ip_key, needs_rehash, normalize_username, verify_password)
+                   ip_key, needs_rehash, normalize_username, verify_password, verify_password_evenly)
 from .config import docs_enabled, load_settings
 from .db import Database, QueryTimeout, _iso, utcnow
 from .extract import strip_reading_times
@@ -360,7 +360,7 @@ async def _check_login(user: dict[str, Any] | None, password: str) -> dict[str, 
             await asyncio.to_thread(burn_time, password)
             ok = False
         else:
-            ok = await asyncio.to_thread(verify_password, password, user["password_hash"])
+            ok = await asyncio.to_thread(verify_password_evenly, password, user["password_hash"])
         rehash = None
         if ok and not user["disabled"] and needs_rehash(user["password_hash"]):
             # Hash mit älteren scrypt-Parametern (z. B. p=1): mit den aktuellen neu anlegen. Die

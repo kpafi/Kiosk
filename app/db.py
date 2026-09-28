@@ -57,7 +57,9 @@ CREATE TABLE IF NOT EXISTS articles (
     story_id        INTEGER,                        -- Geschichte (v8): kleinste Artikel-ID der Gruppe, NULL = keine
     UNIQUE (source_id, guid)
 );
-CREATE INDEX IF NOT EXISTS idx_articles_published ON articles (published_at DESC, id DESC);
+-- Ersetzt durch idx_articles_list (unten, gleicher Anfang, deckt mehr ab): Der alte Index kostete nur
+-- Schreibzeit und Platz.
+DROP INDEX IF EXISTS idx_articles_published;
 CREATE INDEX IF NOT EXISTS idx_articles_status ON articles (text_status);
 -- Je Quelle nach Zeit, mit paywalled: deckt die Zähler je Quelle (source_counts,
 -- unread_free_by_source) ganz ab. Ohne paywalled im Index liest SQLite jede Artikelzeile samt
@@ -239,8 +241,10 @@ COUNT_INDEX = "INDEXED BY idx_articles_source_counts"
 # Zeitreihenfolge über idx_articles_list endet die Abfrage nach LIMIT passenden Zeilen (unter 1 ms);
 # selbst wenn fast nichts passt (fast alles gelesen, leere Quellen), prüft sie nur Indexeinträge
 # (ca. 45 ms statt 125 ms). Nicht für eine einzelne Quelle (ihr Index liefert schon die Reihenfolge),
-# für Suche (bm25) und für Gemerkt/Später (dort sind die wenigen Zeilen aus user_articles der beste Start).
+# für Suche (bm25), Profil-Begriffe (Volltextindex) und für Gemerkt/Später (dort sind die wenigen
+# Zeilen aus user_articles der beste Start).
 LIST_INDEX = "INDEXED BY idx_articles_list"
+TERM_HITS_FOR_INDEX = 1000  # ab so vielen Treffern der Profil-Begriffe lohnt der Zeitindex (siehe list_articles_sql)
 
 ARTICLE_LIST_COLS = ", ".join(
     f"a.{c}" for c in (
@@ -424,7 +428,7 @@ class Database:
         for stmt in _statements(USER_TABLES):
             c.execute(stmt)
         # Index über die alte Spalte read; ein Ersatz über paywalled ist zu unselektiv (der Planer
-        # sortierte dann, statt idx_articles_published zu nutzen).
+        # sortierte dann, statt den Index nach Zeit zu nutzen).
         c.execute("DROP INDEX IF EXISTS idx_articles_read_paywalled_source")
 
         has_state = c.execute(
@@ -788,7 +792,11 @@ class Database:
         join = ""
         order = "a.published_at DESC, a.id DESC"
         index = ""
-        if not query and not starred and not later and (sources is None or len(sources) > 1):
+        # Mit Profil-Begriffen nur, wenn sie häufig sind: Seltene liefert der Volltextindex schneller
+        # (0,4 ms statt 30 ms über den ganzen Zeitindex), häufige nicht (110 ms statt 30 ms, alle Treffer
+        # lesen und sortieren). Die Zählung ist gedeckelt und kostet wenige Millisekunden.
+        if not query and not starred and not later and (sources is None or len(sources) > 1) \
+                and (not terms or self._many_term_hits(terms)):
             index = LIST_INDEX
         if query:
             join = "JOIN articles_fts f ON f.rowid = a.id"
@@ -808,6 +816,11 @@ class Database:
             sql += " OFFSET ?"
             params.append(offset)
         return sql, tuple(params)
+
+    def _many_term_hits(self, terms: list[str]) -> bool:
+        """True, wenn die Profil-Begriffe mindestens TERM_HITS_FOR_INDEX Artikel treffen."""
+        return self.one("SELECT COUNT(*) AS n FROM (SELECT rowid FROM articles_fts WHERE articles_fts MATCH ? "
+                        "LIMIT ?)", (_terms_query(terms), TERM_HITS_FOR_INDEX))["n"] >= TERM_HITS_FOR_INDEX
 
     def count_articles(self, user_id: int, *, cap: int, sources: list[str] | None = None, query: str | None = None,
                        unread: bool = False, starred: bool = False, free_only: bool = False,

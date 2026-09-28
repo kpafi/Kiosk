@@ -129,6 +129,25 @@ def burn_time(password: str) -> None:
     verify_password(password, _DUMMY_HASH)
 
 
+def verify_password_evenly(password: str, stored: str) -> bool:
+    """verify_password, danach so viel zusätzliche scrypt-Arbeit, dass die Prüfung so viel kostet wie
+    mit den aktuellen Parametern (wie burn_time für unbekannte Namen). Sonst verriete die Laufzeit
+    einen älteren Hash (p=1) und damit, dass es den Namen gibt, auch wenn die Mindestdauer des Logins
+    (main.LOGIN_MIN_SECONDS) bei knapper CPU überschritten wird."""
+    ok = verify_password(password, stored)
+    try:
+        _scheme, n, r, p, _salt, _hash = stored.split("$")
+        spent = int(n) * int(r) * int(p)
+    except ValueError:
+        spent = 0
+    target = SCRYPT_N * SCRYPT_R * SCRYPT_P
+    if spent < target:
+        extra_p = -(-(target - spent) // (SCRYPT_N * SCRYPT_R))       # aufgerundet
+        hashlib.scrypt(password.encode(), salt=b"kiosk-ausgleich!", n=SCRYPT_N, r=SCRYPT_R,
+                       p=min(extra_p, SCRYPT_P), dklen=SCRYPT_DKLEN)
+    return ok
+
+
 class _Limiter:
     """Zählt Fehlversuche je Schlüssel in einem gleitenden Zeitfenster, begrenzt auf max_keys Schlüssel.
 
@@ -261,15 +280,20 @@ class Auth:
         ist; sonst None (auch für unbekannte Namen). Ein neu gesetztes Passwort (python -m app.users
         passwd) nimmt allen Geräten die Ausnahme von der Bremse."""
         token = cookies.get(self.device_cookie_name)
-        if not token or not username or not password_hash:
+        if not token:
             return None
+        # Auch für unbekannte Namen ganz geprüft (Signatur, Vergleich mit einem Blind-Fingerabdruck):
+        # gleiche Arbeit, ob es den Namen gibt oder nicht.
         try:
             payload = self._device_signer.unsign(token.encode(), max_age=DEVICE_MAX_AGE).decode()
         except (BadSignature, SignatureExpired, UnicodeDecodeError):
             return None
         m = _DEVICE_RE.fullmatch(payload)
-        if not m or not hmac.compare_digest(m[1], username) \
-                or not hmac.compare_digest(m[2], self.fingerprint(password_hash)):
+        if not m:
+            return None
+        same_name = hmac.compare_digest(m[1], username or "")
+        same_hash = hmac.compare_digest(m[2], self.fingerprint(password_hash or _DUMMY_HASH))
+        if not (same_name and same_hash and username and password_hash):
             return None
         return m[3]
 

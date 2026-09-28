@@ -294,7 +294,8 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
   speichert der Abruf kein ETag/Last-Modified, damit kein 304 den Rest zurückhält). feedparser läuft in
   einem eigenen Worker-Prozess (höchstens 30 s, ein Platz nur fürs Feed-Parsing). Vorher prüft eine
   lineare Vorprüfung den Feed: höchstens 100 000 Tags, 256 Attribute in einem Tag und 200 verschiedene
-  Namensraum-Präfixe (feedparser wird darüber quadratisch langsam), sonst `Feed abgelehnt: …`.
+  Namensraum-Präfixe (feedparser wird darüber quadratisch langsam), sonst `Feed abgelehnt: …`; ebenso
+  Feeds in UTF-16/32 oder EBCDIC (die Vorprüfung sähe dort kein Markup).
   ETag und Last-Modified werden nur gespeichert und gesendet, wenn sie aus druckbarem ASCII bestehen;
   ein gescheiterter Abruf löscht beide (der nächste Abruf geht ohne Bedingung). Angefordert wird unkomprimiert
   (`Accept-Encoding: identity`); schickt ein Server trotzdem gzip/deflate (auch rohes deflate), wird
@@ -340,9 +341,12 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
   über dem Zeitlimit; stirbt er ohne Ergebnis (Signal, z. B. OOM-Killer), zählt das als Versuch nur für
   diesen Artikel. Lässt sich kein Prozess starten (z. B. `pids_limit`), wird der Artikel ohne gezählten
   Versuch neu eingeplant; andere Fehler der Worker-Mechanik zählen als vorübergehender Fehlschlag.
-- Vor trafilatura prüft eine lineare Vorprüfung (nach den Regeln des HTML5-Tokenizers: Kommentare,
-  script/style, Textelemente wie title/textarea, Attributwerte in einfachen oder doppelten
-  Anführungszeichen; was nicht sauber endet, zählt ab dort wieder) die Seite: höchstens 100 000 Tags,
+- Vor trafilatura wird die Seite dekodiert wie von trafilatura (Kodierung erkannt, auch UTF-16/32) und
+  als UTF-8 geprüft und weitergegeben: Vorprüfung und Parser sehen dieselben Zeichen. Komprimierte
+  Bytes ohne Content-Encoding (trafilatura entpackte sie ohne Grenze) sind sofort endgültig `failed`.
+  Die lineare Vorprüfung (nach den Regeln des HTML5-Tokenizers: Kommentare, falsche Kommentare wie
+  `<!x …>`, script/style, Textelemente wie title/textarea, Attributwerte in einfachen oder doppelten
+  Anführungszeichen; was nicht sauber endet, zählt ab dort wieder) prüft dann: höchstens 100 000 Tags,
   250 000 `<` insgesamt und 256 Attribute in einem Tag. Echte Seiten haben bis ca. 36 000 Tags
   (heise-Bestenliste, 2 MB); die ungünstigste bekannte Form kostet trafilatura bei 100 000 Tags ca. 50 s.
   Darüber ist die Seite sofort endgültig `failed` (`Seite abgelehnt: …`): trafilatura/lxml brauchen für

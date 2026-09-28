@@ -5,6 +5,7 @@ import asyncio
 import socket
 import threading
 import time
+import zlib
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1195,7 +1196,8 @@ def _page_problem(raw: bytes):
 
 def _feed_problem(raw: bytes):
     return fetcher_mod.markup_problem(raw, max_tags=fetcher_mod.MAX_FEED_TAGS, max_attrs=fetcher_mod.MAX_TAG_ATTRS,
-                                      max_lt=fetcher_mod.MAX_FEED_LT, max_prefixes=fetcher_mod.MAX_FEED_PREFIXES)
+                                      max_lt=fetcher_mod.MAX_FEED_LT, max_prefixes=fetcher_mod.MAX_FEED_PREFIXES,
+                                      xml=True)
 
 
 ATTR_BOMB = b"<div " + b" ".join(b'a%d="1"' % i for i in range(100_000)) + b"><p>x</p></div>"
@@ -1294,12 +1296,13 @@ async def test_worker_base_exception_is_not_reraised_in_the_loop(db, settings, m
         200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
     monkeypatch.setattr(fetcher_mod, "extract", _exiting_extract)
     try:
-        with pytest.raises(fetcher_mod.JobInfraError, match="SystemExit"):
+        with pytest.raises(fetcher_mod.JobInfraError, match="unerwartet beendet"):
             await f._run_extract(ARTICLE_HTML.encode(), f"{PUBLIC}/x")
         await asyncio.wait_for(f.extract_article(aid, f"{PUBLIC}/artikel"), timeout=30)
         row = db.get_article(aid)
         # Fehler der Worker-Mechanik: vorübergehend (Versuch zählt), nicht endgültig "failed".
-        assert "SystemExit" in row["text_error"] and row["text_status"] == "pending" and row["attempts"] == 1
+        assert row["text_error"] == "Extraktion: Worker-Prozess unerwartet beendet"
+        assert row["text_status"] == "pending" and row["attempts"] == 1
     finally:
         await f.close()
 
@@ -1385,7 +1388,7 @@ async def test_worker_start_failure_is_requeued_without_attempt(db, settings, mo
         await f.close()
     row = db.get_article(aid)
     assert row["text_status"] == "pending" and row["attempts"] == 0 and row["next_attempt_at"] is None
-    assert "ließ sich nicht starten" in row["text_error"]
+    assert row["text_error"] == "Extraktion: Worker-Prozess ließ sich nicht starten"   # ohne englische Einzelheit
 
 
 async def test_skipped_articles_do_not_count_as_extracted(db, settings, monkeypatch):
@@ -1406,3 +1409,123 @@ async def test_skipped_articles_do_not_count_as_extracted(db, settings, monkeypa
         assert all(r["attempts"] == 0 and r["text_status"] == "pending" for r in db.q("SELECT * FROM articles"))
     finally:
         await f.close()
+
+
+@pytest.mark.parametrize("before, after", [
+    (b'<title><p a="</title>', b'"'),                       # Inhalt eines Textelements: kein Tag
+    (b'<textarea><p a="</textarea>', b'"'),
+    (b'<iframe><p a="</iframe>', b'"'),
+    (b'<noembed><p a="</noembed>', b'"'),
+    (b'<xmp><p a="</xmp>', b'"'),
+    (b"<!x <!-- >", b"-->"),                               # falscher Kommentar endet am ">"
+    (b"</ <script>", b"</script>"),
+    (b"<?x <script>", b"</script>"),
+    (b"<![CDATA[<style>]]>", b"</style>"),                   # in HTML ein falscher Kommentar
+    (b"<!DOCTYPE <!-- >", b"-->"),
+], ids=["title", "textarea", "iframe", "noembed", "xmp", "bogus-bang", "bogus-slash", "bogus-pi",
+        "cdata-in-html", "doctype"])
+def test_markup_guard_bogus_regions_open_nothing(before, after):
+    raw = b"<html><body>" + before + BOMB_20K + after + b"</body></html>"
+    assert "Attribute" in (_page_problem(raw) or ""), before
+
+
+def test_markup_guard_counts_markup_inside_text_regions():
+    raw = b"<html><body><title>" + b"<p>" * 110_000 + b"</title></body></html>"
+    assert "Tags" in (_page_problem(raw) or "")
+    raw = b"<html><body><!x " + b"<p " * 110_000 + b"></body></html>"
+    assert "Tags" in (_page_problem(raw) or "")
+
+
+def test_feed_mode_keeps_cdata_and_title_as_markup():
+    """In Feeds ist title ein gewöhnliches Element und CDATA-Inhalt HTML, das feedparser auswertet."""
+    feed = (b"<rss><channel><item><title>x</title><description><![CDATA[<div "
+            + b" ".join(b"a%d" % i for i in range(20_000)) + b">]]></description></item></channel></rss>")
+    assert "Attribute" in (_feed_problem(feed) or "")
+
+
+def _no_extract(page, url):
+    raise AssertionError("extract darf nicht laufen")
+
+
+@pytest.mark.parametrize("packed", [
+    lambda b: __import__("gzip").compress(b),
+    lambda b: zlib.compress(b),
+], ids=["gzip", "zlib"])
+def test_compressed_page_without_content_encoding_is_rejected(packed):
+    """trafilatura entpackt solche Bytes ohne Header-Prüfung und ohne Grenze (4,7 KB gzip ergaben
+    400 000 Absätze); die Vorprüfung sähe nur die komprimierten Bytes."""
+    raw = packed(b"<html><body>" + b"<p>abc " * 400_000 + b"</body></html>")
+    assert len(raw) < 100_000
+    with pytest.raises(fetcher_mod.MarkupRejected, match="komprimierter Inhalt"):
+        fetcher_mod._extract_job(_no_extract, raw, "https://x/a")
+
+
+@pytest.mark.parametrize("codec", ["utf-16", "utf-32", "utf-16-be"])
+def test_pre_check_sees_the_decoded_page(codec):
+    page = ("<html><body>" + "<div " + " ".join(f"a{i}" for i in range(20_000)) + "></div></body></html>")
+    with pytest.raises(fetcher_mod.MarkupRejected, match="Attribute"):
+        fetcher_mod._extract_job(_no_extract, page.encode(codec) if codec != "utf-16-be"
+                                 else b"\xfe\xff" + page.encode("utf-16-be"), "https://x/a")
+
+
+def test_extract_gets_exactly_the_checked_utf8():
+    seen = []
+
+    def spy(page, url):
+        seen.append(page)
+        return "ok"
+
+    page = "<html><head><meta charset='utf-16'></head><body><p>Grüße aus Köln</p></body></html>"
+    for raw in (page.encode("utf-8"), page.encode("utf-16"), page.encode("latin-1")):
+        seen.clear()
+        assert fetcher_mod._extract_job(spy, raw, "https://x/a") == "ok"
+        assert seen == [fetcher_mod.page_as_utf8(raw)]
+        seen[0].decode("utf-8")                                # gültiges UTF-8, wie trafilatura es liest
+    assert "Grüße aus Köln".encode() in fetcher_mod.page_as_utf8(page.encode("utf-16"))
+    utf8 = page.encode("utf-8")
+    assert fetcher_mod.page_as_utf8(utf8) == utf8          # UTF-8 bleibt Byte für Byte gleich
+
+
+@pytest.mark.parametrize("raw", [
+    '<?xml version="1.0"?><rss><channel></channel></rss>'.encode("utf-16"),
+    '<?xml version="1.0"?><rss><channel></channel></rss>'.encode("utf-16-le"),
+    '<?xml version="1.0"?><rss><channel></channel></rss>'.encode("utf-32"),
+    '<?xml version="1.0"?><rss><channel></channel></rss>'.encode("cp037"),
+], ids=["utf16-bom", "utf16-ohne-bom", "utf32", "ebcdic"])
+def test_feeds_in_non_ascii_compatible_encodings_are_rejected(raw):
+    with pytest.raises(fetcher_mod.MarkupRejected, match="Kodierung nicht unterstützt"):
+        fetcher_mod._feed_job(lambda *a: None, SRC, raw)
+
+
+def test_ascii_compatible_feeds_pass_the_encoding_check():
+    for raw in ('<?xml version="1.0" encoding="iso-8859-1"?><rss/>'.encode("latin-1"),
+                "﻿<rss/>".encode("utf-8"), b"  <rss/>"):
+        assert fetcher_mod.feed_encoding_problem(raw) is None
+
+
+@pytest.mark.parametrize("exc, text", [
+    (httpx.ReadTimeout(""), "Zeitüberschreitung beim Abruf"),
+    (TimeoutError(), "Zeitüberschreitung beim Abruf"),
+    (httpx.ConnectError("[Errno 111] Connection refused"), "Verbindung fehlgeschlagen"),
+    (httpx.RemoteProtocolError("peer closed connection"), "Netzwerkfehler"),
+    (fetcher_mod.ResolveError("Name nicht auflösbar: x.example"), "Name nicht auflösbar: x.example"),
+    (fetcher_mod.TooLarge("Antwort zu groß (über 5 MB)"), "Antwort zu groß (über 5 MB)"),
+    (ValueError("kaputt"), "ValueError: kaputt"),
+])
+def test_error_texts_are_german(exc, text):
+    assert fetcher_mod.error_text(exc) == text
+
+
+async def test_timeouts_and_sizes_are_stored_readably(db, settings):
+    aid = _article(db)
+
+    def slow(request):
+        raise httpx.ReadTimeout("", request=request)
+
+    f = make_fetcher(db, settings, slow)
+    try:
+        await f.extract_article(aid, f"{PUBLIC}/artikel")
+    finally:
+        await f.close()
+    assert db.get_article(aid)["text_error"] == "Zeitüberschreitung beim Abruf"
+    assert fetcher_mod._mb(123_400_000) == "117,7 MB" and fetcher_mod._mb(5 * 2**20) == "5 MB"

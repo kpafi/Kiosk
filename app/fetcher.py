@@ -14,6 +14,7 @@ import pickle
 import re
 import resource
 import signal
+import sys
 import time
 import zlib
 from collections import defaultdict
@@ -25,6 +26,7 @@ from urllib.parse import urljoin, urlparse
 
 import feedparser
 import httpx
+import trafilatura.utils as trafilatura_utils
 
 from .config import Settings
 from .db import Database, QueryTimeout, _iso, request_time_limit, utcnow
@@ -93,6 +95,9 @@ MAX_PAGE_TAGS = 100_000     # Tags außerhalb von script/style
 # "<" insgesamt, auch in Skripten und Kommentaren: begrenzt, was dort (ob zu Recht oder nicht)
 # übersprungen wird, und die Arbeit der Prüfung selbst. Echte Seiten bis ca. 36 000.
 MAX_PAGE_LT = 250_000
+# Größe der Seite nach dem Dekodieren (UTF-8): Einbyte-Kodierungen mit vielen Umlauten wachsen bis auf das
+# Doppelte, mehr kann aus ARTICLE_MAX_BYTES nicht werden (komprimierte Bytes werden abgelehnt).
+DECODED_MAX_BYTES = 2 * 5 * 1024 * 1024
 MAX_TAG_ATTRS = 256         # Attribute (Stücke außerhalb von Attributwerten in Anführungszeichen) in einem Tag
 MAX_FEED_TAGS = 100_000
 MAX_FEED_LT = 250_000       # "<" insgesamt im Feed (echte Feeds: bis ca. 15 500, FOCUS)
@@ -186,7 +191,8 @@ class JobInfraError(Exception):
 
 class JobStartFailed(JobInfraError):
     """Der Worker-Prozess ließ sich nicht starten (fork: EAGAIN an pids_limit, Forkserver weg). Kein
-    Fehler des Artikels: wird ohne Zählung eines Versuchs erneut eingeplant."""
+    Fehler des Artikels: wird ohne Zählung eines Versuchs erneut eingeplant (zählt aber für das Budget
+    des Sammellaufs, siehe _extract_once)."""
 
 
 class JobSkipped(Exception):
@@ -207,22 +213,32 @@ GERMAN_ERRORS = (ExtractTimeout, JobCrashed, JobOutOfMemory, JobInfraError, Mark
 
 
 def error_text(e: BaseException) -> str:
-    """Fehlermeldung zum Speichern: eigene (deutsche) Meldungen unverändert, fremde mit Typname."""
-    return str(e) if isinstance(e, GERMAN_ERRORS) else f"{type(e).__name__}: {e}"
+    """Fehlermeldung zum Speichern (erscheint in der Oberfläche): eigene deutsche Meldungen unverändert,
+    die häufigen Netzwerkfehler von httpx auf Deutsch (deren Text ist oft leer, z. B. ReadTimeout),
+    alles andere mit Typname. Einzelheiten stehen im Protokoll."""
+    if isinstance(e, GERMAN_ERRORS):
+        return str(e)
+    if isinstance(e, (httpx.TimeoutException, TimeoutError)):
+        return "Zeitüberschreitung beim Abruf"
+    if isinstance(e, httpx.ConnectError):
+        return "Verbindung fehlgeschlagen"
+    if isinstance(e, httpx.TransportError):
+        return "Netzwerkfehler"
+    return f"{type(e).__name__}: {e}"
 
 
 def markup_problem(raw: bytes, *, max_tags: int, max_attrs: int, max_lt: int,
-                   max_prefixes: int | None = None) -> str | None:
+                   max_prefixes: int | None = None, xml: bool = False) -> str | None:
     """Grund zur Ablehnung einer Seite bzw. eines Feeds, sonst None. Linear in der Größe.
 
     Zählt "<" insgesamt (höchstens `max_lt`, auch in Skripten und Kommentaren: Obergrenze für alles,
     was die Prüfung selbst überspringt), Tags (höchstens `max_tags`) und Attribute je Start-Tag
     (höchstens `max_attrs`), optional verschiedene Namensraum-Präfixe (xmlns:…, `max_prefixes`;
     feedparser wird erst mit vielen verschiedenen quadratisch). Ein kleiner Zustandsautomat
-    (_Scanner): Start-Tags mit Anführungszeichen (ein ">" oder "<!--" in einem Attributwert beendet
-    nichts), Kommentare ("-->" oder "--!>"), Inhalt von script/style bis zum schließenden Tag, CDATA
-    (der Inhalt zählt mit: feedparser wertet HTML darin aus). Was nicht sauber endet (Kommentar,
-    Skript, Anführungszeichen), gilt ab dort wieder als Markup: im Zweifel mehr zählen."""
+    (_Scanner) nach den Regeln des Parsers: für Seiten (HTML, `xml` False) wie der HTML5-Tokenizer
+    von libxml2 2.14, für Feeds (`xml` True) mit CDATA, dessen Inhalt mitzählt (feedparser wertet
+    HTML darin aus). Was nicht sauber endet (Kommentar, Skript, Anführungszeichen), gilt ab dort
+    wieder als Markup: im Zweifel mehr zählen."""
     low = raw.lower()
     if low.count(b"<") > max_lt:
         return f"zu viel Markup (über {_num(max_lt)} Zeichen „<“)"
@@ -232,21 +248,24 @@ def markup_problem(raw: bytes, *, max_tags: int, max_attrs: int, max_lt: int,
             prefixes.add(m[1])
             if len(prefixes) > max_prefixes:
                 return f"zu viele Namensräume (über {_num(max_prefixes)} Präfixe)"
-    return _Scanner(low, max_attrs).run(max_tags)
+    return _Scanner(low, max_attrs, xml).run(max_tags)
 
 
 class _Scanner:
-    """Zustandsautomat für markup_problem über den klein geschriebenen Text, angelehnt an den
-    HTML5-Tokenizer (libxml2 2.14). Jede Suche nach einem Ende (Kommentar, schließendes Tag,
-    Anführungszeichen), die nichts findet, wird gemerkt: Weitere Suchen ab späteren Stellen finden
-    dann auch nichts und entfallen. So bleibt es auch mit Hunderttausenden unbeendeten "<!--" linear."""
+    """Zustandsautomat für markup_problem über den klein geschriebenen Text. Jede Suche nach einem
+    Ende (Kommentar, schließendes Tag, Anführungszeichen), die nichts findet, wird gemerkt: Weitere
+    Suchen ab späteren Stellen finden dann auch nichts und entfallen. So bleibt es auch mit
+    Hunderttausenden unbeendeten "<!--" linear.
 
-    def __init__(self, low: bytes, max_attrs: int):
-        self.low, self.size, self.max_attrs = low, len(low), max_attrs
+    Übersprungen (nicht als Tags gezählt) werden nur Bereiche, deren Inhalt auch der Parser nicht als
+    Markup liest: echte Kommentare und (HTML) Skripte und Styles. Andere Bereiche, die der Parser als
+    Text nimmt (HTML: Inhalt von title, textarea …, falsche Kommentare wie "<!x …>", "<?x …>",
+    "</ …>"), werden in einem Zug bis zu ihrem Ende gelesen, jedes "<" darin zählt als Tag, aber
+    nichts darin öffnet einen übersprungenen Bereich."""
+
+    def __init__(self, low: bytes, max_attrs: int, xml: bool = False):
+        self.low, self.size, self.max_attrs, self.xml = low, len(low), max_attrs, xml
         self._missing: dict[bytes, int] = {}      # Suchbegriff -> ab hier gibt es ihn nicht mehr
-        # Bis hierhin Inhalt eines Textelements (title, textarea ...): Darin beginnt nichts, was
-        # übersprungen würde (kein Skript, kein Kommentar); Tags zählen trotzdem weiter.
-        self._text_until = -1
 
     def _find(self, key: bytes, start: int, search) -> int:
         """Position des Treffers von search(start) oder -1; merkt sich Fehlschläge je `key`."""
@@ -263,7 +282,7 @@ class _Scanner:
         return self._find(closing, start, lambda s: self.low.find(closing, s))
 
     def run(self, max_tags: int) -> str | None:
-        low, pos, tags = self.low, 0, 0
+        low, size, pos, tags = self.low, self.size, 0, 0
         while True:
             start = low.find(b"<", pos)
             if start < 0:
@@ -271,40 +290,51 @@ class _Scanner:
             tags += 1
             if tags > max_tags:
                 return f"zu viele Tags (über {_num(max_tags)})"
-            skipping = start >= self._text_until
             nxt = low[start + 1:start + 2]
-            if nxt == b"!":
-                if skipping and low.startswith(b"<!--", start):
-                    # Ab start + 2 gesucht: "<!-->" und "<!--->" sind schon beendete Kommentare.
-                    end = self._find(b"-->", start + 2, self._comment_end)
-                    # Unbeendet: ab hier wieder als Markup lesen (der Parser könnte es auch tun).
-                    pos = start + 4 if end < 0 else end
-                else:
-                    pos = start + 2       # <!DOCTYPE, <![CDATA[: Inhalt zählt weiter mit
+            text_until = -1               # Ende eines Bereichs, den der Parser als Text liest
+            if nxt == b"!" and low.startswith(b"<!--", start):
+                # Ab start + 2 gesucht: "<!-->" und "<!--->" sind schon beendete Kommentare.
+                end = self._find(b"-->", start + 2, self._comment_end)
+                # Unbeendet: ab hier wieder als Markup lesen (der Parser könnte es auch tun).
+                pos = start + 4 if end < 0 else end
                 continue
             if nxt == b"/" and low[start + 2:start + 3].isalpha():
                 end, attrs = self._tag(start + 1)     # auch Attribute an End-Tags zerlegt der Parser
             elif nxt.isalpha():
                 end, attrs = self._tag(start)
+            elif self.xml:
+                # <!DOCTYPE, <![CDATA[ (Inhalt zählt mit), <?xml …?>, "a < b" im Text
+                pos = start + 2 if nxt == b"!" else start + 1
+                continue
+            elif nxt in (b"!", b"?", b"/"):
+                # HTML: falscher Kommentar bis zum nächsten ">" (auch <![CDATA[ … in einer Seite)
+                gt = low.find(b">", start + 2)
+                text_until, end, attrs = (size if gt < 0 else gt), None, 0
             else:
-                pos = start + 1           # <?xml, "a < b" im Text
+                pos = start + 1           # "a < b" im Text
                 continue
             if attrs > self.max_attrs:
                 return f"zu viele Attribute in einem Tag (über {_num(self.max_attrs)})"
+            if text_until < 0 and not self.xml and nxt != b"/":
+                name = _TAG_NAME_RE.match(low, start + 1).group(0)
+                if name in _RAWTEXT:
+                    # Skript und Style: Rohtext bis zum schließenden Tag; fehlt es, zählt der Rest
+                    # wieder als Markup.
+                    close = self._closing(name, end)
+                    if close >= 0:
+                        end = close
+                elif name in _TEXT_ELEMENTS:
+                    # title, textarea, xmp …: Inhalt ist Text bis zum eigenen End-Tag (fehlt es: bis
+                    # zum Schluss). Kein "<" darin beginnt ein Tag oder einen Kommentar.
+                    close = self._closing(name, end)
+                    text_until = size if close < 0 else close
+            if text_until >= 0:
+                begin = start + 2 if end is None else end
+                tags += low.count(b"<", begin, text_until)
+                if tags > max_tags:
+                    return f"zu viele Tags (über {_num(max_tags)})"
+                end = text_until + 1 if end is None else text_until
             pos = end
-            if nxt == b"/" or not skipping:
-                continue
-            name = _TAG_NAME_RE.match(low, start + 1).group(0)
-            if name in _RAWTEXT:
-                # Skript und Style: Rohtext bis zum schließenden Tag; fehlt es, zählt der Rest wieder.
-                close = self._closing(name, end)
-                if close >= 0:
-                    pos = close
-            elif name in _TEXT_ELEMENTS:
-                # title, textarea, xmp ...: Inhalt ist Text, "<script" oder "<!--" darin beginnt
-                # nichts. Weiter gezählt wird trotzdem (fehlt das Ende: bis zum Schluss).
-                close = self._closing(name, end)
-                self._text_until = self.size if close < 0 else close
 
     def _comment_end(self, start: int) -> int:
         m = _COMMENT_END_RE.search(self.low, start)
@@ -355,26 +385,81 @@ _RAWTEXT = (b"script", b"style")
 _TEXT_ELEMENTS = (b"title", b"textarea", b"xmp", b"iframe", b"noembed", b"noframes")
 
 
+def _mb(n: int) -> str:
+    """Bytes als Megabyte mit höchstens einer Nachkommastelle ("117,7 MB", "5 MB")."""
+    return f"{n / 2**20:.1f}".rstrip("0").rstrip(".").replace(".", ",") + " MB"
+
+
 def _num(n: int) -> str:
     """Zahl mit schmalem geschütztem Leerzeichen als Tausendertrenner ("100 000")."""
     return f"{n:,}".replace(",", " ")
 
 
 def _extract_job(extract_fn, page: bytes, url: str):
-    """Läuft im Worker-Prozess: Vorprüfung der Seite, dann extract_fn (app.extract.extract, in Tests
-    austauschbar; wird als Referenz mitgeschickt)."""
-    problem = markup_problem(page, max_tags=MAX_PAGE_TAGS, max_attrs=MAX_TAG_ATTRS, max_lt=MAX_PAGE_LT)
+    """Läuft im Worker-Prozess: Seite dekodieren (page_as_utf8), Vorprüfung, dann extract_fn
+    (app.extract.extract, in Tests austauschbar; wird als Referenz mitgeschickt) mit genau den UTF-8-
+    Bytes, die die Vorprüfung gesehen hat."""
+    utf8 = page_as_utf8(page)
+    problem = markup_problem(utf8, max_tags=MAX_PAGE_TAGS, max_attrs=MAX_TAG_ATTRS, max_lt=MAX_PAGE_LT)
     if problem:
         raise MarkupRejected(f"Seite abgelehnt: {problem}")
-    return extract_fn(page, url)
+    return extract_fn(utf8, url)
+
+
+def _looks_compressed(data: bytes) -> bool:
+    """True, wenn trafilatura (utils.handle_compressed_file) die Bytes entpacken würde: gzip- oder
+    zstd-Kennung, ein gültiger zlib-Anfang oder (falls installiert) Brotli. trafilatura prüft dabei
+    keine Header; wir entpacken nie selbst, eine solche Seite wird abgelehnt."""
+    if data[:3] == b"\x1f\x8b\x08" or data[:4] == b"\x28\xb5\x2f\xfd":
+        return True
+    try:
+        d = zlib.decompressobj()
+        if d.decompress(data[:65536], 65536) or d.eof:
+            return True                   # der Anfang ist ein gültiger zlib-Strom
+    except zlib.error:
+        pass
+    if trafilatura_utils.HAS_BROTLI:
+        try:
+            trafilatura_utils.brotli.decompress(data)
+            return True
+        except Exception:  # noqa: BLE001
+            pass
+    return False
+
+
+def page_as_utf8(page: bytes) -> bytes:
+    """Die Seite als UTF-8, so wie trafilatura sie liest (utils.decode_file: Kodierung erkennen, sonst
+    UTF-8 mit Ersatzzeichen). Die Vorprüfung sieht so dieselben Zeichen wie der Parser, auch bei
+    UTF-16/32 oder EBCDIC. Komprimierte Bytes ohne Content-Encoding (die trafilatura ohne jede
+    Grenze entpacken würde: 4,7 KB gzip ergaben 400 000 Absätze) werden abgelehnt, ebenso eine
+    Seite, die dekodiert größer als DECODED_MAX_BYTES ist."""
+    if _looks_compressed(page):
+        raise MarkupRejected("Seite abgelehnt: komprimierter Inhalt ohne Content-Encoding")
+    utf8 = trafilatura_utils.decode_file(page).encode("utf-8", errors="replace")
+    if len(utf8) > DECODED_MAX_BYTES:
+        raise MarkupRejected(f"Seite abgelehnt: dekodiert zu groß (über {_mb(DECODED_MAX_BYTES)})")
+    if utf8 != page and _looks_compressed(utf8):
+        raise MarkupRejected("Seite abgelehnt: komprimierter Inhalt ohne Content-Encoding")
+    return utf8
+
+
+def feed_encoding_problem(raw: bytes) -> str | None:
+    """Feeds und Sitemaps nur in ASCII-kompatibler Kodierung: feedparser und expat erkennen UTF-16/32
+    (BOM oder Nullbytes um "<") und EBCDIC selbst, die Vorprüfung sähe dort kein Markup."""
+    head = raw[:4]
+    if head[:2] in (b"\xff\xfe", b"\xfe\xff") or head in (b"\x00\x00\xfe\xff", b"\x00\x00\x00<", b"<\x00\x00\x00") \
+            or head[:2] in (b"\x00<", b"<\x00") or head == b"\x4c\x6f\xa7\x94":
+        return "Kodierung nicht unterstützt (UTF-16/32 oder EBCDIC)"
+    return None
 
 
 def _feed_job(fn, *args):
     """Läuft im Worker-Prozess: Vorprüfung des Feeds bzw. der Sitemap (das bytes-Argument), dann fn
     (parse_feed, pick_child, parse_sitemap)."""
     raw = next(a for a in args if isinstance(a, bytes))
-    problem = markup_problem(raw, max_tags=MAX_FEED_TAGS, max_attrs=MAX_TAG_ATTRS, max_lt=MAX_FEED_LT,
-                             max_prefixes=MAX_FEED_PREFIXES)
+    problem = feed_encoding_problem(raw) or markup_problem(
+        raw, max_tags=MAX_FEED_TAGS, max_attrs=MAX_TAG_ATTRS, max_lt=MAX_FEED_LT,
+        max_prefixes=MAX_FEED_PREFIXES, xml=True)
     if problem:
         raise MarkupRejected(f"Feed abgelehnt: {problem}")
     return fn(*args)
@@ -405,7 +490,9 @@ def _job_main(conn, fn, args: tuple, memory_limit: int, cpu_seconds: int) -> Non
         try:
             conn.send(msg)
         except BaseException as e:  # noqa: BLE001  (Ergebnis nicht picklebar oder zu groß)
-            conn.send((False, JobInfraError(f"Ergebnis nicht übertragbar ({type(e).__name__})")))
+            # Einzelheit ins Protokoll des Containers (stderr des Workers), die Meldung bleibt deutsch.
+            sys.stderr.write(f"kiosk-worker: Ergebnis nicht übertragbar: {type(e).__name__}: {e}\n")
+            conn.send((False, JobInfraError("Ergebnis nicht übertragbar")))
     finally:
         os._exit(0)
 
@@ -702,8 +789,8 @@ class Fetcher:
                 else:
                     recv.close()
                 if isinstance(e, Exception):
-                    raise JobStartFailed(f"{what}: Worker-Prozess ließ sich nicht starten "
-                                         f"({type(e).__name__}: {e})") from e
+                    log.warning("%s: Worker-Prozess ließ sich nicht starten: %r", what, e)
+                    raise JobStartFailed(f"{what}: Worker-Prozess ließ sich nicht starten") from e
                 raise
             send.close()  # sonst sähe _collect nach dem Ende des Prozesses kein EOF
             pid = proc.pid
@@ -728,7 +815,8 @@ class Fetcher:
             raise JobOutOfMemory(f"{what}: zu viel Speicher (über {_num(JOB_MEMORY_LIMIT // 2**20)} MB)")
         if not isinstance(payload, Exception):
             # SystemExit, KeyboardInterrupt o. Ä. aus dem Worker nie in der Event-Loop weiterwerfen.
-            raise JobInfraError(f"{what}: Worker-Prozess meldete {type(payload).__name__}")
+            log.warning("%s: Worker-Prozess meldete %r", what, payload)
+            raise JobInfraError(f"{what}: Worker-Prozess unerwartet beendet")
         raise payload
 
     # ---- Leistungsschalter je Quelle ---------------------------------------
@@ -886,7 +974,7 @@ class Fetcher:
                         continue
                     declared = r.headers.get("content-length", "")
                     if declared.isdigit() and int(declared) > max_bytes:
-                        raise TooLarge(f"Antwort zu groß ({_num(int(declared))} Bytes, Grenze {_num(max_bytes)})")
+                        raise TooLarge(f"Antwort zu groß ({_mb(int(declared))}, Grenze {_mb(max_bytes)})")
                     return Fetched(r.status_code, r.headers, await _read_limited(r, max_bytes), str(r.url))
             raise FetchError(f"Zu viele Umleitungen (> {MAX_REDIRECTS})")
 
@@ -1166,6 +1254,7 @@ class Fetcher:
             self._fail(article_id, f"Ungültige URL: {type(e).__name__}: {e}")
             return
         except (ResolveError, FetchError, httpx.HTTPError, TimeoutError) as e:
+            log.info("Extraktion %s (%s): %r", article_id, url, e)   # Einzelheiten; gespeichert wird Deutsch
             self._retry(article_id, url, error_text(e))
             return
         except Exception as e:  # noqa: BLE001
@@ -1193,7 +1282,9 @@ class Fetcher:
         except JobSkipped:
             return False
         except JobStartFailed as e:
-            # Kein Prozess (z. B. pids_limit): nicht die Schuld des Artikels, ohne Zählung neu einplanen.
+            # Kein Prozess (z. B. pids_limit): nicht die Schuld des Artikels, neu eingeplant ohne
+            # gezählten Versuch des Artikels. Für das Budget des Laufs zählt er aber (die Seite wurde
+            # geholt): So holt ein Lauf, in dem keine Prozesse starten, nicht endlos weiter Seiten.
             self.db.requeue(article_id, str(e))
             log.warning("Extraktion %s (%s): %s", article_id, url, e)
             return True
@@ -1240,7 +1331,7 @@ async def _read_limited(r: httpx.Response, max_bytes: int) -> bytes:
         # Nur bei vorgefertigten Antworten ohne Netzwerk (MockTransport in Tests): Der Inhalt liegt
         # schon vollständig im Speicher, es bleibt die Größenprüfung.
         if len(r.content) > max_bytes:
-            raise TooLarge(f"Antwort zu groß (über {_num(max_bytes)} Bytes)")
+            raise TooLarge(f"Antwort zu groß (über {_mb(max_bytes)})")
         return r.content
     if r.status_code in (204, 304):
         return b""  # nie ein Body, auch wenn Content-Encoding gesetzt ist
@@ -1252,13 +1343,13 @@ async def _read_limited(r: httpx.Response, max_bytes: int) -> bytes:
         nonlocal total
         total += len(data)
         if total > max_bytes:
-            raise TooLarge(f"Antwort zu groß (über {_num(max_bytes)} Bytes)")
+            raise TooLarge(f"Antwort zu groß (über {_mb(max_bytes)})")
         chunks.append(data)
 
     async for chunk in r.aiter_raw():
         raw_total += len(chunk)
         if raw_total > max_bytes:
-            raise TooLarge(f"Antwort zu groß (über {_num(max_bytes)} Bytes)")
+            raise TooLarge(f"Antwort zu groß (über {_mb(max_bytes)})")
         if decoder is None:
             add(chunk)
             continue

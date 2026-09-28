@@ -245,6 +245,8 @@ COUNT_INDEX = "INDEXED BY idx_articles_source_counts"
 # Zeilen aus user_articles der beste Start).
 LIST_INDEX = "INDEXED BY idx_articles_list"
 TERM_HITS_FOR_INDEX = 1000  # ab so vielen Treffern der Profil-Begriffe lohnt der Zeitindex (siehe list_articles_sql)
+TERM_COUNT_TIME = 0.3       # Sekunden für diese Zählung höchstens
+BROAD_TERMS = 5             # mehr Profil-Begriffe gelten ohne Zählung als häufig (ebenso Präfixe unter 4 Zeichen)
 
 ARTICLE_LIST_COLS = ", ".join(
     f"a.{c}" for c in (
@@ -775,17 +777,22 @@ class Database:
         """Artikelliste. Ohne Suche per Keyset-Cursor `before` = (published_at, id),
         mit Suche (bm25-Sortierung) per `offset`. `terms` (Profil-Begriffe) filtern nur,
         die Sortierung bleibt chronologisch. Flags und Filter gelten für `user_id`."""
+        # Eine gemeinsame Frist für beide Abfragen (Zählung der Profil-Begriffe und Liste): Eine
+        # Anfrage darf die Frist der API nicht zweimal ausschöpfen.
+        budget = request_time_limit.get()
+        deadline = None if budget is None else _time.monotonic() + budget
         sql, params = self.list_articles_sql(
             user_id, sources=sources, query=query, unread=unread, starred=starred, free_only=free_only,
-            before=before, limit=limit, offset=offset, later=later, terms=terms, since=since)
-        return self.q(sql, params)
+            before=before, limit=limit, offset=offset, later=later, terms=terms, since=since, deadline=deadline)
+        return self.q(sql, params, time_limit=_left(deadline))
 
     def list_articles_sql(self, user_id: int, *, sources: list[str] | None,
                           query: str | None, unread: bool, starred: bool, free_only: bool,
                           before: tuple[str, int] | None, limit: int, offset: int = 0,
                           later: bool = False, terms: list[str] | None = None,
-                          since: str | None = None) -> tuple[str, tuple]:
-        """SQL und Parameter für list_articles (getrennt, damit Tests den Plan prüfen können)."""
+                          since: str | None = None, deadline: float | None = None) -> tuple[str, tuple]:
+        """SQL und Parameter für list_articles (getrennt, damit Tests den Plan prüfen können);
+        `deadline` (monotone Zeit) begrenzt die Zählung der Profil-Begriffe."""
         where, params = _article_filter(sources=sources, unread=unread, starred=starred,
                                         free_only=free_only, later=later, terms=terms, since=since,
                                         cutoff=self.retention_cutoff())
@@ -796,7 +803,7 @@ class Database:
         # (0,4 ms statt 30 ms über den ganzen Zeitindex), häufige nicht (110 ms statt 30 ms, alle Treffer
         # lesen und sortieren). Die Zählung ist gedeckelt und kostet wenige Millisekunden.
         if not query and not starred and not later and (sources is None or len(sources) > 1) \
-                and (not terms or self._many_term_hits(terms)):
+                and (not terms or self._many_term_hits(terms, deadline)):
             index = LIST_INDEX
         if query:
             join = "JOIN articles_fts f ON f.rowid = a.id"
@@ -817,10 +824,21 @@ class Database:
             params.append(offset)
         return sql, tuple(params)
 
-    def _many_term_hits(self, terms: list[str]) -> bool:
-        """True, wenn die Profil-Begriffe mindestens TERM_HITS_FOR_INDEX Artikel treffen."""
-        return self.one("SELECT COUNT(*) AS n FROM (SELECT rowid FROM articles_fts WHERE articles_fts MATCH ? "
-                        "LIMIT ?)", (_terms_query(terms), TERM_HITS_FOR_INDEX))["n"] >= TERM_HITS_FOR_INDEX
+    def _many_term_hits(self, terms: list[str], deadline: float | None = None) -> bool:
+        """True, wenn die Profil-Begriffe mindestens TERM_HITS_FOR_INDEX Artikel treffen. Breite Begriffe
+        (_broad_terms) gelten ohne Zählung als häufig: Deren Zählung allein kostete Sekunden (20
+        Präfixe aus drei Buchstaben: 2,5 s). Die Zählung hat höchstens TERM_COUNT_TIME Sekunden (und
+        nie mehr als bis `deadline`); dauert sie länger, sind die Begriffe häufig."""
+        if _broad_terms(terms):
+            return True
+        left = _left(deadline)
+        try:
+            return self.one("SELECT COUNT(*) AS n FROM (SELECT rowid FROM articles_fts WHERE articles_fts MATCH ? "
+                            "LIMIT ?)", (_terms_query(terms), TERM_HITS_FOR_INDEX),
+                            time_limit=TERM_COUNT_TIME if left is None else min(TERM_COUNT_TIME, left)
+                            )["n"] >= TERM_HITS_FOR_INDEX
+        except QueryTimeout:
+            return True
 
     def count_articles(self, user_id: int, *, cap: int, sources: list[str] | None = None, query: str | None = None,
                        unread: bool = False, starred: bool = False, free_only: bool = False,
@@ -1461,6 +1479,28 @@ def _phrase(text: str) -> str:
     tokens = _TOKEN_RE.findall(text)
     star = "*" if tokens and len(tokens[-1]) >= PREFIX_MIN_LEN else ""
     return '"' + text.replace('"', '""') + '"' + star
+
+
+def _broad_terms(terms: list[str]) -> bool:
+    """Profil-Begriffe, die sicher viele Artikel treffen oder teuer zu zählen sind: mehr als BROAD_TERMS
+    oder ein Präfix-Begriff (siehe _phrase) mit weniger als 4 Zeichen im letzten Wort."""
+    if len(terms) > BROAD_TERMS:
+        return True
+    for term in terms:
+        tokens = _TOKEN_RE.findall(term)
+        if tokens and PREFIX_MIN_LEN <= len(tokens[-1]) < 4:
+            return True
+    return False
+
+
+def _left(deadline: float | None) -> float | None:
+    """Verbleibende Sekunden bis `deadline` (None: keine Frist); abgelaufen: QueryTimeout."""
+    if deadline is None:
+        return None
+    left = deadline - _time.monotonic()
+    if left <= 0:
+        raise QueryTimeout("Zeitbudget der Anfrage verbraucht")
+    return left
 
 
 def _terms_query(terms: list[str]) -> str:

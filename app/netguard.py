@@ -77,7 +77,7 @@ async def check_url(url: str) -> None:
     try:
         infos = await loop.getaddrinfo(host, DEFAULT_PORTS[parsed.scheme], type=socket.SOCK_STREAM)
     except socket.gaierror as e:
-        raise ResolveError(f"Name nicht auflösbar: {host} ({e})") from e
+        raise ResolveError(f"Name nicht auflösbar: {host}") from e
     if not infos:
         raise ResolveError(f"Name nicht auflösbar: {host}")
     for info in infos:
@@ -150,7 +150,7 @@ async def _allowed_addresses(host: str, port: int) -> list[str]:
     try:
         infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except socket.gaierror as e:
-        raise ResolveError(f"Name nicht auflösbar: {host} ({e})") from e
+        raise ResolveError(f"Name nicht auflösbar: {host}") from e
     ips = list(dict.fromkeys(info[4][0].split("%", 1)[0] for info in infos))
     if not ips:
         raise ResolveError(f"Name nicht auflösbar: {host}")

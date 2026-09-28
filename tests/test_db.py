@@ -917,3 +917,36 @@ def test_old_published_index_is_dropped(tmp_path):
     names = {r["name"] for r in d.q("SELECT name FROM sqlite_master WHERE type='index'")}
     d.close()
     assert "idx_articles_published" not in names and "idx_articles_list" in names
+
+
+def test_broad_profile_terms_skip_the_count(db):
+    sources = [f"s{i}" for i in range(5)]
+    db.upsert_articles([make_row(sources[i % 5], i, ago(minutes=i)) for i in range(20)])
+    params = dict(sources=sources, query=None, unread=True, starred=False, free_only=True, before=None, limit=50)
+    for terms in (["Wir"], [f"Begriff{i}" for i in range(6)]):
+        stmts = []
+        db._conn.set_trace_callback(stmts.append)
+        sql, _ = db.list_articles_sql(UID, **params, terms=terms)
+        db._conn.set_trace_callback(None)
+        assert "idx_articles_list" in sql and not any("COUNT" in s for s in stmts), terms
+    assert not db_mod._broad_terms(["Wirtschaft", "NATO"]) and db_mod._broad_terms(["Öl"]) is False
+
+
+def test_count_and_list_share_one_deadline(db, monkeypatch):
+    """Zählung der Profil-Begriffe und Liste teilen sich die Frist der Anfrage."""
+    import time as _t
+    sources = [f"s{i}" for i in range(5)]
+    db.upsert_articles([make_row(sources[i % 5], i, ago(minutes=i)) for i in range(20)])
+
+    def slow_count(terms, deadline=None):
+        _t.sleep(0.3)
+        return True
+
+    monkeypatch.setattr(db, "_many_term_hits", slow_count)
+    token = db_mod.request_time_limit.set(0.2)
+    try:
+        with pytest.raises(db_mod.QueryTimeout):
+            list_all(db, sources=sources, unread=True, terms=["Titel"])
+    finally:
+        db_mod.request_time_limit.reset(token)
+    assert list_all(db, sources=sources, unread=True, terms=["Titel"])       # ohne Frist: normal

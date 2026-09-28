@@ -21,13 +21,13 @@ SECURE_COOKIE_NAME = "__Host-kiosk_session"
 PLAIN_COOKIE_NAME = "kiosk_session"
 COOKIE_NAMES = (SECURE_COOKIE_NAME, PLAIN_COOKIE_NAME)
 # Bekanntes Gerät (OWASP "device cookie"): nach erfolgreichem Login gesetzt, an den Benutzernamen
-# gebunden, überlebt das Abmelden. Wer es vorzeigt, ist von der globalen Notbremse und der Bremse je
+# und dessen Passwort-Hash gebunden (ein neues Passwort macht es ungültig), überlebt das Abmelden. Wer es vorzeigt, ist von der globalen Notbremse und der Bremse je
 # Benutzername ausgenommen (die ein Angreifer sonst für alle auslösen könnte), nicht aber von der je
 # IP; Fehlversuche mit dem Cookie zählen je Gerät (MAX_DEVICE_ATTEMPTS).
 SECURE_DEVICE_COOKIE_NAME = "__Host-kiosk_device"
 PLAIN_DEVICE_COOKIE_NAME = "kiosk_device"
 DEVICE_MAX_AGE = 365 * 86400
-_DEVICE_RE = re.compile(r"d:([a-z0-9._-]{2,32}):([0-9a-f]{32})")
+_DEVICE_RE = re.compile(r"d:([a-z0-9._-]{2,32}):([0-9a-f]{16}):([0-9a-f]{32})")
 
 # Login-Bremse: je IP höchstens MAX_ATTEMPTS, je Benutzername MAX_USER_ATTEMPTS Versuche in
 # WINDOW_SECONDS, dazu eine Notbremse über alle Anfragen (GLOBAL_MAX_ATTEMPTS pro
@@ -248,24 +248,30 @@ class Auth:
 
     # ---- Bekanntes Gerät ------------------------------------------------
 
-    def issue_device(self, username: str) -> str:
-        """Neues Device-Cookie für diesen Benutzernamen (eigene Zufalls-ID je Login)."""
-        return self._device_signer.sign(f"d:{username}:{secrets.token_hex(16)}".encode()).decode()
+    def issue_device(self, username: str, password_hash: str) -> str:
+        """Neues Device-Cookie für diesen Benutzernamen und Passwort-Hash (Fingerabdruck wie im
+        Session-Cookie; eigene Zufalls-ID je Login)."""
+        payload = f"d:{username}:{self.fingerprint(password_hash)}:{secrets.token_hex(16)}"
+        return self._device_signer.sign(payload.encode()).decode()
 
-    def device_id(self, cookies: dict[str, str], username: str | None) -> str | None:
+    def device_id(self, cookies: dict[str, str], username: str | None,
+                  password_hash: str | None) -> str | None:
         """ID des Geräts, wenn das Device-Cookie (nur der Name des aktuellen Modus) gültig signiert,
-        nicht abgelaufen und an genau diesen Benutzernamen gebunden ist; sonst None."""
+        nicht abgelaufen und an genau diesen Benutzernamen und seinen aktuellen Passwort-Hash gebunden
+        ist; sonst None (auch für unbekannte Namen). Ein neu gesetztes Passwort (python -m app.users
+        passwd) nimmt allen Geräten die Ausnahme von der Bremse."""
         token = cookies.get(self.device_cookie_name)
-        if not token or not username:
+        if not token or not username or not password_hash:
             return None
         try:
             payload = self._device_signer.unsign(token.encode(), max_age=DEVICE_MAX_AGE).decode()
         except (BadSignature, SignatureExpired, UnicodeDecodeError):
             return None
         m = _DEVICE_RE.fullmatch(payload)
-        if not m or not hmac.compare_digest(m[1], username):
+        if not m or not hmac.compare_digest(m[1], username) \
+                or not hmac.compare_digest(m[2], self.fingerprint(password_hash)):
             return None
-        return m[2]
+        return m[3]
 
     # ---- Login-Bremse --------------------------------------------------
 

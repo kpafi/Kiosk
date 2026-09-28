@@ -808,7 +808,7 @@ def test_rsync_uploads_allowlist_from_head(tmp_path):
 def test_deploy_refuses_dirty_tree_and_uses_head():
     script = (ROOT / "deploy" / "deploy.sh").read_text(encoding="utf-8")
     code = script.split('echo "== Code nach $BOX:$DEST"')[1].split('echo "== .env"')[0]
-    assert 'git status --porcelain --untracked-files=no -- "${DEPLOY_PATHS[@]}"' in code
+    assert 'git status --porcelain --untracked-files=all -- "${DEPLOY_PATHS[@]}"' in code
     assert "exit 2" in code and "KIOSK_ALLOW_DIRTY" in code
     assert code.index("git archive") < code.index("rsync")
     perms = _heredoc("PERMS")
@@ -877,3 +877,40 @@ def test_uvicorn_without_server_header_and_access_log():
     assert "\"--no-server-header\"" in dockerfile and "\"--no-access-log\"" in dockerfile
     req = (ROOT / "requirements.txt").read_text(encoding="utf-8")
     assert "starlette>=0.49.1" in req
+
+
+def _dirty_check(repo, allow=False):
+    import os
+    script = (ROOT / "deploy" / "deploy.sh").read_text(encoding="utf-8")
+    start = script.index("DEPLOY_PATHS=(")
+    snippet = script[start:script.index("stage=$(mktemp -d)", start)] + "\necho SAUBER\n"
+    env = {**os.environ, "KIOSK_ALLOW_DIRTY": "1" if allow else ""}
+    return subprocess.run(["bash", "-c", snippet], cwd=repo, env=env, text=True, capture_output=True)
+
+
+def test_deploy_refuses_untracked_files_under_deploy_paths(tmp_path):
+    """Ein committetes app.js, das ein nie hinzugefügtes Modul importiert: nicht deployen."""
+    repo = tmp_path / "repo"
+    (repo / "static" / "js").mkdir(parents=True)
+    (repo / "app").mkdir()
+    (repo / "static" / "js" / "app.js").write_text("import './neu.js';\n")
+    (repo / "app" / "main.py").write_text("x = 1\n")
+    (repo / ".gitignore").write_text("*.pyc\n")
+    git = ["git", "-c", "user.email=t@example.org", "-c", "user.name=t"]
+    subprocess.run(git + ["init", "-q"], cwd=repo, check=True)
+    subprocess.run(git + ["add", "-A"], cwd=repo, check=True)
+    subprocess.run(git + ["commit", "-qm", "x"], cwd=repo, check=True)
+    assert "SAUBER" in _dirty_check(repo).stdout
+    (repo / "app" / "cache.pyc").write_text("ignoriert")          # ignorierte Dateien stören nicht
+    (repo / "notizen.txt").write_text("außerhalb der Pfade")      # nicht deploybar, stört nicht
+    assert "SAUBER" in _dirty_check(repo).stdout
+    (repo / "static" / "js" / "neu.js").write_text("export {};\n")
+    r = _dirty_check(repo)
+    assert r.returncode == 2 and "?? static/js/neu.js" in r.stderr and "KIOSK_ALLOW_DIRTY" in r.stderr
+    assert "SAUBER" in _dirty_check(repo, allow=True).stdout
+
+
+def test_caddy_csp_replaces_the_app_fallback():
+    csp = BLOCK.split("header @app {")[1].split("}")[0]
+    assert "Content-Security-Policy" in csp and "defer" in csp
+    assert "interest-cohort" not in BLOCK

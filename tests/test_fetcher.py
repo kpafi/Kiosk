@@ -168,7 +168,7 @@ async def test_small_feed_image_is_replaced_by_page_image(db, settings, monkeypa
     aid = db.one("SELECT id FROM articles")["id"]
     f = make_fetcher(db, settings, lambda r: httpx.Response(200, headers={"content-type": "text/html"}, content=b"<p>x</p>"))
 
-    async def fake_extract(page, url):
+    async def fake_extract(page, url, skip=None):
         return extract_mod.Extraction("full", "<p>Text</p>", "Text", 4, False, page_image, None)
 
     monkeypatch.setattr(f, "_run_extract", fake_extract)
@@ -183,7 +183,7 @@ async def test_page_image_does_not_replace_image_of_already_extracted_article(db
     db.store_extraction(aid, status="full", body_html="<p>alt</p>", body_text="alt", body_len=3, paywalled=False)
     f = make_fetcher(db, settings, lambda r: httpx.Response(200, headers={"content-type": "text/html"}, content=b"<p>x</p>"))
 
-    async def fake_extract(page, url):
+    async def fake_extract(page, url, skip=None):
         return extract_mod.Extraction("full", "<p>Text</p>", "Text", 4, False, "https://i.example/gross.jpg", None)
 
     monkeypatch.setattr(f, "_run_extract", fake_extract)
@@ -661,7 +661,7 @@ async def test_timeout_measures_run_time_not_queue_time(db, settings, monkeypatc
 async def test_hung_job_does_not_touch_its_neighbours(db, settings, monkeypatch):
     """Ein hängender Auftrag: nur er zählt einen Versuch; der gleichzeitig laufende Nachbar (hier ein
     Abruf auf Anforderung) und die wartenden laufen ungestört zu Ende (je Auftrag ein Prozess)."""
-    monkeypatch.setattr(fetcher_mod, "EXTRACT_TIMEOUT", 2)
+    monkeypatch.setattr(fetcher_mod, "EXTRACT_TIMEOUT", 3)   # Luft: jeder Worker importiert das Testmodul neu
     monkeypatch.setattr(fetcher_mod, "extract", _timed_extract)
     urls = {"hung": f"{PUBLIC}/d/60", "nb": f"{PUBLIC}/d/1.6", "w1": f"{PUBLIC}/d/0.1", "w2": f"{PUBLIC}/d/0.2"}
     db.upsert_articles([make_row("alpha", i, ago(hours=i + 1), url=u) for i, u in enumerate(urls.values())])
@@ -682,7 +682,7 @@ async def test_hung_job_does_not_touch_its_neighbours(db, settings, monkeypatch)
         assert row["text_error"] == "Extraktion Zeitüberschreitung"
         for k in ("nb", "w1", "w2"):
             row = db.get_article(ids[k])
-            assert row["text_status"] in ("full", "partial") and row["attempts"] == 0, k
+            assert row["text_status"] in ("full", "partial") and row["attempts"] == 0, (k, row["text_error"])
     finally:
         await f.close()
 
@@ -783,8 +783,7 @@ def test_markup_guard_accepts_big_real_world_shapes():
             + "".join(f'<item xmlns:dc="http://purl.org/dc/elements/1.1/"><title>t{i}</title><link>https://a/{i}</link>'
                       f"<description><![CDATA[{'Ein Wort ' * 400}<p>x</p>]]></description></item>" for i in range(300))
             + "</channel></rss>").encode()
-    assert fetcher_mod.markup_problem(feed, max_tags=fetcher_mod.MAX_FEED_TAGS, max_attrs=fetcher_mod.MAX_TAG_ATTRS,
-                                      max_prefixes=fetcher_mod.MAX_FEED_PREFIXES) is None
+    assert _feed_problem(feed) is None
 
 
 async def test_hostile_page_fails_fast_without_retries(db, settings):
@@ -804,7 +803,7 @@ async def test_hostile_page_fails_fast_without_retries(db, settings):
 @pytest.mark.parametrize("body", [
     b"".join(b'<n%d:x xmlns:n%d="urn:%d"/>' % (i, i, i) for i in range(150_000)),     # feedbomb ns
     b"<x " + b" ".join(b'a%d="1"' % i for i in range(300_000)) + b"/>",                 # feedbomb attrs
-])
+], ids=["ns", "attrs"])
 async def test_hostile_feed_is_rejected_before_feedparser(db, settings, body):
     raw = (b'<rss version="2.0"><channel><item><title>x</title><link>https://a/1</link>' + body
            + b"</item></channel></rss>")[:5 * 1024 * 1024]
@@ -813,7 +812,7 @@ async def test_hostile_feed_is_rejected_before_feedparser(db, settings, body):
         start = time.perf_counter()
         assert await asyncio.wait_for(f._fetch_all_feeds(), timeout=30) == 0
         assert time.perf_counter() - start < 10
-        assert db.source_states()["alpha"]["last_error"].startswith("MarkupRejected: Feed abgelehnt: zu viele")
+        assert db.source_states()["alpha"]["last_error"].startswith("Feed abgelehnt: zu viele")
     finally:
         await f.close()
 
@@ -957,7 +956,7 @@ async def test_feed_parsing_runs_in_worker_with_timeout(db, settings, monkeypatc
     f = make_fetcher(db, settings, lambda r: httpx.Response(200, content=rss(item(1))))
     try:
         assert await asyncio.wait_for(f._fetch_all_feeds(), timeout=20) == 0
-        assert db.source_states()["alpha"]["last_error"] == "ExtractTimeout: Feed-Parsing Zeitüberschreitung"
+        assert db.source_states()["alpha"]["last_error"] == "Feed-Parsing Zeitüberschreitung"
         assert not f._pids   # hängender Worker-Prozess beendet
     finally:
         await f.close()
@@ -1008,7 +1007,7 @@ async def test_title_echo_is_removed_off_the_event_loop(db, settings, monkeypatc
         threads.append(threading.current_thread() is threading.main_thread())
         return real(result, title)
 
-    async def fake_extract(page, url):
+    async def fake_extract(page, url, skip=None):
         return extract_mod.Extraction("full", "<p>Titel 1</p><p>Text</p>", "Titel 1 Text", 12, False, None, None)
 
     monkeypatch.setattr(fetcher_mod, "drop_title_echo", spy)
@@ -1187,3 +1186,139 @@ async def test_guarded_backend_connects_to_checked_public_address(monkeypatch):
         await backend.connect_tcp("localhost", 80)
     with pytest.raises(BlockedURL):
         await backend.connect_unix_socket("/var/run/docker.sock")
+
+
+def _page_problem(raw: bytes):
+    return fetcher_mod.markup_problem(raw, max_tags=fetcher_mod.MAX_PAGE_TAGS, max_attrs=fetcher_mod.MAX_TAG_ATTRS,
+                                      max_lt=fetcher_mod.MAX_PAGE_LT)
+
+
+def _feed_problem(raw: bytes):
+    return fetcher_mod.markup_problem(raw, max_tags=fetcher_mod.MAX_FEED_TAGS, max_attrs=fetcher_mod.MAX_TAG_ATTRS,
+                                      max_lt=fetcher_mod.MAX_FEED_LT, max_prefixes=fetcher_mod.MAX_FEED_PREFIXES)
+
+
+ATTR_BOMB = b"<div " + b" ".join(b'a%d="1"' % i for i in range(100_000)) + b"><p>x</p></div>"
+
+
+@pytest.mark.parametrize("prefix", [
+    b'<div title="a><!--">',                 # ">" und "<!--" in einem Attributwert beenden nichts
+    b"<!-- nie beendet ",                    # unbeendeter Kommentar: der Rest zählt weiter
+    b"<script>var a = 1;",                   # unbeendetes Skript
+    b"<style>p{}",                           # unbeendeter Style
+    b"<!-- x --!>",                          # Kommentar-Ende, das auch HTML-Parser kennen
+    b"<div data-x='unbeendet",               # unbeendeter Wert: danach zählt alles mit
+], ids=["gt-in-wert", "kommentar", "skript", "style", "kommentar-bang", "wert"])
+def test_markup_guard_cannot_be_blinded(prefix):
+    raw = b"<html><body>" + prefix + ATTR_BOMB + b"</body></html>"
+    assert "Attribute" in (_page_problem(raw) or "")
+
+
+def test_markup_guard_counts_cdata_content_in_feeds():
+    raw = (b'<rss version="2.0"><channel><item><title>x</title><description><![CDATA[<!--]]></description>'
+           + b"<x/>" * 300_000 + b"</item></channel></rss>")
+    assert _feed_problem(raw)
+    # Auch knapp unter der Gesamtgrenze: Tags in CDATA zählen als Tags.
+    raw = b"<rss><channel><item><description><![CDATA[" + b"<p>" * 110_000 + b"]]></description></item></channel></rss>"
+    assert "Tags" in (_feed_problem(raw) or "")
+
+
+def test_markup_guard_accepts_single_quoted_json_attributes():
+    obj = "{" + ",".join(f'"k{i}":"v {i}"' for i in range(140)) + "}"
+    ids = "[" + ",".join(f'"a{i}"' for i in range(300)) + "]"
+    page = (f"<html><body><div data-x='{obj}' data-ids='{ids}' class=\"a b\">Text</div>"
+            f"<p title='a \"b\" c' data-y = 'x y z'>ok</p></body></html>").encode()
+    assert _page_problem(page) is None
+
+
+@pytest.mark.parametrize("raw", [
+    b"<!--" * 90_000,                                    # lauter unbeendete Kommentare
+    b'<a b="' * 90_000,                                   # lauter unbeendete Werte
+    b"<div " + b'a="' * 1_500_000,                        # ein Tag voller unbeendeter Werte
+    b"<script>" * 90_000,                                 # lauter unbeendete Skripte
+    b"<p " + b"x" * 5_000_000,                            # ein Tag ohne Ende
+], ids=["kommentare", "werte", "tag-voller-werte", "skripte", "tag-ohne-ende"])
+def test_markup_guard_stays_linear(raw):
+    start = time.perf_counter()
+    _page_problem(raw)
+    _feed_problem(raw)
+    assert time.perf_counter() - start < 5
+
+
+async def test_breaker_is_checked_again_with_the_job_slot(db, settings, monkeypatch):
+    """Auch mit 6 gleichzeitigen Extraktionen (KIOSK_EXTRACT_CONCURRENCY) laufen nach dem Auslösen
+    keine weiteren Aufträge der Quelle: Wer schon auf einen Worker-Platz wartet, fragt mit dem Platz
+    noch einmal nach. Höchstens LIMIT + (Worker-Plätze - 1) Zeitüberschreitungen."""
+    from dataclasses import replace
+    monkeypatch.setattr(fetcher_mod, "EXTRACT_TIMEOUT", 1)
+    monkeypatch.setattr(fetcher_mod, "extract", _timed_extract)
+    db.upsert_articles([make_row("alpha", i, ago(minutes=i + 1), url=f"{PUBLIC}/alpha{i}/60") for i in range(8)])
+    f = make_fetcher(db, replace(settings, extract_concurrency=6), lambda r: httpx.Response(
+        200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
+    try:
+        await asyncio.wait_for(f._extract_pending(), timeout=30)
+    finally:
+        await f.close()
+    tried = db.one("SELECT SUM(attempts) AS n FROM articles")["n"]
+    assert 2 <= tried <= fetcher_mod.SOURCE_TROUBLE_LIMIT + fetcher_mod.EXTRACT_WORKERS - 1
+
+
+async def test_on_demand_extraction_ignores_the_breaker(db, settings):
+    """Öffnet jemand einen Artikel einer ausgelösten Quelle, gibt es trotzdem einen echten Versuch
+    (sonst wartete die Oberfläche 30 s auf nichts)."""
+    aid = _article(db)
+    f = make_fetcher(db, settings, lambda r: httpx.Response(
+        200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
+    try:
+        f._cycle_started = time.monotonic() - 1
+        for _ in range(fetcher_mod.SOURCE_TROUBLE_LIMIT):
+            f._note_trouble("alpha")
+        assert f._tripped("alpha")
+        await f.extract_article(aid, f"{PUBLIC}/artikel", "alpha")      # Hintergrund: übersprungen
+        assert db.get_article(aid)["text_status"] == "pending"
+        assert f.start_extraction(aid, f"{PUBLIC}/artikel", source="alpha")
+        await asyncio.wait_for(asyncio.shield(f._inflight[aid]), timeout=30)
+        assert db.get_article(aid)["text_status"] in ("full", "partial")
+    finally:
+        await f.close()
+
+
+def _exiting_extract(page, url):
+    """Läuft im Worker-Prozess: beendet sich per SystemExit (keine Exception-Unterklasse)."""
+    raise SystemExit(3)
+
+
+async def test_worker_base_exception_is_not_reraised_in_the_loop(db, settings, monkeypatch):
+    aid = _article(db)
+    f = make_fetcher(db, settings, lambda r: httpx.Response(
+        200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
+    monkeypatch.setattr(fetcher_mod, "extract", _exiting_extract)
+    try:
+        with pytest.raises(RuntimeError, match="SystemExit"):
+            await f._run_extract(ARTICLE_HTML.encode(), f"{PUBLIC}/x")
+        await asyncio.wait_for(f.extract_article(aid, f"{PUBLIC}/artikel"), timeout=30)
+        assert "SystemExit" in db.get_article(aid)["text_error"]
+    finally:
+        await f.close()
+
+
+async def test_jobs_use_their_own_threads_not_the_default_executor(db, settings, monkeypatch):
+    """Start und Einsammeln der Worker-Prozesse blockieren nicht den Standard-Executor (den brauchen
+    getaddrinfo, scrypt und die Gruppierung)."""
+    used = []
+    loop = asyncio.get_running_loop()
+    real = loop.run_in_executor
+
+    def spy(executor, fn, *args):
+        used.append(executor)
+        return real(executor, fn, *args)
+
+    monkeypatch.setattr(loop, "run_in_executor", spy)
+    f = make_fetcher(db, settings, lambda r: httpx.Response(200))
+    try:
+        result = await f._run_extract(ARTICLE_HTML.encode(), f"{PUBLIC}/x")
+        assert result.status in ("full", "partial")
+        assert used and all(e is f._threads for e in used)
+    finally:
+        await f.close()
+    assert f._threads is None

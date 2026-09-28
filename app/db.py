@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import json
 import re
 import sqlite3
@@ -875,8 +876,14 @@ class Database:
 
         Die Menge steht beim Aufruf fest: höchstens bis zur damals höchsten ID (bzw. `max_id`), mit
         der Aufbewahrungsgrenze von da; später geholte Artikel bleiben ungelesen, wie am Stück."""
+        # Profil-Begriffe: die Treffer des Volltextindex einmal je Aufruf, nicht je Block.
         where, params = _article_filter(sources=sources, unread=True, starred=False,
-                                        free_only=False, terms=terms, cutoff=self.retention_cutoff())
+                                        free_only=False, cutoff=self.retention_cutoff())
+        term_ids = None
+        if terms:
+            term_ids = sorted(r["rowid"] for r in self.q(
+                "SELECT rowid FROM articles_fts WHERE articles_fts MATCH ?", (_terms_query(terms),), time_limit=None))
+            where.append("a.id IN (SELECT value FROM json_each(?))")
         bounds = self.one("SELECT MIN(id) AS lo, MAX(id) AS hi FROM articles", time_limit=None)
         if bounds["lo"] is None:
             return
@@ -887,15 +894,21 @@ class Database:
         # statt je Block alle Artikel der Quellen über deren Index zu lesen.
         for start in range(bounds["lo"] - 1, hi, MARK_READ_ID_STEP):
             window = (start, min(start + MARK_READ_ID_STEP, hi))
+            block = list(params)
+            if term_ids is not None:
+                ids = term_ids[bisect.bisect_right(term_ids, window[0]):bisect.bisect_right(term_ids, window[1])]
+                if not ids:
+                    continue
+                block.append(json.dumps(ids))
             with self.tx() as c:
                 visible = c.execute(f"SELECT COUNT(*) AS n FROM articles a NOT INDEXED {USER_JOIN} WHERE {cond} "
-                                    "AND a.paywalled=0", (user_id, *params, *window)).fetchone()["n"]
+                                    "AND a.paywalled=0", (user_id, *block, *window)).fetchone()["n"]
                 # WHERE ist Pflicht vor ON CONFLICT (sonst mehrdeutig für den SQLite-Parser); cond ist nie leer.
                 c.execute(
                     "INSERT INTO user_articles (user_id, article_id, read, updated_at) "
                     f"SELECT ?, a.id, 1, ? FROM articles a NOT INDEXED {USER_JOIN} WHERE {cond} "
                     "ON CONFLICT (user_id, article_id) DO UPDATE SET read=1, updated_at=excluded.updated_at",
-                    (user_id, now, user_id, *params, *window))
+                    (user_id, now, user_id, *block, *window))
             yield visible
 
     def article_counts(self, user_id: int, unread_sources: list[str] | None = None, *,
@@ -1320,6 +1333,13 @@ class Database:
             return
         with self.tx() as c:
             c.execute(f"UPDATE users SET {', '.join(sets)} WHERE id=?", (*fields.values(), user_id))
+
+    def replace_password_hash(self, user_id: int, old: str, new: str) -> bool:
+        """Ersetzt den Passwort-Hash nur, wenn noch `old` gespeichert ist (Umstellung der scrypt-
+        Parameter beim Login); False, wenn ihn inzwischen jemand geändert hat."""
+        with self.tx() as c:
+            return c.execute("UPDATE users SET password_hash=? WHERE id=? AND password_hash=?",
+                             (new, user_id, old)).rowcount == 1
 
     def end_sessions(self, user_id: int) -> None:
         """Beendet alle Sitzungen des Benutzers (Abmelden)."""

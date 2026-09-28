@@ -15,14 +15,19 @@ kiosk.example.org {
 		X-Content-Type-Options nosniff
 		X-Frame-Options DENY
 		Referrer-Policy no-referrer
-		Permissions-Policy "camera=(), microphone=(), geolocation=(), interest-cohort=()"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
 		Cross-Origin-Opener-Policy same-origin
 		# Alles, was die App ausliefert (Schriften, Icons, Manifest, API), lädt nur sie selbst.
 		Cross-Origin-Resource-Policy same-origin
 	}
 	# /docs (Swagger UI) lädt Skripte von einem CDN und nutzt Inline-Skripte, deshalb ohne CSP.
 	@app not path /docs /docs/*
-	header @app Content-Security-Policy "default-src 'self'; img-src * data:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'"
+	# defer: erst beim Schreiben der Antwort setzen, damit sie die schmale CSP der App (Rückfallebene,
+	# nur frame-ancestors u. a.) ersetzt statt als zweite Kopfzeile daneben zu stehen.
+	header @app {
+		Content-Security-Policy "default-src 'self'; img-src * data:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'"
+		defer
+	}
 	log {
 		output discard
 	}

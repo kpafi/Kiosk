@@ -77,11 +77,15 @@ echo "== Code nach $BOX:$DEST"
 # Entwicklungsdateien hoch; die entfernt der Schritt "Besitzer und Rechte".
 DEPLOY_PATHS=(Dockerfile .dockerignore docker-compose.yml requirements.txt app static sources.yaml deploy
               README.md .env.example)
-dirty=$(git status --porcelain --untracked-files=no -- "${DEPLOY_PATHS[@]}")
+# Auch ungetrackte (nicht ignorierte) Dateien zählen: Ein committetes app.js, das ein nie
+# hinzugefügtes Modul importiert, liefe sonst ohne dieses Modul auf die Box.
+dirty=$(git status --porcelain --untracked-files=all -- "${DEPLOY_PATHS[@]}")
 if [ -n "$dirty" ] && [ "${KIOSK_ALLOW_DIRTY:-}" != 1 ]; then
-  echo "Nicht committete Änderungen an deploybaren Dateien; deployt würde nur HEAD:" >&2
+  echo "Nicht committete oder ungetrackte Dateien unter den deploybaren Pfaden (?? = ungetrackt);" >&2
+  echo "deployt würde nur HEAD, ohne sie:" >&2
   printf '%s\n' "$dirty" >&2
-  echo "Erst committen (oder KIOSK_ALLOW_DIRTY=1 setzen, dann geht HEAD ohne diese Änderungen raus)." >&2
+  echo "Erst committen (bzw. löschen oder in .gitignore). KIOSK_ALLOW_DIRTY=1 deployt trotzdem genau HEAD," >&2
+  echo "ohne diese Änderungen und Dateien." >&2
   exit 2
 fi
 stage=$(mktemp -d)

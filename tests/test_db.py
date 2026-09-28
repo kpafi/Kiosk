@@ -876,3 +876,16 @@ def test_read_then_write_waits_for_other_writer(db):
 def test_cutoffs_use_stored_timestamp_format(db):
     db.retention_days = 90
     assert "." not in db.retention_cutoff() and db.retention_cutoff().endswith("+00:00")
+
+
+def test_mark_all_read_with_terms_queries_fts_once(db, monkeypatch):
+    monkeypatch.setattr(db_mod, "MARK_READ_ID_STEP", 2)
+    db.upsert_articles([make_row("alpha", i, ago(hours=i + 1), title=("Wetter" if i % 2 else "Sport") + f" {i}")
+                        for i in range(10)])
+    stmts = []
+    db._conn.set_trace_callback(stmts.append)
+    assert db.mark_all_read(UID, ["alpha"], ["Wett"]) == 5
+    db._conn.set_trace_callback(None)
+    assert sum("MATCH" in s for s in stmts) == 1
+    read = {r["title"] for r in db.q("SELECT a.title FROM user_articles ua JOIN articles a ON a.id = ua.article_id")}
+    assert read == {f"Wetter {i}" for i in range(1, 10, 2)}

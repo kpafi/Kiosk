@@ -894,7 +894,7 @@ def test_refresh_without_fetcher_is_503(authed):
     """KIOSK_DISABLE_FETCHER: kein {"started": true}, auf das nie ein Lauf folgt. 503 (nicht 409:
     das zeigt die Oberfläche als "Läuft bereits" bzw. "Wird im nächsten Lauf geholt")."""
     r = authed.post("/api/refresh")
-    assert r.status_code == 503 and "ausgeschaltet" in r.json()["detail"]
+    assert r.status_code == 503 and r.json()["detail"] == "Der Sammler ist ausgeschaltet"
 
 
 def test_only_fts_syntax_errors_are_bad_search_requests(authed, monkeypatch):
@@ -1011,7 +1011,7 @@ def test_security_headers_on_every_response(client):
         assert "frame-ancestors 'none'" in r.headers["content-security-policy"]
         assert r.headers["cross-origin-resource-policy"] == "same-origin"
         assert r.headers["cross-origin-opener-policy"] == "same-origin"
-        assert "camera=()" in r.headers["permissions-policy"]
+        assert "camera=()" in r.headers["permissions-policy"] and "interest-cohort" not in r.headers["permissions-policy"]
 
 
 def test_range_requests_on_static_files_are_cheap(client):
@@ -1030,3 +1030,86 @@ def test_range_requests_on_static_files_are_cheap(client):
     # Ein einzelner Bereich funktioniert weiter.
     r = client.get("/css/app.css", headers={"Range": "bytes=0-9"})
     assert r.status_code == 206 and len(r.content) == 10
+
+
+def _legacy_user(name="anna", password="anna-passwort-123"):
+    import base64
+    import hashlib
+    import os
+    salt = os.urandom(16)
+    old = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32)
+    return state.db.create_user(
+        name, f"scrypt$16384$8$1${base64.b64encode(salt).decode()}${base64.b64encode(old).decode()}", display_name="Anna")
+
+
+@pytest.mark.login_timing
+def test_login_duration_does_not_depend_on_hash_parameters(client, monkeypatch):
+    """Ein alter Hash (p=1) ist schneller geprüft als der Blindhash unbekannter Namen (p=5): Ohne
+    Mindestdauer verriete die Antwortzeit, welche Namen es gibt."""
+    monkeypatch.setattr(main_mod, "LOGIN_MIN_SECONDS", 0.4)
+    _legacy_user()
+    durations = {}
+    for name in ("anna", "gibt-es-nicht"):
+        t0 = time.monotonic()
+        assert login(client, "falsches-passwort", name).status_code == 401
+        durations[name] = time.monotonic() - t0
+    assert min(durations.values()) >= 0.4, durations
+    t0 = time.monotonic()
+    assert login(client).status_code == 204
+    assert time.monotonic() - t0 >= 0.4
+
+
+def test_rehash_does_not_revert_a_concurrent_password_reset(client, monkeypatch):
+    uid = _legacy_user()
+    real = main_mod.hash_password
+    reset = real("ganz-neues-passwort")
+
+    def rehash_while_admin_resets(password):
+        state.db.update_user(uid, password_hash=reset)     # gleichzeitig: python -m app.users passwd
+        return real(password)
+
+    monkeypatch.setattr(main_mod, "hash_password", rehash_while_admin_resets)
+    assert login(client, "anna-passwort-123", "anna").status_code == 401   # altes Passwort gilt nicht mehr
+    assert state.db.get_user(uid)["password_hash"] == reset
+    monkeypatch.setattr(main_mod, "hash_password", real)
+    assert login(client, "ganz-neues-passwort", "anna").status_code == 204
+
+
+def test_parallel_first_logins_keep_the_first_rehash(client, monkeypatch):
+    """Zwei gleichzeitige erste Logins: Der zweite überschreibt den umgestellten Hash des ersten nicht
+    (sonst endete dessen gerade ausgegebene Sitzung sofort)."""
+    uid = _legacy_user()
+    real = main_mod.hash_password
+    first = real("anna-passwort-123")
+
+    def other_login_was_faster(password):
+        state.db.update_user(uid, password_hash=first)
+        return real(password)
+
+    monkeypatch.setattr(main_mod, "hash_password", other_login_was_faster)
+    assert login(client, "anna-passwort-123", "anna").status_code == 204
+    assert state.db.get_user(uid)["password_hash"] == first
+    assert client.get("/api/me").json()["username"] == "anna"
+
+
+def test_password_reset_revokes_known_device(client):
+    import time as _t
+    assert login(client).status_code == 204
+    admin = state.db.get_user_by_name("admin")
+    state.db.update_user(admin["id"], password_hash=hash_password("neues-admin-passwort"), end_sessions=True)
+    state.auth._global.attempts["*"] = [_t.monotonic()] * state.auth._global.limit
+    assert login(client, "neues-admin-passwort").status_code == 429       # Gerät gilt nicht mehr
+
+
+def test_read_all_invalidates_counters_even_if_it_fails(authed, monkeypatch):
+    calls = []
+    monkeypatch.setattr(main_mod, "invalidate_unread", lambda user_id=None, **kw: calls.append(user_id))
+
+    def steps(*a, **kw):
+        yield 3
+        raise RuntimeError("kaputt")
+
+    monkeypatch.setattr(state.db, "mark_all_read_steps", steps)
+    with pytest.raises(RuntimeError):
+        authed.post("/api/articles/read-all", json={})
+    assert calls

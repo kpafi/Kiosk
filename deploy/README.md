@@ -30,7 +30,8 @@ Gleicher Server wie secure-chat und MailDigest (203.0.113.10, SSH-Alias `kiosk-s
   vorhandener Wert bleibt unverändert. Hochgeladen wird nur, was Build und Betrieb brauchen (Allowlist:
   Dockerfile, .dockerignore, docker-compose.yml, requirements.txt, app/, static/, sources.yaml, deploy/,
   README.md, .env.example), und zwar der committete Stand (`git archive HEAD`); mit nicht committeten
-  Änderungen an diesen Dateien bricht der Deploy ab (`KIOSK_ALLOW_DIRTY=1` deployt trotzdem HEAD).
+  Änderungen oder ungetrackten (nicht ignorierten) Dateien unter diesen Pfaden bricht der Deploy ab und
+  nennt sie (`KIOSK_ALLOW_DIRTY=1` deployt trotzdem genau HEAD, ohne diese Änderungen und Dateien).
   `.env*` auf dem Server wird nie überschrieben oder gelöscht. Reste früherer Deploys (`tests/` usw.)
   löscht der Rechte-Schritt. Steht in der `.env` noch `KIOSK_PASSWORD`, obwohl es schon Benutzer gibt,
   warnt der Deploy am Ende (die Datei ändert er nicht). Ablauf: Code per rsync, Backup-Skript und Cron

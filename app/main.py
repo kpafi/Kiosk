@@ -50,6 +50,9 @@ RUN_MAX = timedelta(hours=3)            # so lange darf ein einzelner Sammellauf
 WATCHDOG_INTERVAL = 60                  # Sekunden zwischen zwei Prüfungen des Wachhunds
 WATCHDOG_EXIT_CODE = 3
 VERIFY_SLOTS = 2                        # gleichzeitige scrypt-Prüfungen beim Login (je ca. 16 MiB)
+# Mindestdauer einer Anmeldung (204/401), etwa das Dreifache einer Prüfung mit den aktuellen
+# scrypt-Parametern (p=5: ca. 150-200 ms), siehe login.
+LOGIN_MIN_SECONDS = 0.5
 MAX_ID = 2**63 - 1                      # größter SQLite-INTEGER; größere Werte ergäben einen 500er
 SECURITY_HEADERS = (
     ("X-Content-Type-Options", "nosniff"),
@@ -58,7 +61,7 @@ SECURITY_HEADERS = (
     ("Content-Security-Policy", "frame-ancestors 'none'; base-uri 'none'; object-src 'none'"),
     ("Cross-Origin-Opener-Policy", "same-origin"),
     ("Cross-Origin-Resource-Policy", "same-origin"),
-    ("Permissions-Policy", "camera=(), microphone=(), geolocation=(), interest-cohort=()"),
+    ("Permissions-Policy", "camera=(), microphone=(), geolocation=()"),
 )
 
 
@@ -299,54 +302,88 @@ class LoginBody(BaseModel):
 
 @app.post("/api/login", status_code=204)
 async def login(body: LoginBody, request: Request):
+    """Anmelden. Antworten mit 204 oder 401 dauern mindestens LOGIN_MIN_SECONDS (per sleep, nicht
+    per CPU): Die Dauer hängt sonst an den scrypt-Parametern des gespeicherten Hashes (ältere mit
+    p=1 sind schneller geprüft als der Blindhash für unbekannte Namen) und verriete, welche
+    Benutzernamen es gibt. 429 kommt sofort (hängt nicht an der Existenz des Namens)."""
+    started = time.monotonic()
     ip = _client_ip(request)
     username = normalize_username(body.username)
     # Ungültige Namen teilen sich einen Zähler (sie können kein Konto treffen); so verdrängen
     # beliebige Fantasienamen die Zähler echter Namen nicht aus der begrenzten Liste.
     limit_key = username or INVALID_NAME_KEY
-    # Bekanntes Gerät (gültiges Device-Cookie für genau diesen Namen): nicht von der globalen
-    # Notbremse und der Bremse je Name betroffen, die ein Angreifer sonst für alle auslösen könnte.
-    device = state.auth.device_id(request.cookies, username)
+    user = state.db.get_user_by_name(username) if username else None
+    # Bekanntes Gerät (gültiges Device-Cookie für genau diesen Namen und dessen aktuellen
+    # Passwort-Hash): nicht von der globalen Notbremse und der Bremse je Name betroffen, die ein
+    # Angreifer sonst für alle auslösen könnte.
+    device = state.auth.device_id(request.cookies, username, user["password_hash"] if user else None)
     # Der Versuch zählt schon vor der Passwortprüfung (atomar mit der Prüfung der Grenzen);
     # ein erfolgreicher Login gibt nur diese Reservierung zurück (die Zähler des Namens verfallen).
     if not state.auth.reserve(ip, limit_key, device):
         raise HTTPException(429, "Zu viele Versuche, bitte später erneut")
-    user = state.db.get_user_by_name(username) if username else None
-    # scrypt im Thread (blockiert sonst die Event-Loop), höchstens zwei gleichzeitig; unbekannte
-    # Namen kosten genauso lange, gesperrte Konten bekommen dieselbe Meldung wie ein falsches Passwort.
-    async with state.verify_slots:
-        if user is None:
-            await asyncio.to_thread(burn_time, body.password)
-            ok = False
-        else:
-            ok = await asyncio.to_thread(verify_password, body.password, user["password_hash"])
-        rehash = None
-        if ok and not user["disabled"] and needs_rehash(user["password_hash"]):
-            # Hash mit älteren scrypt-Parametern (z. B. p=1): mit den aktuellen neu anlegen. Die
-            # Sitzungen des Benutzers auf anderen Geräten enden dabei einmal (ihr Cookie hängt am
-            # Fingerabdruck des Hashes, siehe Auth).
-            rehash = await asyncio.to_thread(hash_password, body.password)
-    if not ok or user["disabled"]:
-        raise HTTPException(401, LOGIN_ERROR)
+    try:
+        user = await _check_login(user, body.password)
+    except HTTPException:
+        await _login_pause(started)
+        raise
     state.auth.clear(ip, limit_key, device)
-    if rehash is not None:
-        state.db.update_user(user["id"], password_hash=rehash, last_login_at=utcnow())
-        user = {**user, "password_hash": rehash}
-        log.info("Passwort-Hash von Benutzer %d auf aktuelle scrypt-Parameter umgestellt", user["id"])
-    else:
-        state.db.update_user(user["id"], last_login_at=utcnow())
+    state.db.update_user(user["id"], last_login_at=utcnow())
     response = Response(status_code=204)
     # Ohne Domain-Attribut; mit Secure gilt das __Host-Präfix.
     response.set_cookie(
         state.auth.cookie_name, state.auth.issue_token(user), max_age=state.auth.max_age,
         httponly=True, samesite="lax", secure=state.auth.cookie_secure, path="/",
     )
-    # Bekanntes Gerät für diesen Namen (neue ID, Laufzeit DEVICE_MAX_AGE); bleibt beim Abmelden.
+    # Bekanntes Gerät für diesen Namen und Passwort-Hash (neue ID, Laufzeit DEVICE_MAX_AGE); bleibt
+    # beim Abmelden, verfällt mit einem neuen Passwort.
     response.set_cookie(
-        state.auth.device_cookie_name, state.auth.issue_device(user["username"]), max_age=DEVICE_MAX_AGE,
-        httponly=True, samesite="lax", secure=state.auth.cookie_secure, path="/",
+        state.auth.device_cookie_name, state.auth.issue_device(user["username"], user["password_hash"]),
+        max_age=DEVICE_MAX_AGE, httponly=True, samesite="lax", secure=state.auth.cookie_secure, path="/",
     )
+    await _login_pause(started)
     return response
+
+
+async def _login_pause(started: float) -> None:
+    left = LOGIN_MIN_SECONDS - (time.monotonic() - started)
+    if left > 0:
+        await asyncio.sleep(left)
+
+
+async def _check_login(user: dict[str, Any] | None, password: str) -> dict[str, Any]:
+    """Prüft das Passwort (scrypt im Thread, höchstens VERIFY_SLOTS gleichzeitig; unbekannte Namen
+    kosten genauso lange, gesperrte Konten bekommen dieselbe Meldung wie ein falsches Passwort) und
+    stellt einen Hash mit älteren scrypt-Parametern um. Gibt den Benutzer mit dem gültigen Hash
+    zurück, sonst 401."""
+    async with state.verify_slots:
+        if user is None:
+            await asyncio.to_thread(burn_time, password)
+            ok = False
+        else:
+            ok = await asyncio.to_thread(verify_password, password, user["password_hash"])
+        rehash = None
+        if ok and not user["disabled"] and needs_rehash(user["password_hash"]):
+            # Hash mit älteren scrypt-Parametern (z. B. p=1): mit den aktuellen neu anlegen. Die
+            # Sitzungen des Benutzers auf anderen Geräten enden dabei einmal (ihr Cookie hängt am
+            # Fingerabdruck des Hashes, siehe Auth), ebenso seine anderen Device-Cookies.
+            rehash = await asyncio.to_thread(hash_password, password)
+    if not ok or user["disabled"]:
+        raise HTTPException(401, LOGIN_ERROR)
+    if rehash is None:
+        return user
+    # Nur ersetzen, wenn noch der geprüfte Hash gespeichert ist: Ein gleichzeitig neu gesetztes
+    # Passwort bleibt, und zwei gleichzeitige erste Logins beenden sich nicht gegenseitig die Sitzung.
+    if state.db.replace_password_hash(user["id"], user["password_hash"], rehash):
+        log.info("Passwort-Hash von Benutzer %d auf aktuelle scrypt-Parameter umgestellt", user["id"])
+        return {**user, "password_hash": rehash}
+    fresh = state.db.get_user(user["id"])
+    if fresh is None or fresh["disabled"]:
+        raise HTTPException(401, LOGIN_ERROR)
+    async with state.verify_slots:
+        ok = await asyncio.to_thread(verify_password, password, fresh["password_hash"])
+    if not ok:
+        raise HTTPException(401, LOGIN_ERROR)
+    return fresh
 
 
 @app.post("/api/logout", status_code=204)
@@ -1074,12 +1111,15 @@ async def read_all(body: ReadAllBody = ReadAllBody(), user: dict = Depends(curre
         if not sources:  # Widerspruch zwischen sources und source: nichts markieren
             return {"marked": 0}
     scope, terms = article_scope(user["id"], sources, set(), body.profile)
-    # Blockweise (je Block eine Transaktion), dazwischen kommen andere Anfragen dran.
+    # Blockweise (je Block eine Transaktion), dazwischen kommen andere Anfragen dran. Die Zähler
+    # verwerfen auch, wenn die Anfrage mittendrin abbricht: Die fertigen Blöcke sind gespeichert.
     marked = 0
-    for n in state.db.mark_all_read_steps(user["id"], scope, terms or None, body.max_id):
-        marked += n
-        await asyncio.sleep(0)
-    invalidate_unread(user["id"])
+    try:
+        for n in state.db.mark_all_read_steps(user["id"], scope, terms or None, body.max_id):
+            marked += n
+            await asyncio.sleep(0)
+    finally:
+        invalidate_unread(user["id"])
     return {"marked": marked}
 
 
@@ -1091,7 +1131,7 @@ async def refresh():
     # {"started": true}, auf das nie ein Lauf folgt. Nicht 409: Das zeigt die Oberfläche als
     # "Läuft bereits" bzw. "Wird im nächsten Lauf geholt", und einen nächsten Lauf gibt es nicht.
     if state.settings.disable_fetcher or state.task is None:
-        raise HTTPException(503, "Der Sammler ist ausgeschaltet (KIOSK_DISABLE_FETCHER)")
+        raise HTTPException(503, "Der Sammler ist ausgeschaltet")
     if not state.fetcher.trigger():
         raise HTTPException(409, "Ein Sammellauf läuft bereits")
     return {"started": True}

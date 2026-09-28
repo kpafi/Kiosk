@@ -304,18 +304,20 @@ def test_limiter_keeps_limited_keys_when_full(settings, monkeypatch):
 
 def test_device_cookie_roundtrip_and_binding(settings):
     a = Auth(settings)
-    token = a.issue_device("anna")
+    token = a.issue_device("anna", "scrypt$alt")
     cookies = {auth_mod.SECURE_DEVICE_COOKIE_NAME: token}
-    dev = a.device_id(cookies, "anna")
+    dev = a.device_id(cookies, "anna", "scrypt$alt")
     assert dev and len(dev) == 32
-    assert a.device_id(cookies, "bert") is None
-    assert a.device_id(cookies, None) is None
-    assert a.device_id({auth_mod.SECURE_DEVICE_COOKIE_NAME: token + "x"}, "anna") is None
-    assert a.device_id({auth_mod.PLAIN_DEVICE_COOKIE_NAME: token}, "anna") is None   # falscher Modus
-    assert Auth(replace(settings, secret="y" * 48)).device_id(cookies, "anna") is None
+    assert a.device_id(cookies, "bert", "scrypt$alt") is None
+    assert a.device_id(cookies, None, None) is None
+    assert a.device_id(cookies, "anna", None) is None                               # unbekannter Name
+    assert a.device_id(cookies, "anna", "scrypt$neu") is None                       # Passwort neu gesetzt
+    assert a.device_id({auth_mod.SECURE_DEVICE_COOKIE_NAME: token + "x"}, "anna", "scrypt$alt") is None
+    assert a.device_id({auth_mod.PLAIN_DEVICE_COOKIE_NAME: token}, "anna", "scrypt$alt") is None   # falscher Modus
+    assert Auth(replace(settings, secret="y" * 48)).device_id(cookies, "anna", "scrypt$alt") is None
     # Session-Signatur und Device-Signatur sind getrennt (eigenes Salt).
     assert a.parse_token(token) is None
-    assert a.issue_device("anna") != token
+    assert a.issue_device("anna", "scrypt$alt") != token
 
 
 def test_known_device_counts_per_device_not_per_user_or_global(settings, monkeypatch):
@@ -324,7 +326,7 @@ def test_known_device_counts_per_device_not_per_user_or_global(settings, monkeyp
     for i in range(3):
         a.note_failure(f"10.0.0.{i}", "x")
     assert a.rate_limited("1.2.3.4", "anna")                 # Notbremse greift für Unbekannte
-    dev = a.device_id({auth_mod.SECURE_DEVICE_COOKIE_NAME: a.issue_device("anna")}, "anna")
+    dev = a.device_id({auth_mod.SECURE_DEVICE_COOKIE_NAME: a.issue_device("anna", "h")}, "anna", "h")
     assert not a.rate_limited("1.2.3.4", "anna", dev)
     for i in range(auth_mod.MAX_DEVICE_ATTEMPTS):
         assert a.reserve(f"10.5.{i}.1", "anna", dev)          # je Versuch andere IP

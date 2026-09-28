@@ -339,13 +339,16 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
   `failed`) und eine CPU-Zeit-Grenze knapp über dem Zeitlimit; stirbt er ohne Ergebnis (Signal, z. B.
   OOM-Killer), zählt das als Versuch nur für diesen Artikel.
 - Vor trafilatura prüft eine lineare Vorprüfung die Seite: höchstens 60 000 Tags außerhalb von
-  script/style/Kommentaren, 250 000 `<` insgesamt und 256 Attribute in einem Tag (echte Seiten, auch
+  script/style/Kommentaren, 100 000 `<` insgesamt und 256 Attribute in einem Tag (Werte in einfachen
+  oder doppelten Anführungszeichen zählen nicht mit; was nicht sauber endet, zählt ab dort wieder) (echte Seiten, auch
   große Live-Blogs von Guardian und FAZ: bis ca. 4 600 Tags). Darüber ist die Seite sofort endgültig
   `failed` (`Seite abgelehnt: …`): trafilatura/lxml brauchen für solche Seiten quadratisch Zeit oder
   Gigabytes Speicher.
 - Leistungsschalter je Quelle: Nach 2 Zeitüberschreitungen bzw. Abstürzen einer Quelle in einem
   Sammellauf werden ihre übrigen Artikel in diesem Lauf nicht mehr versucht (kein Versuch gezählt,
-  bleiben fällig); der nächste Lauf beginnt von vorn.
+  bleiben fällig); der nächste Lauf beginnt von vorn. Geprüft wird auch noch einmal, sobald ein Auftrag
+  seinen Worker-Platz hat. Öffnet jemand einen Artikel einer solchen Quelle (Abruf auf Anforderung),
+  gibt es trotzdem einen Versuch.
 - Ungültige URLs (z. B. kaputte IPv6-Klammer, Port außerhalb des Bereichs, nicht unterstütztes Schema,
   auch in einer Umleitung) sind sofort endgültig `failed`.
 - Bereits gesehene Feed-Einträge (Quelle + GUID) stehen in `seen_guids` und werden nicht erneut angelegt,
@@ -423,11 +426,13 @@ einen Benutzernamen mit 30 falschen Versuchen für 15 Minuten sperren; die höhe
 macht das teurer, ohne Passwort-Raten über viele IPs wirklich zu erleichtern. Bekannte Geräte
 (OWASP „device cookie“): Nach einem erfolgreichen Login bekommt der Browser `__Host-kiosk_device`
 (bzw. `kiosk_device` ohne Secure; HttpOnly, SameSite=Lax, ein Jahr, signiert und an den Benutzernamen
-gebunden, bleibt beim Abmelden). Wer es für diesen Namen vorzeigt, ist von der globalen Notbremse und der
+und seinen Passwort-Hash gebunden, bleibt beim Abmelden; ein neu gesetztes Passwort macht es ungültig). Wer es für diesen Namen vorzeigt, ist von der globalen Notbremse und der
 Grenze je Benutzername ausgenommen (die ein Angreifer sonst für alle auslösen könnte); die Grenze je IP
 gilt weiter, Fehlversuche mit dem Cookie zählen je Gerät (höchstens 10 in 15 Minuten). Ist die Liste der
 Zähler voll (1000), fliegt der Eintrag mit den wenigsten Versuchen, nie ein gesperrter: Erfundene Namen
-können den Zähler eines echten Namens nicht verdrängen.
+können den Zähler eines echten Namens nicht verdrängen. Eine Anmeldung (204 oder 401) dauert mindestens
+0,5 s (gewartet, nicht gerechnet), damit die Antwortzeit nicht verrät, ob es einen Namen gibt (ältere
+Hashes mit p=1 sind schneller geprüft als der Blindhash für unbekannte Namen).
 Mit `KIOSK_COOKIE_SECURE=true` wird nur `__Host-kiosk_session` akzeptiert, sonst nur `kiosk_session`;
 nach einem Umschalten ist also eine neue Anmeldung nötig.
 Schreibende API-Aufrufe mit fremdem `Origin` (bzw. `Sec-Fetch-Site: cross-site`) werden mit 403 abgelehnt.

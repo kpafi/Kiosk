@@ -48,6 +48,15 @@ def day_began_yesterday(request, monkeypatch):
         monkeypatch.setattr(Database, "today_start", lambda self, now=None: ago(days=1))
 
 
+@pytest.fixture(autouse=True)
+def fast_login(request, monkeypatch):
+    """Die Mindestdauer einer Anmeldung (main.LOGIN_MIN_SECONDS, gegen Zeitmessung) kostete jeden Test
+    mit Login eine halbe Sekunde. Tests der Mindestdauer markieren sich mit @pytest.mark.login_timing."""
+    main = sys.modules.get("app.main")
+    if main is not None and request.node.get_closest_marker("login_timing") is None:
+        monkeypatch.setattr(main, "LOGIN_MIN_SECONDS", 0.0)
+
+
 # Benutzer der db-Fixture (Admin "tester", angelegt beim Öffnen der frischen Datenbank).
 UID = 1
 ADMIN_PASSWORD = "geheim-und-lang"

@@ -434,7 +434,7 @@ async def test_child_goes_through_the_guarded_fetch(db, settings, monkeypatch):
     f = make_fetcher(db, settings, server)
     try:
         await f._fetch_all_feeds()
-        assert db.source_states()["alpha"]["last_error"].startswith("TooLarge: Antwort zu groß")
+        assert db.source_states()["alpha"]["last_error"].startswith("Antwort zu groß")
     finally:
         await f.close()
 
@@ -446,7 +446,7 @@ async def test_child_goes_through_the_guarded_fetch(db, settings, monkeypatch):
     f = make_fetcher(db, settings, redirecting)
     try:
         await f._fetch_all_feeds()
-        assert db.source_states()["alpha"]["last_error"].startswith("BlockedURL: Adresse nicht erlaubt: 127.0.0.1")
+        assert db.source_states()["alpha"]["last_error"].startswith("Adresse nicht erlaubt: 127.0.0.1")
     finally:
         await f.close()
 
@@ -462,8 +462,8 @@ async def test_sitemap_parsing_runs_in_worker_with_timeout(db, settings, monkeyp
     f = make_fetcher(db, settings, Server())
     try:
         assert await asyncio.wait_for(f._fetch_all_feeds(), timeout=20) == 0
-        assert db.source_states()["alpha"]["last_error"] == "ExtractTimeout: Sitemap-Parsing Zeitüberschreitung"
-        assert f._pool is None
+        assert db.source_states()["alpha"]["last_error"] == "Sitemap-Parsing: Zeitüberschreitung"
+        assert not f._pids   # hängender Worker-Prozess beendet
     finally:
         await f.close()
 

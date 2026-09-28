@@ -21,7 +21,7 @@ def _loader(user):
 def test_hash_format_and_verify():
     h = hash_password("richtig-langes-passwort")
     scheme, n, r, p, salt, digest = h.split("$")
-    assert (scheme, n, r, p) == ("scrypt", "16384", "8", "1")
+    assert (scheme, n, r, p) == ("scrypt", "16384", "8", "5")   # OWASP: N=2^14, r=8, p=5
     import base64
     assert len(base64.b64decode(salt)) == 16 and len(base64.b64decode(digest)) == 32
     assert verify_password("richtig-langes-passwort", h)
@@ -273,3 +273,110 @@ def test_stale_secret_temp_link_is_removed(tmp_path, monkeypatch):
     assert load_settings().secret == "s" * 64
     assert not own.exists() and not dead.exists() and alive.exists()
     assert os.stat(tmp_path / "secret.key").st_nlink == 1
+
+
+def test_made_up_names_cannot_flush_a_real_counter(settings, monkeypatch):
+    """L1: 1000 erfundene Namen verdrängten früher den Zähler eines echten Namens (ältester flog).
+    Jetzt fliegt der Schlüssel mit den wenigsten Versuchen, nie ein gesperrter."""
+    monkeypatch.setattr(auth_mod, "MAX_TRACKED_KEYS", 10)
+    a = Auth(settings)
+    for i in range(5):
+        a.note_failure(f"10.0.1.{i}", "anna")          # anna: 5 Versuche, als erste eingetragen
+    for i in range(MAX_USER_ATTEMPTS):
+        a.note_failure(f"10.0.2.{i}", "bert")          # bert: gesperrt
+    for i in range(100):
+        a.note_failure(f"10.0.3.{i}", f"erfunden{i}")
+    assert len(a._by_user.attempts) == 10
+    assert len(a._by_user.attempts["anna"]) == 5 and a.rate_limited("9.9.9.9", "bert")
+
+
+def test_limiter_keeps_limited_keys_when_full(settings, monkeypatch):
+    monkeypatch.setattr(auth_mod, "MAX_TRACKED_KEYS", 3)
+    a = Auth(settings)
+    for name in ("x", "y"):
+        for i in range(MAX_USER_ATTEMPTS):
+            a.note_failure(f"10.1.{i}.1", name)
+    for i in range(20):
+        a.note_failure("10.9.9.9", f"n{i}")
+    assert a.rate_limited("1.1.1.1", "x") and a.rate_limited("1.1.1.1", "y")
+    assert len(a._by_user.attempts) == 3
+
+
+def test_device_cookie_roundtrip_and_binding(settings):
+    a = Auth(settings)
+    token = a.issue_device("anna", "scrypt$alt")
+    cookies = {auth_mod.SECURE_DEVICE_COOKIE_NAME: token}
+    dev = a.device_id(cookies, "anna", "scrypt$alt")
+    assert dev and len(dev) == 32
+    assert a.device_id(cookies, "bert", "scrypt$alt") is None
+    assert a.device_id(cookies, None, None) is None
+    assert a.device_id(cookies, "anna", None) is None                               # unbekannter Name
+    assert a.device_id(cookies, "anna", "scrypt$neu") is None                       # Passwort neu gesetzt
+    assert a.device_id({auth_mod.SECURE_DEVICE_COOKIE_NAME: token + "x"}, "anna", "scrypt$alt") is None
+    assert a.device_id({auth_mod.PLAIN_DEVICE_COOKIE_NAME: token}, "anna", "scrypt$alt") is None   # falscher Modus
+    assert Auth(replace(settings, secret="y" * 48)).device_id(cookies, "anna", "scrypt$alt") is None
+    # Session-Signatur und Device-Signatur sind getrennt (eigenes Salt).
+    assert a.parse_token(token) is None
+    assert a.issue_device("anna", "scrypt$alt") != token
+
+
+def test_known_device_counts_per_device_not_per_user_or_global(settings, monkeypatch):
+    monkeypatch.setattr(auth_mod, "GLOBAL_MAX_ATTEMPTS", 3)
+    a = Auth(settings)
+    for i in range(3):
+        a.note_failure(f"10.0.0.{i}", "x")
+    assert a.rate_limited("1.2.3.4", "anna")                 # Notbremse greift für Unbekannte
+    dev = a.device_id({auth_mod.SECURE_DEVICE_COOKIE_NAME: a.issue_device("anna", "h")}, "anna", "h")
+    assert not a.rate_limited("1.2.3.4", "anna", dev)
+    for i in range(auth_mod.MAX_DEVICE_ATTEMPTS):
+        assert a.reserve(f"10.5.{i}.1", "anna", dev)          # je Versuch andere IP
+    assert not a.reserve("10.6.0.1", "anna", dev)             # Grenze je Gerät
+    assert "anna" not in a._by_user.attempts and len(a._global.attempts["*"]) == 3
+    a.clear("10.5.0.1", "anna", dev)
+    assert a.reserve("10.6.0.1", "anna", dev)
+
+
+def test_needs_rehash():
+    assert not auth_mod.needs_rehash(hash_password("richtig-langes-passwort"))
+    assert auth_mod.needs_rehash("scrypt$16384$8$1$AAAAAAAAAAAAAAAAAAAAAA==$" + "A" * 43 + "=")
+    assert auth_mod.needs_rehash("kaputt")
+
+
+def test_legacy_hash_check_costs_as_much_as_a_current_one(monkeypatch):
+    """Prüfung eines alten Hashes (p=1) plus Ausgleich = so viel scrypt-Arbeit wie p=5 (wie der
+    Blindhash für unbekannte Namen), auch wenn die Mindestdauer des Logins überschritten wird."""
+    import base64
+    import hashlib
+    salt = b"s" * 16
+    legacy = "scrypt$16384$8$1$" + base64.b64encode(salt).decode() + "$" + base64.b64encode(
+        hashlib.scrypt(b"pw-alt-und-lang", salt=salt, n=2**14, r=8, p=1, dklen=32)).decode()
+    current = hash_password("pw-neu-und-lang")
+    work = []
+    real = hashlib.scrypt
+
+    def counting(password, *, salt, n, r, p, dklen, maxmem=0):
+        work.append(n * r * p)
+        return real(password, salt=salt, n=n, r=r, p=p, dklen=dklen, maxmem=maxmem)
+
+    monkeypatch.setattr(auth_mod.hashlib, "scrypt", counting)
+    for stored, pw in ((legacy, "pw-alt-und-lang"), (legacy, "falsch"), (current, "falsch"), ("kaputt", "x")):
+        work.clear()
+        auth_mod.verify_password_evenly(pw, stored)
+        assert sum(work) == 2**14 * 8 * auth_mod.SCRYPT_P, stored[:20]
+    assert auth_mod.verify_password_evenly("pw-alt-und-lang", legacy)
+    work.clear()
+    auth_mod.burn_time("egal")
+    assert sum(work) == 2**14 * 8 * auth_mod.SCRYPT_P
+
+
+def test_device_cookie_is_checked_fully_for_unknown_names(settings, monkeypatch):
+    a = Auth(settings)
+    token = a.issue_device("anna", "h")
+    calls = []
+    real = a._device_signer.unsign
+    monkeypatch.setattr(a._device_signer, "unsign", lambda *args, **kw: calls.append(1) or real(*args, **kw))
+    cookies = {auth_mod.SECURE_DEVICE_COOKIE_NAME: token}
+    assert a.device_id(cookies, "gibtsnicht", None) is None
+    assert a.device_id(cookies, None, None) is None
+    assert a.device_id(cookies, "anna", "h")
+    assert len(calls) == 3

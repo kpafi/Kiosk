@@ -21,8 +21,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .auth import (COOKIE_NAMES, INVALID_NAME_KEY, LOGIN_ERROR, Auth, burn_time, ip_key, normalize_username,
-                   verify_password)
+from .auth import (COOKIE_NAMES, DEVICE_MAX_AGE, INVALID_NAME_KEY, LOGIN_ERROR, Auth, burn_time, hash_password,
+                   ip_key, needs_rehash, normalize_username, verify_password, verify_password_evenly)
 from .config import docs_enabled, load_settings
 from .db import Database, QueryTimeout, _iso, utcnow
 from .extract import strip_reading_times
@@ -50,7 +50,19 @@ RUN_MAX = timedelta(hours=3)            # so lange darf ein einzelner Sammellauf
 WATCHDOG_INTERVAL = 60                  # Sekunden zwischen zwei Prüfungen des Wachhunds
 WATCHDOG_EXIT_CODE = 3
 VERIFY_SLOTS = 2                        # gleichzeitige scrypt-Prüfungen beim Login (je ca. 16 MiB)
+# Mindestdauer einer Anmeldung (204/401), etwa das Dreifache einer Prüfung mit den aktuellen
+# scrypt-Parametern (p=5: ca. 150-200 ms), siehe login.
+LOGIN_MIN_SECONDS = 0.5
 MAX_ID = 2**63 - 1                      # größter SQLite-INTEGER; größere Werte ergäben einen 500er
+SECURITY_HEADERS = (
+    ("X-Content-Type-Options", "nosniff"),
+    ("X-Frame-Options", "DENY"),
+    ("Referrer-Policy", "no-referrer"),
+    ("Content-Security-Policy", "frame-ancestors 'none'; base-uri 'none'; object-src 'none'"),
+    ("Cross-Origin-Opener-Policy", "same-origin"),
+    ("Cross-Origin-Resource-Policy", "same-origin"),
+    ("Permissions-Policy", "camera=(), microphone=(), geolocation=()"),
+)
 
 
 @asynccontextmanager
@@ -196,16 +208,25 @@ async def require_login(request: Request, call_next):
     # Leseabfragen während einer API-Anfrage bekommen eine Frist (db.READ_TIME_LIMIT); eine Aufgabe,
     # die hier gestartet wird, erbt sie (Fetcher._spawn setzt sie für Extraktionen zurück).
     if not path.startswith("/api/"):
-        return await _require_login(request, call_next, path)
+        return _secured(await _require_login(request, call_next, path))
     token = db_mod.request_time_limit.set(db_mod.READ_TIME_LIMIT)
     try:
-        return await _require_login(request, call_next, path)
+        return _secured(await _require_login(request, call_next, path))
     except QueryTimeout as exc:
         # Aus der Middleware selbst (z. B. Benutzer laden): Die Exception-Handler der App greifen
         # erst hinter call_next, ohne dies würde es ein 500.
-        return await query_timeout(request, exc)
+        return _secured(await query_timeout(request, exc))
     finally:
         db_mod.request_time_limit.reset(token)
+
+
+def _secured(response):
+    """Sicherheits-Kopfzeilen auch ohne Caddy (Verteidigung in der Tiefe; Caddy setzt dieselben und die
+    vollständige CSP, siehe deploy/Caddyfile.kiosk). Die CSP hier schränkt keine Skripte ein (/docs
+    lädt sie vom CDN), sie verbietet nur das Einbetten."""
+    for name, value in SECURITY_HEADERS:
+        response.headers.setdefault(name, value)
+    return response
 
 
 async def _require_login(request: Request, call_next, path: str):
@@ -250,6 +271,30 @@ class HeadAsGet:
 app.add_middleware(HeadAsGet)
 
 
+MAX_RANGES = 8     # Bereiche in einer Range-Kopfzeile, darüber wird sie ignoriert (ganze Datei, 200)
+
+
+class LimitRange:
+    """Range-Kopfzeilen mit vielen Bereichen verwerfen (die Antwort ist dann die ganze Datei).
+    Starlette fasst Bereiche paarweise zusammen: ca. 8 000 getrennte Bereiche in einer Kopfzeile
+    (80 KB, so viel lässt uvicorn zu) kosten auch mit 0.49 noch Sekunden auf dem einen Worker; die
+    quadratische Auswertung der Kopfzeile selbst (CVE-2025-62727) behebt Starlette >= 0.49.1. Caddy
+    entfernt Range ohnehin (deploy/Caddyfile.kiosk); das hier gilt auch ohne Caddy."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            headers = scope.get("headers") or []
+            if any(k == b"range" and v.count(b",") >= MAX_RANGES for k, v in headers):
+                scope = {**scope, "headers": [(k, v) for k, v in headers if k not in (b"range", b"if-range")]}
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(LimitRange)
+
+
 class LoginBody(BaseModel):
     username: str = Field(min_length=1, max_length=100)
     password: str = Field(min_length=1, max_length=500)
@@ -257,27 +302,31 @@ class LoginBody(BaseModel):
 
 @app.post("/api/login", status_code=204)
 async def login(body: LoginBody, request: Request):
+    """Anmelden. Antworten mit 204 oder 401 dauern mindestens LOGIN_MIN_SECONDS (per sleep, nicht
+    per CPU): Die Dauer hängt sonst an den scrypt-Parametern des gespeicherten Hashes (ältere mit
+    p=1 sind schneller geprüft als der Blindhash für unbekannte Namen) und verriete, welche
+    Benutzernamen es gibt. 429 kommt sofort (hängt nicht an der Existenz des Namens)."""
+    started = time.monotonic()
     ip = _client_ip(request)
     username = normalize_username(body.username)
     # Ungültige Namen teilen sich einen Zähler (sie können kein Konto treffen); so verdrängen
     # beliebige Fantasienamen die Zähler echter Namen nicht aus der begrenzten Liste.
     limit_key = username or INVALID_NAME_KEY
+    user = state.db.get_user_by_name(username) if username else None
+    # Bekanntes Gerät (gültiges Device-Cookie für genau diesen Namen und dessen aktuellen
+    # Passwort-Hash): nicht von der globalen Notbremse und der Bremse je Name betroffen, die ein
+    # Angreifer sonst für alle auslösen könnte.
+    device = state.auth.device_id(request.cookies, username, user["password_hash"] if user else None)
     # Der Versuch zählt schon vor der Passwortprüfung (atomar mit der Prüfung der Grenzen);
     # ein erfolgreicher Login gibt nur diese Reservierung zurück (die Zähler des Namens verfallen).
-    if not state.auth.reserve(ip, limit_key):
+    if not state.auth.reserve(ip, limit_key, device):
         raise HTTPException(429, "Zu viele Versuche, bitte später erneut")
-    user = state.db.get_user_by_name(username) if username else None
-    # scrypt im Thread (blockiert sonst die Event-Loop), höchstens zwei gleichzeitig; unbekannte
-    # Namen kosten genauso lange, gesperrte Konten bekommen dieselbe Meldung wie ein falsches Passwort.
-    async with state.verify_slots:
-        if user is None:
-            await asyncio.to_thread(burn_time, body.password)
-            ok = False
-        else:
-            ok = await asyncio.to_thread(verify_password, body.password, user["password_hash"])
-    if not ok or user["disabled"]:
-        raise HTTPException(401, LOGIN_ERROR)
-    state.auth.clear(ip, limit_key)
+    try:
+        user = await _check_login(user, body.password)
+    except HTTPException:
+        await _login_pause(started)
+        raise
+    state.auth.clear(ip, limit_key, device)
     state.db.update_user(user["id"], last_login_at=utcnow())
     response = Response(status_code=204)
     # Ohne Domain-Attribut; mit Secure gilt das __Host-Präfix.
@@ -285,7 +334,56 @@ async def login(body: LoginBody, request: Request):
         state.auth.cookie_name, state.auth.issue_token(user), max_age=state.auth.max_age,
         httponly=True, samesite="lax", secure=state.auth.cookie_secure, path="/",
     )
+    # Bekanntes Gerät für diesen Namen und Passwort-Hash (neue ID, Laufzeit DEVICE_MAX_AGE); bleibt
+    # beim Abmelden, verfällt mit einem neuen Passwort.
+    response.set_cookie(
+        state.auth.device_cookie_name, state.auth.issue_device(user["username"], user["password_hash"]),
+        max_age=DEVICE_MAX_AGE, httponly=True, samesite="lax", secure=state.auth.cookie_secure, path="/",
+    )
+    await _login_pause(started)
     return response
+
+
+async def _login_pause(started: float) -> None:
+    left = LOGIN_MIN_SECONDS - (time.monotonic() - started)
+    if left > 0:
+        await asyncio.sleep(left)
+
+
+async def _check_login(user: dict[str, Any] | None, password: str) -> dict[str, Any]:
+    """Prüft das Passwort (scrypt im Thread, höchstens VERIFY_SLOTS gleichzeitig; unbekannte Namen
+    kosten genauso lange, gesperrte Konten bekommen dieselbe Meldung wie ein falsches Passwort) und
+    stellt einen Hash mit älteren scrypt-Parametern um. Gibt den Benutzer mit dem gültigen Hash
+    zurück, sonst 401."""
+    async with state.verify_slots:
+        if user is None:
+            await asyncio.to_thread(burn_time, password)
+            ok = False
+        else:
+            ok = await asyncio.to_thread(verify_password_evenly, password, user["password_hash"])
+        rehash = None
+        if ok and not user["disabled"] and needs_rehash(user["password_hash"]):
+            # Hash mit älteren scrypt-Parametern (z. B. p=1): mit den aktuellen neu anlegen. Die
+            # Sitzungen des Benutzers auf anderen Geräten enden dabei einmal (ihr Cookie hängt am
+            # Fingerabdruck des Hashes, siehe Auth), ebenso seine anderen Device-Cookies.
+            rehash = await asyncio.to_thread(hash_password, password)
+    if not ok or user["disabled"]:
+        raise HTTPException(401, LOGIN_ERROR)
+    if rehash is None:
+        return user
+    # Nur ersetzen, wenn noch der geprüfte Hash gespeichert ist: Ein gleichzeitig neu gesetztes
+    # Passwort bleibt, und zwei gleichzeitige erste Logins beenden sich nicht gegenseitig die Sitzung.
+    if state.db.replace_password_hash(user["id"], user["password_hash"], rehash):
+        log.info("Passwort-Hash von Benutzer %d auf aktuelle scrypt-Parameter umgestellt", user["id"])
+        return {**user, "password_hash": rehash}
+    fresh = state.db.get_user(user["id"])
+    if fresh is None or fresh["disabled"]:
+        raise HTTPException(401, LOGIN_ERROR)
+    async with state.verify_slots:
+        ok = await asyncio.to_thread(verify_password, password, fresh["password_hash"])
+    if not ok:
+        raise HTTPException(401, LOGIN_ERROR)
+    return fresh
 
 
 @app.post("/api/logout", status_code=204)
@@ -517,7 +615,7 @@ async def list_articles(
 ):
     filters = _filters(user["id"], source, country, profile, unread=unread, starred=starred, later=later,
                        free=free, days=days)
-    cursor = None if q else _parse_cursor(before)
+    cursor = None if q else _parse_cursor(before, user["id"])
     # Wasserstand vor der Abfrage lesen: Die Oberfläche schickt ihn an read-all, damit später
     # geholte Artikel nicht ungesehen als gelesen gelten.
     max_id = state.db.max_article_id()
@@ -531,7 +629,9 @@ async def list_articles(
             raise HTTPException(503, "Die Suche dauert zu lange, bitte genauer suchen") from e
         raise
     except sqlite3.OperationalError as e:
-        if q:
+        # Nur Syntaxfehler der FTS5-Abfrage sind ein Fehler der Anfrage; alles andere (z. B.
+        # "database is locked") ist einer des Servers und darf nicht als 400 durchgehen.
+        if q and _fts_syntax_error(e):
             raise HTTPException(400, "Ungültige Suchanfrage") from e
         raise
     items = [_decorate(dict(r)) for r in rows]
@@ -545,6 +645,15 @@ async def list_articles(
             "max_id": max_id}
 
 
+# Meldungen von SQLite zu einer ungültigen FTS5-Abfrage (MATCH), im Unterschied zu Betriebsfehlern.
+_FTS_ERROR_RE = re.compile(r"fts5|syntax error|unterminated string|unknown special query|no such column",
+                           re.IGNORECASE)
+
+
+def _fts_syntax_error(e: sqlite3.OperationalError) -> bool:
+    return bool(_FTS_ERROR_RE.search(str(e)))
+
+
 @app.get("/api/articles/{article_id}/next")
 async def next_article(
     article_id: int = PathParam(ge=1, le=MAX_ID),
@@ -554,8 +663,10 @@ async def next_article(
     free: bool | None = None, days: int | None = Query(None, ge=1, le=3650),
     user: dict = Depends(current_user),
 ):
-    """Nächster älterer Artikel im selben Filterkontext wie die Liste (Keyset ab dem aktuellen)."""
-    published = state.db.published_at_of(article_id)
+    """Nächster älterer Artikel im selben Filterkontext wie die Liste (Keyset ab dem aktuellen).
+    Einen Artikel, den der Benutzer nicht sehen darf (hinter der Aufbewahrungsgrenze, nur von
+    anderen gemerkt), gibt es hier so wenig wie in GET /api/articles/{id}."""
+    published = state.db.published_at_of(article_id, user["id"])
     if published is None:
         raise HTTPException(404, "Artikel nicht gefunden")
     filters = _filters(user["id"], source, country, profile, unread=unread, starred=starred, later=later,
@@ -567,8 +678,9 @@ async def next_article(
 _ASCII_INT = re.compile(r"[0-9]+")
 
 
-def _parse_cursor(raw: str | None) -> tuple[str, int] | None:
-    """Cursor "<published_at>|<id>"; eine reine Zahl (altes Format) gilt als Artikel-ID.
+def _parse_cursor(raw: str | None, user_id: int) -> tuple[str, int] | None:
+    """Cursor "<published_at>|<id>"; eine reine Zahl (altes Format) gilt als Artikel-ID, die der
+    Benutzer sehen dürfen muss (sonst wie eine unbekannte ID).
 
     Nur ASCII-Ziffern (str.isdigit() ließe z. B. "²" durch, int() scheitert dann). Der Zeitpunkt
     wird geprüft und in das gespeicherte Format (UTC, isoformat) gebracht.
@@ -579,7 +691,7 @@ def _parse_cursor(raw: str | None) -> tuple[str, int] | None:
     if _ASCII_INT.fullmatch(raw):
         if int(raw) > MAX_ID:
             raise HTTPException(400, "Ungültiger Cursor")
-        published = state.db.published_at_of(int(raw))
+        published = state.db.published_at_of(int(raw), user_id)
         if published is None:
             raise HTTPException(400, "Unbekannter Cursor")
         return published, int(raw)
@@ -598,8 +710,23 @@ def _parse_cursor(raw: str | None) -> tuple[str, int] | None:
     return published, int(id_part)
 
 
+def _from_own_script(request: Request) -> bool:
+    """False, wenn der Browser sagt, dass die Anfrage nicht von fetch() der eigenen Seite kommt:
+    ein Bild, Frame oder Skript (Sec-Fetch-Dest ungleich "empty") oder eine fremde Herkunft
+    (Sec-Fetch-Site "cross-site" / "same-site"). Ohne diese Kopfzeilen (curl, ältere Browser) True.
+
+    Gespeicherte Artikel dürfen Bilder von beliebigen Adressen einbinden, auch
+    <img src="https://<kiosk>/api/articles/5?retry=true"> (same-origin, mit Cookie): Ein GET soll
+    dann nichts anstoßen, nur lesen."""
+    dest = request.headers.get("sec-fetch-dest")
+    site = request.headers.get("sec-fetch-site")
+    if dest is not None and dest.lower() != "empty":
+        return False
+    return site is None or site.lower() in ("same-origin", "none")
+
+
 @app.get("/api/articles/{article_id}")
-async def get_article(article_id: int = PathParam(ge=1, le=MAX_ID), retry: bool = False,
+async def get_article(request: Request, article_id: int = PathParam(ge=1, le=MAX_ID), retry: bool = False,
                       user: dict = Depends(current_user)):
     row = state.db.get_article(article_id, user["id"])
     if not row:
@@ -613,8 +740,10 @@ async def get_article(article_id: int = PathParam(ge=1, le=MAX_ID), retry: bool 
     due = row["next_attempt_at"] is None or row["next_attempt_at"] <= utcnow()
     forced = retry and row["text_status"] in ("failed", "empty", "partial")
     extracting = state.fetcher.is_extracting(article_id)
-    if not extracting and ((row["text_status"] == "pending" and due) or forced):
-        extracting = state.fetcher.start_extraction(article_id, row["url"], retry=forced)
+    # Als Bild, Frame o. Ä. eingebunden oder von fremder Seite (siehe _from_own_script): nur lesen.
+    may_start = _from_own_script(request)
+    if may_start and not extracting and ((row["text_status"] == "pending" and due) or forced):
+        extracting = state.fetcher.start_extraction(article_id, row["url"], retry=forced, source=row["source_id"])
     item = _decorate(dict(row))
     item["extracting"] = extracting
     if extracting:
@@ -982,8 +1111,15 @@ async def read_all(body: ReadAllBody = ReadAllBody(), user: dict = Depends(curre
         if not sources:  # Widerspruch zwischen sources und source: nichts markieren
             return {"marked": 0}
     scope, terms = article_scope(user["id"], sources, set(), body.profile)
-    marked = state.db.mark_all_read(user["id"], scope, terms or None, body.max_id)
-    invalidate_unread(user["id"])
+    # Blockweise (je Block eine Transaktion), dazwischen kommen andere Anfragen dran. Die Zähler
+    # verwerfen auch, wenn die Anfrage mittendrin abbricht: Die fertigen Blöcke sind gespeichert.
+    marked = 0
+    try:
+        for n in state.db.mark_all_read_steps(user["id"], scope, terms or None, body.max_id):
+            marked += n
+            await asyncio.sleep(0)
+    finally:
+        invalidate_unread(user["id"])
     return {"marked": marked}
 
 
@@ -991,6 +1127,11 @@ async def read_all(body: ReadAllBody = ReadAllBody(), user: dict = Depends(curre
 
 @app.post("/api/refresh", dependencies=[Depends(admin_user)])
 async def refresh():
+    # Ohne Sammler-Schleife (KIOSK_DISABLE_FETCHER) weckt trigger() niemanden: 503 statt eines
+    # {"started": true}, auf das nie ein Lauf folgt. Nicht 409: Das zeigt die Oberfläche als
+    # "Läuft bereits" bzw. "Wird im nächsten Lauf geholt", und einen nächsten Lauf gibt es nicht.
+    if state.settings.disable_fetcher or state.task is None:
+        raise HTTPException(503, "Der Sammler ist ausgeschaltet")
     if not state.fetcher.trigger():
         raise HTTPException(409, "Ein Sammellauf läuft bereits")
     return {"started": True}

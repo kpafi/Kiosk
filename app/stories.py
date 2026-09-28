@@ -49,6 +49,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
+from .db import _iso   # Zeitpunkte im Format von published_at (UTC, ohne Mikrosekunden)
+
 log = logging.getLogger("kiosk.stories")
 
 # ---- Parameter ------------------------------------------------------------------
@@ -2082,7 +2084,7 @@ async def _refresh(db: Any, catalog: Any, now: datetime | None) -> dict[str, Any
     """Ein Lauf von refresh (ohne die Sperre)."""
     global _model
     started = time.monotonic()
-    since = ((now or datetime.now(timezone.utc)) - WINDOW).isoformat()
+    since = _iso((now or datetime.now(timezone.utc)) - WINDOW)
     rows = [dict(r) for r in db.story_window(since, BODY_CHARS, BODY_IF_SUMMARY_BELOW)]
     langs = {s.id: s.lang for s in catalog.all()}
     for r in rows:
@@ -2291,7 +2293,7 @@ def topic_ids(db: Any, row: dict[str, Any], exclude: set[int], limit: int = TOPI
     if len(_best_per_story(model, scored, want)) < limit:
         query = _fts_topic_query(model, row)
         if query:
-            since = (datetime.now(timezone.utc) - timedelta(days=RELATED_DAYS)).isoformat()
+            since = _iso(datetime.now(timezone.utc) - timedelta(days=RELATED_DAYS))
             known = {aid for _, aid, _ in scored}
             own = copy_key(row)
             fts = (db.topic_candidates(query, since, limit=4 * want) if time_limit is None

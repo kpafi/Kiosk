@@ -6,6 +6,8 @@ import ipaddress
 import socket
 from urllib.parse import urlparse
 
+import httpcore
+
 BLOCKED_HOSTNAMES = {"localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"}
 METADATA_IP = ipaddress.ip_address("169.254.169.254")
 # Nur die Standard-Ports: Feeds und Artikel liegen dort; andere Ports öffentlicher Hosts (Admin-
@@ -75,7 +77,7 @@ async def check_url(url: str) -> None:
     try:
         infos = await loop.getaddrinfo(host, DEFAULT_PORTS[parsed.scheme], type=socket.SOCK_STREAM)
     except socket.gaierror as e:
-        raise ResolveError(f"Name nicht auflösbar: {host} ({e})") from e
+        raise ResolveError(f"Name nicht auflösbar: {host}") from e
     if not infos:
         raise ResolveError(f"Name nicht auflösbar: {host}")
     for info in infos:
@@ -98,3 +100,61 @@ def server_addr_blocked(server_addr: object) -> bool:
         return ip_is_blocked(server_addr[0].split("%", 1)[0])
     except ValueError:
         return True
+
+
+class GuardedBackend(httpcore.AsyncNetworkBackend):
+    """Netzwerk-Backend für httpcore gegen DNS-Rebinding: löst den Namen beim Verbindungsaufbau selbst
+    auf, verwirft die Verbindung, wenn eine der Adressen nicht erlaubt ist (wie check_url), und verbindet
+    sich mit genau der geprüften Adresse. Ohne das prüfte check_url eine Auflösung und httpx verband sich
+    nach einer zweiten, die ein feindlicher DNS-Server anders beantworten kann (die Anfrage war dann
+    schon gesendet, bevor die Prüfung der Gegenstelle griff). Hostname für SNI, Zertifikatsprüfung und
+    Host-Kopfzeile bleiben unverändert (httpcore übergibt sie getrennt)."""
+
+    def __init__(self, inner: httpcore.AsyncNetworkBackend | None = None):
+        self._inner = inner or httpcore.AnyIOBackend()
+
+    async def connect_tcp(self, host: str, port: int, timeout: float | None = None,
+                          local_address: str | None = None, socket_options=None):
+        last: Exception | None = None
+        for ip in await _allowed_addresses(host, port):
+            try:
+                return await self._inner.connect_tcp(ip, port, timeout=timeout, local_address=local_address,
+                                                     socket_options=socket_options)
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as e:
+                last = e      # nächste geprüfte Adresse (z. B. IPv4 nach IPv6)
+        assert last is not None
+        raise last
+
+    async def connect_unix_socket(self, path: str, timeout: float | None = None, socket_options=None):
+        raise BlockedURL("Unix-Sockets sind nicht erlaubt")
+
+    async def sleep(self, seconds: float) -> None:
+        await self._inner.sleep(seconds)
+
+
+async def _allowed_addresses(host: str, port: int) -> list[str]:
+    """Alle Adressen des Namens, wenn keine davon gesperrt ist (sonst BlockedURL), in der Reihenfolge
+    von getaddrinfo, ohne Doppelte."""
+    host = host.rstrip(".").lower()
+    try:
+        literal = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        literal = None
+    if literal is not None:
+        if ip_is_blocked(literal):
+            raise BlockedURL(f"Verbindung zu nicht erlaubter Adresse: {literal}")
+        return [str(literal)]
+    if host in BLOCKED_HOSTNAMES or host.endswith(".localhost"):
+        raise BlockedURL(f"Host nicht erlaubt: {host}")
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise ResolveError(f"Name nicht auflösbar: {host}") from e
+    ips = list(dict.fromkeys(info[4][0].split("%", 1)[0] for info in infos))
+    if not ips:
+        raise ResolveError(f"Name nicht auflösbar: {host}")
+    for ip in ips:
+        if ip_is_blocked(ip):
+            raise BlockedURL(f"Verbindung zu nicht erlaubter Adresse: {host} -> {ip}")
+    return ips

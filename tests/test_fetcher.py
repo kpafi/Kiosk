@@ -5,6 +5,7 @@ import asyncio
 import socket
 import threading
 import time
+import zlib
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -138,7 +139,7 @@ def test_migration_v5_clears_placeholders(tmp_path):
         rows = {r["guid"]: (r["summary"], r["author"]) for r in d.q("SELECT guid, summary, author FROM articles")}
         assert rows == {"alpha-1": ("", None), "alpha-2": ("", None), "alpha-3": ("Nonetheless", "Anna")}
         idx = {r["name"] for r in d.q("PRAGMA index_list(articles)")}
-        assert "idx_articles_read_paywalled_source" not in idx and "idx_articles_published" in idx
+        assert "idx_articles_read_paywalled_source" not in idx and "idx_articles_list" in idx and "idx_articles_published" not in idx
         d.close()
 
 
@@ -201,7 +202,7 @@ async def test_small_feed_image_is_replaced_by_page_image(db, settings, monkeypa
     aid = db.one("SELECT id FROM articles")["id"]
     f = make_fetcher(db, settings, lambda r: httpx.Response(200, headers={"content-type": "text/html"}, content=b"<p>x</p>"))
 
-    async def fake_extract(page, url):
+    async def fake_extract(page, url, skip=None):
         return extract_mod.Extraction("full", "<p>Text</p>", "Text", 4, False, page_image, None)
 
     monkeypatch.setattr(f, "_run_extract", fake_extract)
@@ -216,7 +217,7 @@ async def test_page_image_does_not_replace_image_of_already_extracted_article(db
     db.store_extraction(aid, status="full", body_html="<p>alt</p>", body_text="alt", body_len=3, paywalled=False)
     f = make_fetcher(db, settings, lambda r: httpx.Response(200, headers={"content-type": "text/html"}, content=b"<p>x</p>"))
 
-    async def fake_extract(page, url):
+    async def fake_extract(page, url, skip=None):
         return extract_mod.Extraction("full", "<p>Text</p>", "Text", 4, False, "https://i.example/gross.jpg", None)
 
     monkeypatch.setattr(f, "_run_extract", fake_extract)
@@ -263,7 +264,7 @@ async def test_dns_error_is_transient(db, settings, monkeypatch):
     await f.extract_article(aid, "https://news.example/artikel")
     row = db.get_article(aid)
     assert row["text_status"] == "pending" and row["attempts"] == 1
-    assert "ResolveError" in row["text_error"]
+    assert row["text_error"].startswith("Name nicht auflösbar")
 
 
 @pytest.mark.parametrize("url,handler_exc", [
@@ -589,7 +590,7 @@ ARTICLE_HTML = ("<html><head><title>T</title></head><body><article><h1>Titel</h1
                 + "</article></body></html>")
 
 
-async def test_hung_extraction_times_out_and_pool_is_recreated(db, settings, monkeypatch):
+async def test_hung_extraction_times_out_and_only_its_process_is_killed(db, settings, monkeypatch):
     import uuid
     token = uuid.uuid4().hex
     pidfile = _pidfile(token)
@@ -600,13 +601,11 @@ async def test_hung_extraction_times_out_and_pool_is_recreated(db, settings, mon
         200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
     try:
         monkeypatch.setattr(fetcher_mod, "extract", _sleepy_extract)
-        old_pool = f._extraction_pool()
         # Der Sammellauf kommt nach dem Zeitlimit weiter, statt 60 s zu hängen.
         assert await asyncio.wait_for(f._extract_pending(), timeout=15) == 1
         row = db.get_article(first)
         assert row["text_status"] == "pending" and row["attempts"] == 1
-        assert row["text_error"] == "Extraktion Zeitüberschreitung"
-        assert f._pool is None  # verworfen, wird beim nächsten Auftrag neu angelegt
+        assert row["text_error"] == "Extraktion: Zeitüberschreitung"
         pid = int(pidfile.read_text())
         pidfile.unlink()
         for _ in range(50):
@@ -614,45 +613,60 @@ async def test_hung_extraction_times_out_and_pool_is_recreated(db, settings, mon
                 break
             await asyncio.sleep(0.1)
         assert _gone_or_zombie(pid), "hängender Worker wurde nicht beendet"
+        assert not f._pids
 
-        # Zweite Extraktion mit neuem Pool funktioniert.
+        # Die nächste Extraktion bekommt ihren eigenen Prozess und funktioniert.
         monkeypatch.setattr(fetcher_mod, "extract", extract_mod.extract)
         db.upsert_articles([make_row("alpha", 2, ago(minutes=5), url=f"{PUBLIC}/a/2")])
         second = db.one("SELECT id FROM articles WHERE guid='alpha-2'")["id"]
         await asyncio.wait_for(f.extract_article(second, f"{PUBLIC}/a/2"), timeout=30)
-        assert f._pool is not None and f._pool is not old_pool
         assert db.get_article(second)["text_status"] in ("full", "partial")
     finally:
         await f.close()
-    assert f._pool is None
 
 
-async def test_broken_pool_is_transient_and_replaced(db, settings, monkeypatch):
-    from concurrent.futures.process import BrokenProcessPool
+def _crashing_extract(page, url):
+    """Läuft im Worker-Prozess: stirbt ohne Ergebnis (wie nach SIGKILL durch den OOM-Killer)."""
+    import os
+    import signal
+    os.kill(os.getpid(), signal.SIGKILL)
+
+
+def _hungry_extract(page, url):
+    """Läuft im Worker-Prozess: will weit mehr Speicher als JOB_MEMORY_LIMIT."""
+    return bytearray(2 * 1024 ** 3)
+
+
+async def test_crashed_worker_counts_one_attempt(db, settings, monkeypatch):
     aid = _article(db)
     f = make_fetcher(db, settings, lambda r: httpx.Response(
         200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
-
-    class Broken:
-        def submit(self, *a, **kw):
-            raise BrokenProcessPool("Worker gestorben")
-
-        def shutdown(self, **kw):
-            pass
-
-    # Erster Absturz: Schuld unbekannt (z. B. ein feindlicher Feed im selben Pool), ohne Zählung
-    # sofort wieder fällig.
-    f._pool = Broken()
-    await f.extract_article(aid, f"{PUBLIC}/artikel")
+    monkeypatch.setattr(fetcher_mod, "extract", _crashing_extract)
+    try:
+        await asyncio.wait_for(f.extract_article(aid, f"{PUBLIC}/artikel"), timeout=30)
+    finally:
+        await f.close()
     row = db.get_article(aid)
-    assert row["text_status"] == "pending" and row["attempts"] == 0 and row["next_attempt_at"] is None
-    assert "Worker gestorben" in row["text_error"] and f._pool is None
-    # Zweiter Absturz mit demselben Artikel: zählt als Versuch.
-    f._pool = Broken()
-    await f.extract_article(aid, f"{PUBLIC}/artikel")
-    row = db.get_article(aid)
-    assert row["text_status"] == "pending" and row["attempts"] == 1 and "abgebrochen" in row["text_error"]
-    assert f._pool is None and aid not in f._crash_suspects
+    # Der Absturz gehört eindeutig zu diesem Auftrag (eigener Prozess): ein Versuch, später erneut.
+    assert row["text_status"] == "pending" and row["attempts"] == 1
+    assert "Worker-Prozess beendet" in row["text_error"]
+
+
+async def test_memory_limit_fails_only_that_job(db, settings, monkeypatch):
+    aid = _article(db)
+    f = make_fetcher(db, settings, lambda r: httpx.Response(
+        200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
+    monkeypatch.setattr(fetcher_mod, "extract", _hungry_extract)
+    try:
+        await asyncio.wait_for(f.extract_article(aid, f"{PUBLIC}/artikel"), timeout=30)
+        row = db.get_article(aid)
+        assert row["text_status"] == "failed" and "zu viel Speicher" in row["text_error"]
+        # Der nächste Auftrag läuft normal.
+        monkeypatch.setattr(fetcher_mod, "extract", extract_mod.extract)
+        result = await f._run_extract(ARTICLE_HTML.encode(), f"{PUBLIC}/x")
+        assert result.status in ("full", "partial")
+    finally:
+        await f.close()
 
 
 def _timed_extract(page, url):
@@ -670,20 +684,18 @@ async def test_timeout_measures_run_time_not_queue_time(db, settings, monkeypatc
     f = make_fetcher(db, settings, lambda r: httpx.Response(200))
     try:
         page = ARTICLE_HTML.encode()
-        await asyncio.gather(*(f._run_extract(page, f"{PUBLIC}/d/0") for _ in range(2)))  # Pool warm
-        pool = f._pool
+        await asyncio.gather(*(f._run_extract(page, f"{PUBLIC}/d/0") for _ in range(2)))  # Forkserver warm
         results = await asyncio.wait_for(
             asyncio.gather(*(f._run_extract(page, f"{PUBLIC}/d/0.8") for _ in range(6))), timeout=30)
         assert len(results) == 6 and all(r.status in ("full", "partial") for r in results)
-        assert f._pool is pool  # nie verworfen
     finally:
         await f.close()
 
 
-async def test_hung_job_only_counts_for_itself(db, settings, monkeypatch):
-    """Ein hängender Auftrag: nur er zählt einen Versuch; der laufende Nachbar wird ohne Zählung
-    neu eingeplant (auch als Abruf auf Anforderung ohne CancelledError), wartende laufen danach."""
-    monkeypatch.setattr(fetcher_mod, "EXTRACT_TIMEOUT", 2)
+async def test_hung_job_does_not_touch_its_neighbours(db, settings, monkeypatch):
+    """Ein hängender Auftrag: nur er zählt einen Versuch; der gleichzeitig laufende Nachbar (hier ein
+    Abruf auf Anforderung) und die wartenden laufen ungestört zu Ende (je Auftrag ein Prozess)."""
+    monkeypatch.setattr(fetcher_mod, "EXTRACT_TIMEOUT", 3)   # Luft: jeder Worker importiert das Testmodul neu
     monkeypatch.setattr(fetcher_mod, "extract", _timed_extract)
     urls = {"hung": f"{PUBLIC}/d/60", "nb": f"{PUBLIC}/d/1.6", "w1": f"{PUBLIC}/d/0.1", "w2": f"{PUBLIC}/d/0.2"}
     db.upsert_articles([make_row("alpha", i, ago(hours=i + 1), url=u) for i, u in enumerate(urls.values())])
@@ -691,7 +703,7 @@ async def test_hung_job_only_counts_for_itself(db, settings, monkeypatch):
     f = make_fetcher(db, settings, lambda r: httpx.Response(
         200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
     try:
-        await asyncio.gather(*(f._run_extract(b"<p>x</p>", f"{PUBLIC}/d/0") for _ in range(2)))  # Pool warm
+        await asyncio.gather(*(f._run_extract(b"<p>x</p>", f"{PUBLIC}/d/0") for _ in range(2)))  # warm
         hung = asyncio.create_task(f.extract_article(ids["hung"], urls["hung"]))
         await asyncio.sleep(0.8)
         nb = asyncio.create_task(on_demand(f, ids["nb"], urls["nb"]))
@@ -701,51 +713,142 @@ async def test_hung_job_only_counts_for_itself(db, settings, monkeypatch):
 
         row = db.get_article(ids["hung"])
         assert row["text_status"] == "pending" and row["attempts"] == 1
-        assert row["text_error"] == "Extraktion Zeitüberschreitung"
-        row = db.get_article(ids["nb"])
-        assert row["text_status"] == "pending" and row["attempts"] == 0 and row["next_attempt_at"] is None
-        assert "Pool neu gestartet" in row["text_error"]
-        for k in ("w1", "w2"):
-            assert db.get_article(ids[k])["text_status"] in ("full", "partial")
+        assert row["text_error"] == "Extraktion: Zeitüberschreitung"
+        for k in ("nb", "w1", "w2"):
+            row = db.get_article(ids[k])
+            assert row["text_status"] in ("full", "partial") and row["attempts"] == 0, (k, row["text_error"])
     finally:
         await f.close()
 
 
-async def test_cancelled_pool_future_is_not_a_cancelled_request(db, settings):
-    """Bricht der Pool einen Auftrag ab (shutdown mit cancel_futures), kommt beim Aufrufer kein
-    CancelledError an, sondern ein normaler vorübergehender Fehler."""
-    import concurrent.futures
+async def test_close_kills_running_job(db, settings, monkeypatch):
+    """Herunterfahren mitten in einer Extraktion: Der Worker-Prozess endet mit, der Aufrufer bekommt
+    CancelledError (kein hängender Prozess, kein gespeicherter Fehlschlag)."""
+    import uuid
+    token = uuid.uuid4().hex
+    monkeypatch.setattr(fetcher_mod, "extract", _sleepy_extract)
     aid = _article(db)
     f = make_fetcher(db, settings, lambda r: httpx.Response(
         200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
+    task = asyncio.create_task(f._run_extract(ARTICLE_HTML.encode(), f"{PUBLIC}/a/{token}"))
+    pidfile = _pidfile(token)
+    for _ in range(200):
+        if pidfile.exists() and pidfile.read_text():
+            break
+        await asyncio.sleep(0.05)
+    pid = int(pidfile.read_text())
+    pidfile.unlink()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await f.close()
+    for _ in range(50):
+        if _gone_or_zombie(pid):
+            break
+        await asyncio.sleep(0.1)
+    assert _gone_or_zombie(pid)
+    assert db.get_article(aid)["attempts"] == 0
 
-    class Cancelling:
-        def submit(self, *a, **kw):
-            fut = concurrent.futures.Future()
-            asyncio.get_running_loop().call_later(0.05, fut.cancel)
-            return fut
 
-        def shutdown(self, **kw):
-            pass
+async def test_source_breaker_skips_rest_of_source_after_two_timeouts(db, settings, monkeypatch):
+    """Nach SOURCE_TROUBLE_LIMIT Zeitüberschreitungen einer Quelle in einem Lauf: Die übrigen Artikel
+    dieser Quelle bleiben ohne Versuch fällig, andere Quellen laufen weiter; der nächste Lauf
+    beginnt von vorn."""
+    monkeypatch.setattr(fetcher_mod, "EXTRACT_TIMEOUT", 1)
+    monkeypatch.setattr(fetcher_mod, "extract", _timed_extract)
+    rows = [make_row("alpha", i, ago(minutes=i + 1), url=f"{PUBLIC}/alpha{i}/60") for i in range(6)]
+    rows.append(make_row("beta", 1, ago(minutes=30), url=f"{PUBLIC}/beta/0"))
+    db.upsert_articles(rows)
+    f = make_fetcher(db, settings, lambda r: httpx.Response(
+        200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
+    try:
+        await asyncio.wait_for(f._extract_pending(), timeout=30)
+        alpha = db.q("SELECT attempts, text_status, text_error FROM articles WHERE source_id='alpha'")
+        # Zwei Zeitüberschreitungen lösen aus; ein Auftrag, der schon lief, als die zweite kam, darf
+        # noch zu Ende laufen (höchstens SOURCE_TROUBLE_LIMIT + gleichzeitige Extraktionen - 1).
+        tried = sum(r["attempts"] for r in alpha)
+        assert 2 <= tried <= 3 and sorted(r["attempts"] for r in alpha)[-tried:] == [1] * tried
+        assert all(r["text_status"] == "pending" for r in alpha)
+        assert all(r["text_error"] is None for r in alpha if r["attempts"] == 0)
+        assert db.one("SELECT text_status FROM articles WHERE source_id='beta'")["text_status"] in ("full", "partial")
+        assert f._tripped("alpha") and not f._tripped("beta")
+        # Neuer Lauf: Schalter zurückgesetzt, die vier übersprungenen kommen dran (die zwei mit
+        # Versuch erst nach ihrer Wartezeit).
+        monkeypatch.setattr(fetcher_mod, "extract", extract_mod.extract)
+        await asyncio.wait_for(f._extract_pending(), timeout=30)
+        alpha = db.q("SELECT attempts, text_status FROM articles WHERE source_id='alpha'")
+        done = [r["text_status"] for r in alpha if r["attempts"] == 0]
+        assert len(done) == 6 - tried and all(st in ("full", "partial") for st in done)
+    finally:
+        await f.close()
 
-    f._pool = Cancelling()
-    await on_demand(f, aid, f"{PUBLIC}/artikel")
+
+# Feindliche Seiten aus dem Pentest (gekürzt auf das Nötige): werden vor trafilatura abgelehnt.
+HOSTILE_PAGES = {
+    "short_p": b"<html><body><article>" + b"<p>Kurzer Satz.</p>" * 250_000 + b"</article></body></html>",
+    "italics": b"<html><body><div>" + b"<i>a</i>" * 650_000 + b"</div></body></html>",
+    "deep_div": b"<html><body>" + b"<div>" * 100_000 + b"<p>x</p>" + b"</div>" * 100_000 + b"</body></html>",
+    "attrs": b"<html><body><div " + b" ".join(b'a%d="1"' % i for i in range(100_000)) + b"><p>x</p></div></body></html>",
+    "bool_attrs": b"<html><body><div " + b" ".join(b"a%d" % i for i in range(30_000)) + b"><p>x</p></div></body></html>",
+}
+
+
+@pytest.mark.parametrize("name", sorted(HOSTILE_PAGES))
+def test_markup_guard_rejects_hostile_pages_quickly(name):
+    raw = HOSTILE_PAGES[name]
+    start = time.perf_counter()
+    problem = fetcher_mod.markup_problem(raw, max_tags=fetcher_mod.MAX_PAGE_TAGS,
+                                         max_attrs=fetcher_mod.MAX_TAG_ATTRS, max_lt=fetcher_mod.MAX_PAGE_LT)
+    assert problem and time.perf_counter() - start < 1
+
+
+def test_markup_guard_accepts_big_real_world_shapes():
+    # Live-Blog-artig: 4 000 Tags, Skripte voller "<", ein Attribut mit JSON voller Leerzeichen und
+    # "=" (Guardian props="…"), CDATA-Text, Kommentare, "a < b" im Text.
+    props = "{&quot;a&quot;: " + ", ".join(f"&quot;k{i}&quot;: &quot;v = {i} x y z&quot;" for i in range(3000)) + "}"
+    page = ("<!DOCTYPE html><html><head><style>a<b{}</style><script>" + "if (a < b) x();" * 20_000
+            + "</script></head><body><!-- " + "<x>" * 5000 + " -->"
+            + f'<gu-island name="x" props="{props}" data-x=\'{{"a": "b c d e"}}\'></gu-island>'
+            + "<article>" + "<p>Absatz mit <a href='/x?a=1&b=2'>Link</a> und 1 < 2.</p>" * 1300
+            + "</article></body></html>").encode()
+    assert fetcher_mod.markup_problem(page, max_tags=fetcher_mod.MAX_PAGE_TAGS,
+                                      max_attrs=fetcher_mod.MAX_TAG_ATTRS, max_lt=fetcher_mod.MAX_PAGE_LT) is None
+    feed = ('<?xml version="1.0"?><rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/"><channel>'
+            + "".join(f'<item xmlns:dc="http://purl.org/dc/elements/1.1/"><title>t{i}</title><link>https://a/{i}</link>'
+                      f"<description><![CDATA[{'Ein Wort ' * 400}<p>x</p>]]></description></item>" for i in range(300))
+            + "</channel></rss>").encode()
+    assert _feed_problem(feed) is None
+
+
+async def test_hostile_page_fails_fast_without_retries(db, settings):
+    aid = _article(db)
+    f = make_fetcher(db, settings, lambda r: httpx.Response(
+        200, headers={"content-type": "text/html"}, content=HOSTILE_PAGES["short_p"]))
+    try:
+        start = time.perf_counter()
+        await asyncio.wait_for(f.extract_article(aid, f"{PUBLIC}/artikel"), timeout=30)
+        assert time.perf_counter() - start < 10
+    finally:
+        await f.close()
     row = db.get_article(aid)
-    assert row["text_status"] == "pending" and row["attempts"] == 0 and "abgebrochen" in row["text_error"]
-    assert f._pool is None
-    f._pool = Cancelling()      # zweites Mal: zählt
-    await on_demand(f, aid, f"{PUBLIC}/artikel")
-    row = db.get_article(aid)
-    assert row["text_status"] == "pending" and row["attempts"] == 1 and "abgebrochen" in row["text_error"]
+    assert row["text_status"] == "failed" and row["text_error"].startswith("Seite abgelehnt: zu viel Markup")
 
-    # Gehört der Pool zu den wegen Zeitüberschreitung verworfenen: ohne Zählung neu eingeplant.
-    db.q("UPDATE articles SET next_attempt_at=NULL WHERE id=?", (aid,))
-    pool = Cancelling()
-    f._pool = pool
-    f._discarded.add(pool)
-    await on_demand(f, aid, f"{PUBLIC}/artikel")
-    row = db.get_article(aid)
-    assert row["attempts"] == 1 and row["next_attempt_at"] is None
+
+@pytest.mark.parametrize("body", [
+    b"".join(b'<n%d:x xmlns:n%d="urn:%d"/>' % (i, i, i) for i in range(150_000)),     # feedbomb ns
+    b"<x " + b" ".join(b'a%d="1"' % i for i in range(300_000)) + b"/>",                 # feedbomb attrs
+], ids=["ns", "attrs"])
+async def test_hostile_feed_is_rejected_before_feedparser(db, settings, body):
+    raw = (b'<rss version="2.0"><channel><item><title>x</title><link>https://a/1</link>' + body
+           + b"</item></channel></rss>")[:5 * 1024 * 1024]
+    f = make_fetcher(db, settings, lambda r: httpx.Response(200, content=raw))
+    try:
+        start = time.perf_counter()
+        assert await asyncio.wait_for(f._fetch_all_feeds(), timeout=30) == 0
+        assert time.perf_counter() - start < 10
+        assert db.source_states()["alpha"]["last_error"].startswith("Feed abgelehnt: zu viele")
+    finally:
+        await f.close()
 
 
 # ---- _extract_pending: vollständig und robust ------------------------------------
@@ -757,7 +860,7 @@ async def test_extract_pending_pages_past_articles_that_stay_pending(db, setting
     f = make_fetcher(db, settings, lambda r: httpx.Response(503))
     calls: list[int] = []
 
-    async def stays_pending(article_id, url):
+    async def stays_pending(article_id, url, source=None):
         calls.append(article_id)  # nichts gespeichert: bleibt pending und fällig
 
     monkeypatch.setattr(f, "extract_article", stays_pending)
@@ -772,7 +875,7 @@ async def test_unexpected_extraction_error_does_not_abort_run(db, settings, monk
     f = make_fetcher(db, settings, lambda r: httpx.Response(503))
     calls: list[int] = []
 
-    async def flaky(article_id, url):
+    async def flaky(article_id, url, source=None):
         calls.append(article_id)
         if article_id == ids[1]:
             raise RuntimeError("unerwartet")
@@ -887,8 +990,8 @@ async def test_feed_parsing_runs_in_worker_with_timeout(db, settings, monkeypatc
     f = make_fetcher(db, settings, lambda r: httpx.Response(200, content=rss(item(1))))
     try:
         assert await asyncio.wait_for(f._fetch_all_feeds(), timeout=20) == 0
-        assert db.source_states()["alpha"]["last_error"] == "ExtractTimeout: Feed-Parsing Zeitüberschreitung"
-        assert f._pool is None   # hängender Worker samt Pool verworfen
+        assert db.source_states()["alpha"]["last_error"] == "Feed-Parsing: Zeitüberschreitung"
+        assert not f._pids   # hängender Worker-Prozess beendet
     finally:
         await f.close()
 
@@ -938,7 +1041,7 @@ async def test_title_echo_is_removed_off_the_event_loop(db, settings, monkeypatc
         threads.append(threading.current_thread() is threading.main_thread())
         return real(result, title)
 
-    async def fake_extract(page, url):
+    async def fake_extract(page, url, skip=None):
         return extract_mod.Extraction("full", "<p>Titel 1</p><p>Text</p>", "Titel 1 Text", 12, False, None, None)
 
     monkeypatch.setattr(fetcher_mod, "drop_title_echo", spy)
@@ -1037,9 +1140,425 @@ def test_forkserver_preloads_job_modules(db, settings, monkeypatch):
     ctx = multiprocessing.get_context("forkserver")
     monkeypatch.setattr(type(ctx), "set_forkserver_preload", lambda self, mods: calls.append(mods))
     f = make_fetcher(db, settings, lambda r: httpx.Response(200))
-    pool = f._extraction_pool()
+    f._mp_context()
+    assert calls == [["app.fetcher"]]
+    assert fetcher_mod.parse_feed.__module__ == "app.fetcher" and fetcher_mod.extract.__module__ == "app.extract"
+
+
+async def test_rebinding_is_stopped_before_the_request_is_sent(db, settings, monkeypatch):
+    """DNS-Rebinding: check_url sah eine öffentliche Adresse, beim Verbindungsaufbau liefert DNS eine
+    lokale. GuardedBackend löst selbst auf, prüft und verbindet nur mit geprüften Adressen: Beim
+    lokalen Dienst kommt keine Anfrage an."""
+    import socket
+    hits = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            hits.append(self.path)
+            self.send_response(200)
+            self.send_header("content-length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    async def ok(url):
+        return None
+
+    monkeypatch.setattr(fetcher_mod, "check_url", ok)
+    f = Fetcher(db, Catalog([]), settings)
+    await f.start()
+    loop = asyncio.get_running_loop()
+    real = loop.getaddrinfo
+
+    async def rebinding(host, *args, **kw):
+        if host == "rebind.example":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+        return await real(host, *args, **kw)
+
+    monkeypatch.setattr(loop, "getaddrinfo", rebinding)
     try:
-        assert calls == [["app.fetcher"]]
-        assert fetcher_mod.parse_feed.__module__ == "app.fetcher" and fetcher_mod.extract.__module__ == "app.extract"
+        with pytest.raises(BlockedURL, match="nicht erlaubter Adresse"):
+            await f._fetch_once(f"http://rebind.example:{port}/geheim", headers=None, max_bytes=1000)
+        assert hits == []
     finally:
-        pool.shutdown()
+        await f.close()
+        server.shutdown()
+        server.server_close()
+
+
+async def test_guarded_backend_connects_to_checked_public_address(monkeypatch):
+    """Erlaubte Namen: Verbindung zur geprüften Adresse, Hostname bleibt für SNI/Host unverändert
+    (das Backend bekommt nur host/port; start_tls erhält den Namen von httpcore getrennt)."""
+    import socket
+    from app.netguard import GuardedBackend
+    calls = []
+
+    class Inner:
+        async def connect_tcp(self, host, port, **kw):
+            calls.append((host, port))
+            return "stream"
+
+        async def sleep(self, s):
+            pass
+
+    loop = asyncio.get_running_loop()
+
+    async def resolve(host, port, **kw):
+        return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2606:4700::1", port, 0, 0)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+
+    monkeypatch.setattr(loop, "getaddrinfo", resolve)
+    backend = GuardedBackend(Inner())
+    assert await backend.connect_tcp("news.example", 443) == "stream"
+    assert calls == [("2606:4700::1", 443)]
+    with pytest.raises(BlockedURL):
+        await backend.connect_tcp("localhost", 80)
+    with pytest.raises(BlockedURL):
+        await backend.connect_unix_socket("/var/run/docker.sock")
+
+
+def _page_problem(raw: bytes):
+    return fetcher_mod.markup_problem(raw, max_tags=fetcher_mod.MAX_PAGE_TAGS, max_attrs=fetcher_mod.MAX_TAG_ATTRS,
+                                      max_lt=fetcher_mod.MAX_PAGE_LT)
+
+
+def _feed_problem(raw: bytes):
+    return fetcher_mod.markup_problem(raw, max_tags=fetcher_mod.MAX_FEED_TAGS, max_attrs=fetcher_mod.MAX_TAG_ATTRS,
+                                      max_lt=fetcher_mod.MAX_FEED_LT, max_prefixes=fetcher_mod.MAX_FEED_PREFIXES,
+                                      xml=True)
+
+
+ATTR_BOMB = b"<div " + b" ".join(b'a%d="1"' % i for i in range(100_000)) + b"><p>x</p></div>"
+
+
+@pytest.mark.parametrize("prefix", [
+    b'<div title="a><!--">',                 # ">" und "<!--" in einem Attributwert beenden nichts
+    b"<!-- nie beendet ",                    # unbeendeter Kommentar: der Rest zählt weiter
+    b"<script>var a = 1;",                   # unbeendetes Skript
+    b"<style>p{}",                           # unbeendeter Style
+    b"<!-- x --!>",                          # Kommentar-Ende, das auch HTML-Parser kennen
+    b"<div data-x='unbeendet",               # unbeendeter Wert: danach zählt alles mit
+], ids=["gt-in-wert", "kommentar", "skript", "style", "kommentar-bang", "wert"])
+def test_markup_guard_cannot_be_blinded(prefix):
+    raw = b"<html><body>" + prefix + ATTR_BOMB + b"</body></html>"
+    assert "Attribute" in (_page_problem(raw) or "")
+
+
+def test_markup_guard_counts_cdata_content_in_feeds():
+    raw = (b'<rss version="2.0"><channel><item><title>x</title><description><![CDATA[<!--]]></description>'
+           + b"<x/>" * 300_000 + b"</item></channel></rss>")
+    assert _feed_problem(raw)
+    # Auch knapp unter der Gesamtgrenze: Tags in CDATA zählen als Tags.
+    raw = b"<rss><channel><item><description><![CDATA[" + b"<p>" * 110_000 + b"]]></description></item></channel></rss>"
+    assert "Tags" in (_feed_problem(raw) or "")
+
+
+def test_markup_guard_accepts_single_quoted_json_attributes():
+    obj = "{" + ",".join(f'"k{i}":"v {i}"' for i in range(140)) + "}"
+    ids = "[" + ",".join(f'"a{i}"' for i in range(300)) + "]"
+    page = (f"<html><body><div data-x='{obj}' data-ids='{ids}' class=\"a b\">Text</div>"
+            f"<p title='a \"b\" c' data-y = 'x y z'>ok</p></body></html>").encode()
+    assert _page_problem(page) is None
+
+
+@pytest.mark.parametrize("raw", [
+    b"<!--" * 90_000,                                    # lauter unbeendete Kommentare
+    b'<a b="' * 90_000,                                   # lauter unbeendete Werte
+    b"<div " + b'a="' * 1_500_000,                        # ein Tag voller unbeendeter Werte
+    b"<script>" * 90_000,                                 # lauter unbeendete Skripte
+    b"<p " + b"x" * 5_000_000,                            # ein Tag ohne Ende
+], ids=["kommentare", "werte", "tag-voller-werte", "skripte", "tag-ohne-ende"])
+def test_markup_guard_stays_linear(raw):
+    start = time.perf_counter()
+    _page_problem(raw)
+    _feed_problem(raw)
+    assert time.perf_counter() - start < 5
+
+
+async def test_breaker_is_checked_again_with_the_job_slot(db, settings, monkeypatch):
+    """Auch mit 6 gleichzeitigen Extraktionen (KIOSK_EXTRACT_CONCURRENCY) laufen nach dem Auslösen
+    keine weiteren Aufträge der Quelle: Wer schon auf einen Worker-Platz wartet, fragt mit dem Platz
+    noch einmal nach. Höchstens LIMIT + (Worker-Plätze - 1) Zeitüberschreitungen."""
+    from dataclasses import replace
+    monkeypatch.setattr(fetcher_mod, "EXTRACT_TIMEOUT", 1)
+    monkeypatch.setattr(fetcher_mod, "extract", _timed_extract)
+    db.upsert_articles([make_row("alpha", i, ago(minutes=i + 1), url=f"{PUBLIC}/alpha{i}/60") for i in range(8)])
+    f = make_fetcher(db, replace(settings, extract_concurrency=6), lambda r: httpx.Response(
+        200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
+    try:
+        await asyncio.wait_for(f._extract_pending(), timeout=30)
+    finally:
+        await f.close()
+    tried = db.one("SELECT SUM(attempts) AS n FROM articles")["n"]
+    assert 2 <= tried <= fetcher_mod.SOURCE_TROUBLE_LIMIT + fetcher_mod.EXTRACT_WORKERS - 1
+
+
+async def test_on_demand_extraction_ignores_the_breaker(db, settings):
+    """Öffnet jemand einen Artikel einer ausgelösten Quelle, gibt es trotzdem einen echten Versuch
+    (sonst wartete die Oberfläche 30 s auf nichts)."""
+    aid = _article(db)
+    f = make_fetcher(db, settings, lambda r: httpx.Response(
+        200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
+    try:
+        f._cycle_started = time.monotonic() - 1
+        for _ in range(fetcher_mod.SOURCE_TROUBLE_LIMIT):
+            f._note_trouble("alpha")
+        assert f._tripped("alpha")
+        await f.extract_article(aid, f"{PUBLIC}/artikel", "alpha")      # Hintergrund: übersprungen
+        assert db.get_article(aid)["text_status"] == "pending"
+        assert f.start_extraction(aid, f"{PUBLIC}/artikel", source="alpha")
+        await asyncio.wait_for(asyncio.shield(f._inflight[aid]), timeout=30)
+        assert db.get_article(aid)["text_status"] in ("full", "partial")
+    finally:
+        await f.close()
+
+
+def _exiting_extract(page, url):
+    """Läuft im Worker-Prozess: beendet sich per SystemExit (keine Exception-Unterklasse)."""
+    raise SystemExit(3)
+
+
+async def test_worker_base_exception_is_not_reraised_in_the_loop(db, settings, monkeypatch):
+    aid = _article(db)
+    f = make_fetcher(db, settings, lambda r: httpx.Response(
+        200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
+    monkeypatch.setattr(fetcher_mod, "extract", _exiting_extract)
+    try:
+        with pytest.raises(fetcher_mod.JobInfraError, match="unerwartet beendet"):
+            await f._run_extract(ARTICLE_HTML.encode(), f"{PUBLIC}/x")
+        await asyncio.wait_for(f.extract_article(aid, f"{PUBLIC}/artikel"), timeout=30)
+        row = db.get_article(aid)
+        # Fehler der Worker-Mechanik: vorübergehend (Versuch zählt), nicht endgültig "failed".
+        assert row["text_error"] == "Extraktion: Worker-Prozess unerwartet beendet"
+        assert row["text_status"] == "pending" and row["attempts"] == 1
+    finally:
+        await f.close()
+
+
+async def test_jobs_use_their_own_threads_not_the_default_executor(db, settings, monkeypatch):
+    """Start und Einsammeln der Worker-Prozesse blockieren nicht den Standard-Executor (den brauchen
+    getaddrinfo, scrypt und die Gruppierung)."""
+    used = []
+    loop = asyncio.get_running_loop()
+    real = loop.run_in_executor
+
+    def spy(executor, fn, *args):
+        used.append(executor)
+        return real(executor, fn, *args)
+
+    monkeypatch.setattr(loop, "run_in_executor", spy)
+    f = make_fetcher(db, settings, lambda r: httpx.Response(200))
+    try:
+        result = await f._run_extract(ARTICLE_HTML.encode(), f"{PUBLIC}/x")
+        assert result.status in ("full", "partial")
+        assert used and all(e is f._threads for e in used)
+    finally:
+        await f.close()
+    assert f._threads is None
+
+
+BOMB_20K = b"<div " + b" ".join(b'a%d="1"' % i for i in range(20_000)) + b"><p>x</p></div>"
+
+
+@pytest.mark.parametrize("before, after", [
+    (b"<!-->", b"-->"),                                   # leerer Kommentar ist sofort zu Ende
+    (b"<!--->", b"-->"),
+    (b"<title><script></title>", b"</script>"),          # Textelemente: "<script" darin beginnt nichts
+    (b"<textarea><!--</textarea>", b"-->"),
+    (b"<xmp><style></xmp>", b"</style>"),
+    (b"<iframe><script></iframe>", b"</script>"),
+    (b"<noembed><script></noembed>", b"</script>"),
+    (b"<noframes><script></noframes>", b"</script>"),
+    (b'<p a=b="> ', b' ">'),                             # ungequoteter Wert b=" öffnet nichts
+    (b'<p ="> ', b' ">'),                                # Attributname "=\"" statt Wert
+    (b"<p a= b'> ", b" '>"),
+], ids=["leer", "leer-strich", "title", "textarea", "xmp", "iframe", "noembed", "noframes",
+        "phantom-wert", "name-mit-gleich", "phantom-einfach"])
+def test_markup_guard_follows_the_html5_tokenizer(before, after):
+    raw = b"<html><body>" + before + BOMB_20K + after + b"</body></html>"
+    assert "Attribute" in (_page_problem(raw) or ""), before
+
+
+def test_markup_guard_counts_attributes_on_end_tags():
+    raw = b"<html><body><p>x</p " + b" ".join(b"a%d" % i for i in range(20_000)) + b"></body></html>"
+    assert "Attribute" in (_page_problem(raw) or "")
+
+
+def test_markup_guard_real_text_elements_and_values_pass():
+    page = (b"<html><head><title>A <b> B</title><script>if (a<b) x('</p>');</script></head><body>"
+            b"<textarea>x < y</textarea><p a=b c='d e' f = \"g h\" i=j=k>ok</p>"
+            + b"<div class=x data-a='1'>t</div>" * 2000 + b"</body></html>")
+    assert _page_problem(page) is None
+
+
+def test_markup_guard_many_small_attributes_stays_fast():
+    tag = b"<p " + b"a " * 250 + b">"
+    raw = tag * (5 * 1024 * 1024 // len(tag))
+    start = time.perf_counter()
+    _page_problem(raw)
+    assert time.perf_counter() - start < 10
+
+
+async def test_worker_start_failure_is_requeued_without_attempt(db, settings, monkeypatch):
+    """fork scheitert (z. B. EAGAIN an pids_limit): nicht die Schuld des Artikels."""
+    import multiprocessing.process
+    aid = _article(db)
+    f = make_fetcher(db, settings, lambda r: httpx.Response(
+        200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
+
+    def no_fork(self):
+        raise BlockingIOError(11, "Resource temporarily unavailable")
+
+    monkeypatch.setattr(multiprocessing.process.BaseProcess, "start", no_fork)
+    try:
+        assert await f.extract_article(aid, f"{PUBLIC}/artikel") is True
+    finally:
+        await f.close()
+    row = db.get_article(aid)
+    assert row["text_status"] == "pending" and row["attempts"] == 0 and row["next_attempt_at"] is None
+    assert row["text_error"] == "Extraktion: Worker-Prozess ließ sich nicht starten"   # ohne englische Einzelheit
+
+
+async def test_skipped_articles_do_not_count_as_extracted(db, settings, monkeypatch):
+    """Vom Leistungsschalter übersprungene Artikel zählen nicht fürs Budget je Lauf und nicht als
+    extrahiert (last_extracted)."""
+    db.upsert_articles([make_row("alpha", i, ago(minutes=i + 1), url=f"{PUBLIC}/alpha{i}") for i in range(5)])
+    f = make_fetcher(db, settings, lambda r: httpx.Response(
+        200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
+    class Sticky(dict):
+        def clear(self):          # _extract_pending setzt den Schalter zurück; hier bleibt er ausgelöst
+            pass
+
+    later = time.monotonic() + 3600
+    f._trouble = Sticky(alpha=[later] * fetcher_mod.SOURCE_TROUBLE_LIMIT)
+    try:
+        assert await f._extract_pending() == 0
+        assert f._extracted_ids == []
+        assert all(r["attempts"] == 0 and r["text_status"] == "pending" for r in db.q("SELECT * FROM articles"))
+    finally:
+        await f.close()
+
+
+@pytest.mark.parametrize("before, after", [
+    (b'<title><p a="</title>', b'"'),                       # Inhalt eines Textelements: kein Tag
+    (b'<textarea><p a="</textarea>', b'"'),
+    (b'<iframe><p a="</iframe>', b'"'),
+    (b'<noembed><p a="</noembed>', b'"'),
+    (b'<xmp><p a="</xmp>', b'"'),
+    (b"<!x <!-- >", b"-->"),                               # falscher Kommentar endet am ">"
+    (b"</ <script>", b"</script>"),
+    (b"<?x <script>", b"</script>"),
+    (b"<![CDATA[<style>]]>", b"</style>"),                   # in HTML ein falscher Kommentar
+    (b"<!DOCTYPE <!-- >", b"-->"),
+], ids=["title", "textarea", "iframe", "noembed", "xmp", "bogus-bang", "bogus-slash", "bogus-pi",
+        "cdata-in-html", "doctype"])
+def test_markup_guard_bogus_regions_open_nothing(before, after):
+    raw = b"<html><body>" + before + BOMB_20K + after + b"</body></html>"
+    assert "Attribute" in (_page_problem(raw) or ""), before
+
+
+def test_markup_guard_counts_markup_inside_text_regions():
+    raw = b"<html><body><title>" + b"<p>" * 110_000 + b"</title></body></html>"
+    assert "Tags" in (_page_problem(raw) or "")
+    raw = b"<html><body><!x " + b"<p " * 110_000 + b"></body></html>"
+    assert "Tags" in (_page_problem(raw) or "")
+
+
+def test_feed_mode_keeps_cdata_and_title_as_markup():
+    """In Feeds ist title ein gewöhnliches Element und CDATA-Inhalt HTML, das feedparser auswertet."""
+    feed = (b"<rss><channel><item><title>x</title><description><![CDATA[<div "
+            + b" ".join(b"a%d" % i for i in range(20_000)) + b">]]></description></item></channel></rss>")
+    assert "Attribute" in (_feed_problem(feed) or "")
+
+
+def _no_extract(page, url):
+    raise AssertionError("extract darf nicht laufen")
+
+
+@pytest.mark.parametrize("packed", [
+    lambda b: __import__("gzip").compress(b),
+    lambda b: zlib.compress(b),
+], ids=["gzip", "zlib"])
+def test_compressed_page_without_content_encoding_is_rejected(packed):
+    """trafilatura entpackt solche Bytes ohne Header-Prüfung und ohne Grenze (4,7 KB gzip ergaben
+    400 000 Absätze); die Vorprüfung sähe nur die komprimierten Bytes."""
+    raw = packed(b"<html><body>" + b"<p>abc " * 400_000 + b"</body></html>")
+    assert len(raw) < 100_000
+    with pytest.raises(fetcher_mod.MarkupRejected, match="komprimierter Inhalt"):
+        fetcher_mod._extract_job(_no_extract, raw, "https://x/a")
+
+
+@pytest.mark.parametrize("codec", ["utf-16", "utf-32", "utf-16-be"])
+def test_pre_check_sees_the_decoded_page(codec):
+    page = ("<html><body>" + "<div " + " ".join(f"a{i}" for i in range(20_000)) + "></div></body></html>")
+    with pytest.raises(fetcher_mod.MarkupRejected, match="Attribute"):
+        fetcher_mod._extract_job(_no_extract, page.encode(codec) if codec != "utf-16-be"
+                                 else b"\xfe\xff" + page.encode("utf-16-be"), "https://x/a")
+
+
+def test_extract_gets_exactly_the_checked_utf8():
+    seen = []
+
+    def spy(page, url):
+        seen.append(page)
+        return "ok"
+
+    page = "<html><head><meta charset='utf-16'></head><body><p>Grüße aus Köln</p></body></html>"
+    for raw in (page.encode("utf-8"), page.encode("utf-16"), page.encode("latin-1")):
+        seen.clear()
+        assert fetcher_mod._extract_job(spy, raw, "https://x/a") == "ok"
+        assert seen == [fetcher_mod.page_as_utf8(raw)]
+        seen[0].decode("utf-8")                                # gültiges UTF-8, wie trafilatura es liest
+    assert "Grüße aus Köln".encode() in fetcher_mod.page_as_utf8(page.encode("utf-16"))
+    utf8 = page.encode("utf-8")
+    assert fetcher_mod.page_as_utf8(utf8) == utf8          # UTF-8 bleibt Byte für Byte gleich
+
+
+@pytest.mark.parametrize("raw", [
+    '<?xml version="1.0"?><rss><channel></channel></rss>'.encode("utf-16"),
+    '<?xml version="1.0"?><rss><channel></channel></rss>'.encode("utf-16-le"),
+    '<?xml version="1.0"?><rss><channel></channel></rss>'.encode("utf-32"),
+    '<?xml version="1.0"?><rss><channel></channel></rss>'.encode("cp037"),
+], ids=["utf16-bom", "utf16-ohne-bom", "utf32", "ebcdic"])
+def test_feeds_in_non_ascii_compatible_encodings_are_rejected(raw):
+    with pytest.raises(fetcher_mod.MarkupRejected, match="Kodierung nicht unterstützt"):
+        fetcher_mod._feed_job(lambda *a: None, SRC, raw)
+
+
+def test_ascii_compatible_feeds_pass_the_encoding_check():
+    for raw in ('<?xml version="1.0" encoding="iso-8859-1"?><rss/>'.encode("latin-1"),
+                "﻿<rss/>".encode("utf-8"), b"  <rss/>"):
+        assert fetcher_mod.feed_encoding_problem(raw) is None
+
+
+@pytest.mark.parametrize("exc, text", [
+    (httpx.ReadTimeout(""), "Zeitüberschreitung beim Abruf"),
+    (TimeoutError(), "Zeitüberschreitung beim Abruf"),
+    (httpx.ConnectError("[Errno 111] Connection refused"), "Verbindung fehlgeschlagen"),
+    (httpx.RemoteProtocolError("peer closed connection"), "Netzwerkfehler"),
+    (fetcher_mod.ResolveError("Name nicht auflösbar: x.example"), "Name nicht auflösbar: x.example"),
+    (fetcher_mod.TooLarge("Antwort zu groß (über 5 MB)"), "Antwort zu groß (über 5 MB)"),
+    (ValueError("kaputt"), "ValueError: kaputt"),
+])
+def test_error_texts_are_german(exc, text):
+    assert fetcher_mod.error_text(exc) == text
+
+
+async def test_timeouts_and_sizes_are_stored_readably(db, settings):
+    aid = _article(db)
+
+    def slow(request):
+        raise httpx.ReadTimeout("", request=request)
+
+    f = make_fetcher(db, settings, slow)
+    try:
+        await f.extract_article(aid, f"{PUBLIC}/artikel")
+    finally:
+        await f.close()
+    assert db.get_article(aid)["text_error"] == "Zeitüberschreitung beim Abruf"
+    assert fetcher_mod._mb(123_400_000) == "117,7 MB" and fetcher_mod._mb(5 * 2**20) == "5 MB"

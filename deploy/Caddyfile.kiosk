@@ -2,16 +2,32 @@
 # Dieser Block wird von deploy/deploy.sh zwischen den Markern ersetzt; nicht von Hand ändern.
 kiosk.example.org {
 	encode zstd gzip
+	# Range-Anfragen gar nicht erst weitergeben: Starlette vor 0.49.1 fasste viele Bereiche quadratisch
+	# zusammen (CVE-2025-62727, eine Anfrage blockierte den einen uvicorn-Worker). Die statischen
+	# Dateien sind klein, Teilabrufe braucht die App nicht.
+	request_header -Range
+	request_header -If-Range
 	reverse_proxy 127.0.0.1:8100
 	header {
+		# Server-Kopfzeile von Caddy und (falls gesetzt) von uvicorn entfernen
+		-Server
 		Strict-Transport-Security "max-age=31536000"
 		X-Content-Type-Options nosniff
 		X-Frame-Options DENY
 		Referrer-Policy no-referrer
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		Cross-Origin-Opener-Policy same-origin
+		# Alles, was die App ausliefert (Schriften, Icons, Manifest, API), lädt nur sie selbst.
+		Cross-Origin-Resource-Policy same-origin
 	}
 	# /docs (Swagger UI) lädt Skripte von einem CDN und nutzt Inline-Skripte, deshalb ohne CSP.
 	@app not path /docs /docs/*
-	header @app Content-Security-Policy "default-src 'self'; img-src * data:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'"
+	# defer: erst beim Schreiben der Antwort setzen, damit sie die schmale CSP der App (Rückfallebene,
+	# nur frame-ancestors u. a.) ersetzt statt als zweite Kopfzeile daneben zu stehen.
+	header @app {
+		Content-Security-Policy "default-src 'self'; img-src * data:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'"
+		defer
+	}
 	log {
 		output discard
 	}

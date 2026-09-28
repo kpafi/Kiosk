@@ -9,12 +9,15 @@ import multiprocessing
 import io
 import logging
 import math
+import os
+import pickle
 import re
+import resource
+import signal
+import sys
 import time
-import weakref
 import zlib
 from collections import defaultdict
-from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -23,12 +26,13 @@ from urllib.parse import urljoin, urlparse
 
 import feedparser
 import httpx
+import trafilatura.utils as trafilatura_utils
 
 from .config import Settings
-from .db import Database, QueryTimeout, request_time_limit, utcnow
+from .db import Database, QueryTimeout, _iso, request_time_limit, utcnow
 from .extract import (clean_author, drop_title_echo, extract, is_placeholder, is_small_image_url,
                       is_text_card_image, safe_http_url, strip_html)
-from .netguard import BlockedURL, ResolveError, check_url, server_addr_blocked, set_deny_networks
+from .netguard import BlockedURL, GuardedBackend, ResolveError, check_url, server_addr_blocked, set_deny_networks
 from .sitemap import ParsedRows, parse_sitemap, pick_child, sitemap_kind, url_host
 from .sources import Catalog, Source
 from . import stories
@@ -64,10 +68,43 @@ REDIRECT_CODES = (301, 302, 303, 307, 308)
 TRANSIENT_4XX = (408, 425, 429)
 MAX_RETRY_AFTER = 12 * 3600
 EXTRACT_TIMEOUT = 90        # Sekunden für eine Textextraktion im Worker-Prozess
-EXTRACT_WORKERS = 2         # Worker-Prozesse für die Extraktion (begrenzt auch CPU und Speicher)
-# Nach so vielen Aufträgen wird ein Worker durch einen frischen Prozess ersetzt: lxml/trafilatura
-# geben Speicher nicht zuverlässig an das System zurück (Fragmentierung, Caches).
-EXTRACT_TASKS_PER_CHILD = 25
+EXTRACT_WORKERS = 2         # gleichzeitige Worker-Prozesse für die Extraktion (begrenzt CPU und Speicher)
+FEED_PARSE_WORKERS = 1      # eigener Platz fürs Feed-Parsing: wartet nie auf Extraktionen und umgekehrt
+# Grenzen je Worker-Prozess (setrlimit im Prozess selbst, siehe _job_main): Adressraum (ein Auftrag,
+# der mehr braucht, endet mit MemoryError statt den Container an sein mem_limit zu bringen; echte
+# Seiten brauchen bis ca. 120 MB, eine 5-MB-Seite aus reinem Text ca. 190 MB, davon ca. 75 MB
+# geladener Code) und CPU-Zeit als Rückfallebene zum Zeitlimit (danach SIGXCPU bzw. SIGKILL).
+# (EXTRACT_WORKERS + FEED_PARSE_WORKERS) x JOB_MEMORY_LIMIT + App passen in mem_limit von
+# docker-compose.yml (3 x 320 MB + 320 MB = 1280 MB), siehe dort.
+JOB_MEMORY_LIMIT = 320 * 1024 * 1024
+JOB_CPU_GRACE = 10          # Sekunden CPU-Zeit über dem Zeitlimit des Auftrags
+# Leistungsschalter je Quelle: Nach so vielen Zeitüberschreitungen bzw. Abstürzen in einem Lauf (oder
+# binnen SOURCE_TROUBLE_TTL Sekunden) werden weitere Artikel dieser Quelle in diesem Lauf nicht mehr
+# versucht; sie bleiben fällig, ohne dass ein Versuch zählt. Ein feindlicher Feed mit 150 langsamen
+# Seiten kostet so 2 x EXTRACT_TIMEOUT statt 150 x EXTRACT_TIMEOUT je Lauf.
+SOURCE_TROUBLE_LIMIT = 2
+SOURCE_TROUBLE_TTL = 3600
+# Vorprüfung von Seiten und Feeds vor dem Parsen (markup_problem, linear): trafilatura/lxml und
+# feedparser brauchen für manche Formen quadratisch Zeit oder sehr viel Speicher (250 000 kurze
+# Absätze: 3 min; ein Tag mit 100 000 Attributen: 2,5 min; 650 000 leere Elemente: 1,8 GB;
+# 20 000 xmlns-Deklarationen im Feed: 13 s). Eine Ablehnung ist endgültig, die Grenzen liegen deshalb
+# weit über echten Seiten: bis ca. 36 000 Tags (heise-Bestenliste, 2 MB), Live-Blogs von Guardian und
+# FAZ (1,4 MB) ca. 4 600. Die ungünstigste bekannte Form (lauter unbeendete <p>) kostet trafilatura
+# bei 100 000 Tags ca. 50 s (unter EXTRACT_TIMEOUT), bei 150 000 schon über 140 s; was knapp unter der
+# Grenze langsam ist, fängt das Zeitlimit im eigenen Prozess ab.
+MAX_PAGE_TAGS = 100_000     # Tags außerhalb von script/style
+# "<" insgesamt, auch in Skripten und Kommentaren: begrenzt, was dort (ob zu Recht oder nicht)
+# übersprungen wird, und die Arbeit der Prüfung selbst. Echte Seiten bis ca. 36 000.
+MAX_PAGE_LT = 250_000
+# Größe der Seite nach dem Dekodieren (UTF-8): Einbyte-Kodierungen mit vielen Umlauten wachsen bis auf das
+# Doppelte, mehr kann aus ARTICLE_MAX_BYTES nicht werden (komprimierte Bytes werden abgelehnt).
+DECODED_MAX_BYTES = 2 * 5 * 1024 * 1024
+MAX_TAG_ATTRS = 256         # Attribute (Stücke außerhalb von Attributwerten in Anführungszeichen) in einem Tag
+MAX_FEED_TAGS = 100_000
+MAX_FEED_LT = 250_000       # "<" insgesamt im Feed (echte Feeds: bis ca. 15 500, FOCUS)
+# Verschiedene Namensraum-Präfixe (xmlns:x) im ganzen Feed; echte Feeds haben wenige (Der Standard
+# deklariert sie an jedem Eintrag neu: 468 Deklarationen, aber wenige Präfixe).
+MAX_FEED_PREFIXES = 200
 # Content-Encodings, die wir bewusst nicht selbst entpacken (endgültiger Fehler).
 UNSUPPORTED_ENCODINGS = {"br", "zstd", "compress", "x-compress"}
 
@@ -143,28 +180,338 @@ class ExtractTimeout(Exception):
     """Ein Auftrag im Worker-Prozess (Extraktion, Feed-Parsing) hat sein Zeitlimit überschritten."""
 
 
-class PoolDiscarded(Exception):
-    """Der Auftrag ist gescheitert, weil wir den Pool selbst verworfen haben (hängender Nachbar).
-    Kein Fehler des Artikels: wird ohne Zählung eines Versuchs erneut eingeplant."""
+class JobCrashed(Exception):
+    """Der Worker-Prozess eines Auftrags endete ohne Ergebnis (Signal, z. B. SIGKILL durch den
+    OOM-Killer oder SIGXCPU). Betrifft nur diesen Auftrag."""
 
 
-def _discard_pool(pool: concurrent.futures.ProcessPoolExecutor) -> None:
-    """Beendet einen Prozess-Pool sofort, auch mit hängendem Worker.
+class JobInfraError(Exception):
+    """Fehler der Worker-Mechanik, nicht der Seite (Ergebnis nicht übertragbar, SystemExit im Worker):
+    vorübergehend, zählt als Versuch."""
 
-    shutdown(wait=False, cancel_futures=True) verwirft wartende Aufträge, bricht einen laufenden
-    Worker aber nicht ab. Eine öffentliche API dafür gibt es erst ab Python 3.14 (kill_workers);
-    wir nutzen die private Liste _processes (vor shutdown lesen, das setzt sie auf None) und
-    schicken SIGKILL an die eigenen Kindprozesse (gleiche uid, braucht keine Capabilities).
-    Noch laufende Aufträge des Pools enden dann mit BrokenProcessPool, noch nicht gestartete mit
-    CancelledError (siehe Fetcher._run_extract).
-    """
-    procs = list((getattr(pool, "_processes", None) or {}).values())
-    pool.shutdown(wait=False, cancel_futures=True)
-    for proc in procs:
+
+class JobStartFailed(JobInfraError):
+    """Der Worker-Prozess ließ sich nicht starten (fork: EAGAIN an pids_limit, Forkserver weg). Kein
+    Fehler des Artikels: wird ohne Zählung eines Versuchs erneut eingeplant (zählt aber für das Budget
+    des Sammellaufs, siehe _extract_once)."""
+
+
+class JobSkipped(Exception):
+    """Der Auftrag wurde nicht gestartet: Der Leistungsschalter der Quelle hat inzwischen ausgelöst."""
+
+
+class JobOutOfMemory(Exception):
+    """Der Auftrag brauchte mehr als JOB_MEMORY_LIMIT Adressraum (MemoryError im Worker)."""
+
+
+class MarkupRejected(Exception):
+    """Seite oder Feed abgelehnt, bevor ein Parser sie sieht (markup_problem). Endgültig."""
+
+
+# Fehler mit fertiger deutscher Meldung für die Oberfläche (ohne Typname davor, siehe error_text).
+GERMAN_ERRORS = (ExtractTimeout, JobCrashed, JobOutOfMemory, JobInfraError, MarkupRejected, BlockedURL,
+                 ResolveError, FetchError, UnsupportedEncoding)
+
+
+def error_text(e: BaseException) -> str:
+    """Fehlermeldung zum Speichern (erscheint in der Oberfläche): eigene deutsche Meldungen unverändert,
+    die häufigen Netzwerkfehler von httpx auf Deutsch (deren Text ist oft leer, z. B. ReadTimeout),
+    alles andere mit Typname. Einzelheiten stehen im Protokoll."""
+    if isinstance(e, GERMAN_ERRORS):
+        return str(e)
+    if isinstance(e, (httpx.TimeoutException, TimeoutError)):
+        return "Zeitüberschreitung beim Abruf"
+    if isinstance(e, httpx.ConnectError):
+        return "Verbindung fehlgeschlagen"
+    if isinstance(e, httpx.TransportError):
+        return "Netzwerkfehler"
+    return f"{type(e).__name__}: {e}"
+
+
+def markup_problem(raw: bytes, *, max_tags: int, max_attrs: int, max_lt: int,
+                   max_prefixes: int | None = None, xml: bool = False) -> str | None:
+    """Grund zur Ablehnung einer Seite bzw. eines Feeds, sonst None. Linear in der Größe.
+
+    Zählt "<" insgesamt (höchstens `max_lt`, auch in Skripten und Kommentaren: Obergrenze für alles,
+    was die Prüfung selbst überspringt), Tags (höchstens `max_tags`) und Attribute je Start-Tag
+    (höchstens `max_attrs`), optional verschiedene Namensraum-Präfixe (xmlns:…, `max_prefixes`;
+    feedparser wird erst mit vielen verschiedenen quadratisch). Ein kleiner Zustandsautomat
+    (_Scanner) nach den Regeln des Parsers: für Seiten (HTML, `xml` False) wie der HTML5-Tokenizer
+    von libxml2 2.14, für Feeds (`xml` True) mit CDATA, dessen Inhalt mitzählt (feedparser wertet
+    HTML darin aus). Was nicht sauber endet (Kommentar, Skript, Anführungszeichen), gilt ab dort
+    wieder als Markup: im Zweifel mehr zählen."""
+    low = raw.lower()
+    if low.count(b"<") > max_lt:
+        return f"zu viel Markup (über {_num(max_lt)} Zeichen „<“)"
+    if max_prefixes is not None:
+        prefixes: set[bytes] = set()
+        for m in _XMLNS_PREFIX_RE.finditer(low):
+            prefixes.add(m[1])
+            if len(prefixes) > max_prefixes:
+                return f"zu viele Namensräume (über {_num(max_prefixes)} Präfixe)"
+    return _Scanner(low, max_attrs, xml).run(max_tags)
+
+
+class _Scanner:
+    """Zustandsautomat für markup_problem über den klein geschriebenen Text. Jede Suche nach einem
+    Ende (Kommentar, schließendes Tag, Anführungszeichen), die nichts findet, wird gemerkt: Weitere
+    Suchen ab späteren Stellen finden dann auch nichts und entfallen. So bleibt es auch mit
+    Hunderttausenden unbeendeten "<!--" linear.
+
+    Übersprungen (nicht als Tags gezählt) werden nur Bereiche, deren Inhalt auch der Parser nicht als
+    Markup liest: echte Kommentare und (HTML) Skripte und Styles. Andere Bereiche, die der Parser als
+    Text nimmt (HTML: Inhalt von title, textarea …, falsche Kommentare wie "<!x …>", "<?x …>",
+    "</ …>"), werden in einem Zug bis zu ihrem Ende gelesen, jedes "<" darin zählt als Tag, aber
+    nichts darin öffnet einen übersprungenen Bereich."""
+
+    def __init__(self, low: bytes, max_attrs: int, xml: bool = False):
+        self.low, self.size, self.max_attrs, self.xml = low, len(low), max_attrs, xml
+        self._missing: dict[bytes, int] = {}      # Suchbegriff -> ab hier gibt es ihn nicht mehr
+
+    def _find(self, key: bytes, start: int, search) -> int:
+        """Position des Treffers von search(start) oder -1; merkt sich Fehlschläge je `key`."""
+        if start >= self._missing.get(key, self.size + 1):
+            return -1
+        found = search(start)
+        if found < 0:
+            self._missing[key] = start
+        return found
+
+    def _closing(self, name: bytes, start: int) -> int:
+        """Position des schließenden Tags </name ab `start` oder -1."""
+        closing = b"</" + name
+        return self._find(closing, start, lambda s: self.low.find(closing, s))
+
+    def run(self, max_tags: int) -> str | None:
+        low, size, pos, tags = self.low, self.size, 0, 0
+        while True:
+            start = low.find(b"<", pos)
+            if start < 0:
+                return None
+            tags += 1
+            if tags > max_tags:
+                return f"zu viele Tags (über {_num(max_tags)})"
+            nxt = low[start + 1:start + 2]
+            text_until = -1               # Ende eines Bereichs, den der Parser als Text liest
+            if nxt == b"!" and low.startswith(b"<!--", start):
+                # Ab start + 2 gesucht: "<!-->" und "<!--->" sind schon beendete Kommentare.
+                end = self._find(b"-->", start + 2, self._comment_end)
+                # Unbeendet: ab hier wieder als Markup lesen (der Parser könnte es auch tun).
+                pos = start + 4 if end < 0 else end
+                continue
+            if nxt == b"/" and low[start + 2:start + 3].isalpha():
+                end, attrs = self._tag(start + 1)     # auch Attribute an End-Tags zerlegt der Parser
+            elif nxt.isalpha():
+                end, attrs = self._tag(start)
+            elif self.xml:
+                # <!DOCTYPE, <![CDATA[ (Inhalt zählt mit), <?xml …?>, "a < b" im Text
+                pos = start + 2 if nxt == b"!" else start + 1
+                continue
+            elif nxt in (b"!", b"?", b"/"):
+                # HTML: falscher Kommentar bis zum nächsten ">" (auch <![CDATA[ … in einer Seite)
+                gt = low.find(b">", start + 2)
+                text_until, end, attrs = (size if gt < 0 else gt), None, 0
+            else:
+                pos = start + 1           # "a < b" im Text
+                continue
+            if attrs > self.max_attrs:
+                return f"zu viele Attribute in einem Tag (über {_num(self.max_attrs)})"
+            if text_until < 0 and not self.xml and nxt != b"/":
+                name = _TAG_NAME_RE.match(low, start + 1).group(0)
+                if name in _RAWTEXT:
+                    # Skript und Style: Rohtext bis zum schließenden Tag; fehlt es, zählt der Rest
+                    # wieder als Markup.
+                    close = self._closing(name, end)
+                    if close >= 0:
+                        end = close
+                elif name in _TEXT_ELEMENTS:
+                    # title, textarea, xmp …: Inhalt ist Text bis zum eigenen End-Tag (fehlt es: bis
+                    # zum Schluss). Kein "<" darin beginnt ein Tag oder einen Kommentar.
+                    close = self._closing(name, end)
+                    text_until = size if close < 0 else close
+            if text_until >= 0:
+                begin = start + 2 if end is None else end
+                tags += low.count(b"<", begin, text_until)
+                if tags > max_tags:
+                    return f"zu viele Tags (über {_num(max_tags)})"
+                end = text_until + 1 if end is None else text_until
+            pos = end
+
+    def _comment_end(self, start: int) -> int:
+        m = _COMMENT_END_RE.search(self.low, start)
+        return -1 if m is None else m.end()
+
+    def _tag(self, start: int) -> tuple[int, int]:
+        """(Position nach dem Tag, Zahl der Attribute) für das Tag bei `start` ("<" bzw. "/" vor dem
+        Namen), wie der HTML5-Tokenizer: Ein Attributname beginnt mit jedem Zeichen außer Leerraum,
+        "/" und ">" (auch mit "="); nach "=" und Leerraum öffnet ein Anführungszeichen nur als erstes
+        Zeichen einen Wert (auch einfache: data-x='{"a": "b"}'), sonst reicht der Wert bis Leerraum
+        oder ">". Bricht ab, sobald mehr als max_attrs gezählt sind."""
+        low, size, attrs = self.low, self.size, 0
+        i = _TAG_NAME_RE.match(low, start + 1).end()
+        while True:
+            i = _TAG_SPACE_RE.match(low, i).end()
+            if i >= size:
+                return size, attrs
+            if low[i] == 0x3E:                    # ">"
+                return i + 1, attrs
+            attrs += 1
+            if attrs > self.max_attrs:
+                return i, attrs
+            i = _ATTR_NAME_RE.match(low, i).end()
+            j = _SPACE_RE.match(low, i).end()
+            if j >= size or low[j] != 0x3D:       # kein "=": Attribut ohne Wert
+                i = j
+                continue
+            i = _SPACE_RE.match(low, j + 1).end()
+            if i < size and low[i] in (0x22, 0x27):   # " oder '
+                quote = low[i:i + 1]
+                close = self._find(quote, i + 1, lambda s, q=quote: low.find(q, s))
+                if close < 0:
+                    # Unbeendeter Wert: der Parser läse bis zum Schluss; hier zählt der Rest wieder.
+                    return i + 1, attrs
+                i = close + 1
+            else:
+                i = _UNQUOTED_RE.match(low, i).end()
+
+
+_XMLNS_PREFIX_RE = re.compile(rb"xmlns:([^\s=>/\"']{1,100})")
+_COMMENT_END_RE = re.compile(rb"--!?>")
+_TAG_NAME_RE = re.compile(rb"[^ \t\n\r\f/>]*")
+_TAG_SPACE_RE = re.compile(rb"[ \t\n\r\f/]*")
+_SPACE_RE = re.compile(rb"[ \t\n\r\f]*")
+_ATTR_NAME_RE = re.compile(rb"[^ \t\n\r\f/>][^ \t\n\r\f/>=]*")
+_UNQUOTED_RE = re.compile(rb"[^ \t\n\r\f>]*")
+_RAWTEXT = (b"script", b"style")
+_TEXT_ELEMENTS = (b"title", b"textarea", b"xmp", b"iframe", b"noembed", b"noframes")
+
+
+def _mb(n: int) -> str:
+    """Bytes als Megabyte mit höchstens einer Nachkommastelle ("117,7 MB", "5 MB")."""
+    return f"{n / 2**20:.1f}".rstrip("0").rstrip(".").replace(".", ",") + " MB"
+
+
+def _num(n: int) -> str:
+    """Zahl mit schmalem geschütztem Leerzeichen als Tausendertrenner ("100 000")."""
+    return f"{n:,}".replace(",", " ")
+
+
+def _extract_job(extract_fn, page: bytes, url: str):
+    """Läuft im Worker-Prozess: Seite dekodieren (page_as_utf8), Vorprüfung, dann extract_fn
+    (app.extract.extract, in Tests austauschbar; wird als Referenz mitgeschickt) mit genau den UTF-8-
+    Bytes, die die Vorprüfung gesehen hat."""
+    utf8 = page_as_utf8(page)
+    problem = markup_problem(utf8, max_tags=MAX_PAGE_TAGS, max_attrs=MAX_TAG_ATTRS, max_lt=MAX_PAGE_LT)
+    if problem:
+        raise MarkupRejected(f"Seite abgelehnt: {problem}")
+    return extract_fn(utf8, url)
+
+
+def _looks_compressed(data: bytes) -> bool:
+    """True, wenn trafilatura (utils.handle_compressed_file) die Bytes entpacken würde: gzip- oder
+    zstd-Kennung, ein gültiger zlib-Anfang oder (falls installiert) Brotli. trafilatura prüft dabei
+    keine Header; wir entpacken nie selbst, eine solche Seite wird abgelehnt."""
+    if data[:3] == b"\x1f\x8b\x08" or data[:4] == b"\x28\xb5\x2f\xfd":
+        return True
+    try:
+        d = zlib.decompressobj()
+        if d.decompress(data[:65536], 65536) or d.eof:
+            return True                   # der Anfang ist ein gültiger zlib-Strom
+    except zlib.error:
+        pass
+    if trafilatura_utils.HAS_BROTLI:
         try:
-            proc.kill()
+            trafilatura_utils.brotli.decompress(data)
+            return True
         except Exception:  # noqa: BLE001
             pass
+    return False
+
+
+def page_as_utf8(page: bytes) -> bytes:
+    """Die Seite als UTF-8, so wie trafilatura sie liest (utils.decode_file: Kodierung erkennen, sonst
+    UTF-8 mit Ersatzzeichen). Die Vorprüfung sieht so dieselben Zeichen wie der Parser, auch bei
+    UTF-16/32 oder EBCDIC. Komprimierte Bytes ohne Content-Encoding (die trafilatura ohne jede
+    Grenze entpacken würde: 4,7 KB gzip ergaben 400 000 Absätze) werden abgelehnt, ebenso eine
+    Seite, die dekodiert größer als DECODED_MAX_BYTES ist."""
+    if _looks_compressed(page):
+        raise MarkupRejected("Seite abgelehnt: komprimierter Inhalt ohne Content-Encoding")
+    utf8 = trafilatura_utils.decode_file(page).encode("utf-8", errors="replace")
+    if len(utf8) > DECODED_MAX_BYTES:
+        raise MarkupRejected(f"Seite abgelehnt: dekodiert zu groß (über {_mb(DECODED_MAX_BYTES)})")
+    if utf8 != page and _looks_compressed(utf8):
+        raise MarkupRejected("Seite abgelehnt: komprimierter Inhalt ohne Content-Encoding")
+    return utf8
+
+
+def feed_encoding_problem(raw: bytes) -> str | None:
+    """Feeds und Sitemaps nur in ASCII-kompatibler Kodierung: feedparser und expat erkennen UTF-16/32
+    (BOM oder Nullbytes um "<") und EBCDIC selbst, die Vorprüfung sähe dort kein Markup."""
+    head = raw[:4]
+    if head[:2] in (b"\xff\xfe", b"\xfe\xff") or head in (b"\x00\x00\xfe\xff", b"\x00\x00\x00<", b"<\x00\x00\x00") \
+            or head[:2] in (b"\x00<", b"<\x00") or head == b"\x4c\x6f\xa7\x94":
+        return "Kodierung nicht unterstützt (UTF-16/32 oder EBCDIC)"
+    return None
+
+
+def _feed_job(fn, *args):
+    """Läuft im Worker-Prozess: Vorprüfung des Feeds bzw. der Sitemap (das bytes-Argument), dann fn
+    (parse_feed, pick_child, parse_sitemap)."""
+    raw = next(a for a in args if isinstance(a, bytes))
+    problem = feed_encoding_problem(raw) or markup_problem(
+        raw, max_tags=MAX_FEED_TAGS, max_attrs=MAX_TAG_ATTRS, max_lt=MAX_FEED_LT,
+        max_prefixes=MAX_FEED_PREFIXES, xml=True)
+    if problem:
+        raise MarkupRejected(f"Feed abgelehnt: {problem}")
+    return fn(*args)
+
+
+def _portable(exc: BaseException) -> BaseException:
+    """Die Exception selbst, wenn sie sich zum Elternprozess schicken lässt, sonst ein RuntimeError
+    mit Typ und Text."""
+    try:
+        pickle.loads(pickle.dumps(exc))
+        return exc
+    except Exception:  # noqa: BLE001
+        return RuntimeError(f"{type(exc).__name__}: {str(exc)[:500]}")
+
+
+def _job_main(conn, fn, args: tuple, memory_limit: int, cpu_seconds: int) -> None:
+    """Einstieg des Worker-Prozesses für genau einen Auftrag (vom Forkserver geforkt): Grenzen
+    setzen, fn(*args) ausführen, (True, Ergebnis) bzw. (False, Exception) schicken und sofort enden
+    (os._exit: kein Aufräumen großer Bäume, keine Finalizer)."""
+    try:
+        try:
+            resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 5))
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))    # SIGXCPU ohne Core-Datei
+            msg = (True, fn(*args))
+        except BaseException as e:  # noqa: BLE001  (auch MemoryError, SystemExit)
+            msg = (False, _portable(e))
+        try:
+            conn.send(msg)
+        except BaseException as e:  # noqa: BLE001  (Ergebnis nicht picklebar oder zu groß)
+            # Einzelheit ins Protokoll des Containers (stderr des Workers), die Meldung bleibt deutsch.
+            sys.stderr.write(f"kiosk-worker: Ergebnis nicht übertragbar: {type(e).__name__}: {e}\n")
+            conn.send((False, JobInfraError("Ergebnis nicht übertragbar")))
+    finally:
+        os._exit(0)
+
+
+def _collect(conn, proc) -> tuple[Any, int | None]:
+    """Im Thread: wartet auf die Nachricht des Worker-Prozesses (None, wenn er ohne endete) und auf
+    sein Ende; gibt (Nachricht, Exit-Code) zurück und schließt Pipe und Prozess-Objekt."""
+    try:
+        try:
+            msg = conn.recv()
+        except (EOFError, OSError):
+            msg = None
+    finally:
+        conn.close()
+    proc.join()
+    code = proc.exitcode
+    proc.close()
+    return msg, code
 
 
 @dataclass
@@ -367,6 +714,10 @@ class Fetcher:
         self._priority_sem = asyncio.Semaphore(PRIORITY_CONCURRENCY)
         # Artikel-ID -> laufende Extraktion; verhindert doppelte Abrufe und doppelt gezählte Versuche.
         self._inflight: dict[int, asyncio.Task] = {}
+        # Leistungsschalter: Quelle (bzw. Host) -> Zeitpunkte von Zeitüberschreitungen und Abstürzen,
+        # zählen ab Beginn des laufenden Sammellaufs (siehe _tripped).
+        self._trouble: dict[str, list[float]] = {}
+        self._cycle_started = -math.inf
         self._extracted_ids: list[int] = []         # zuletzt extrahierte Artikel (siehe run_once)
         self._stories_at = -math.inf                 # monotone Zeit des letzten Laufs der Gruppierung
         # Extraktionen auf Anforderung: wie viele laufen oder warten (Grenze PRIORITY_QUEUE_MAX) und
@@ -375,20 +726,15 @@ class Fetcher:
         self._ondemand_done: dict[int, float] = {}
         self._client: httpx.AsyncClient | None = None
         self._wake = asyncio.Event()
-        # Extraktion (trafilatura/lxml) in eigenen Prozessen: Ein Thread ließe sich bei einer
-        # hängenden Seite nicht abbrechen. Wird bei Bedarf (neu) angelegt, siehe _extraction_pool.
-        self._pool: concurrent.futures.ProcessPoolExecutor | None = None
-        # Höchstens so viele Aufträge im Pool wie Worker: Das Zeitlimit misst so nur die reine
-        # Laufzeit (nicht die Wartezeit in der Pool-Warteschlange), und ein verworfener Pool
-        # trifft nur die gerade laufenden Aufträge.
-        self._pool_sem = asyncio.Semaphore(EXTRACT_WORKERS)
-        # Wegen Zeitüberschreitung von uns verworfene Pools; die dadurch abgebrochenen Aufträge
-        # der Nachbarn zählen nicht als Versuch.
-        self._discarded: weakref.WeakSet = weakref.WeakSet()
-        # Artikel, deren Extraktion schon einmal mit einem gestorbenen Worker endete. Wer schuld war,
-        # ist nicht bekannt (z. B. ein Feed, der den Speicher sprengte): Beim ersten Mal wird ohne
-        # Zählung neu eingeplant, erst ein zweiter Absturz mit demselben Artikel zählt als Versuch.
-        self._crash_suspects: set[int] = set()
+        # Extraktion (trafilatura/lxml) und Feed-Parsing in eigenen Prozessen, einer je Auftrag (siehe
+        # _run_job): Ein Thread ließe sich bei einer hängenden Seite nicht abbrechen, und ein
+        # hängender oder abgestürzter Auftrag reißt so keinen Nachbarn mit (in einem Prozess-Pool
+        # machte ein getöteter Worker den ganzen Pool unbrauchbar). Die Semaphoren begrenzen die
+        # gleichzeitigen Prozesse; das Zeitlimit zählt erst ab dem eigenen Platz.
+        self._job_sem = asyncio.Semaphore(EXTRACT_WORKERS)
+        self._feed_sem = asyncio.Semaphore(FEED_PARSE_WORKERS)
+        self._pids: set[int] = set()                 # PIDs laufender Worker-Prozesse (für close)
+        self._threads: concurrent.futures.ThreadPoolExecutor | None = None   # siehe _job_threads
         # Zuletzt gewählte Sitemap je Quelle mit Sitemap-Index (nur fürs Protokoll bei einem Wechsel).
         self._sitemap_child: dict[str, str] = {}
         # Zusätzlich gesperrte Ziele (KIOSK_FETCH_DENY_IPS) gelten für alle Abrufe dieses Prozesses.
@@ -411,97 +757,141 @@ class Fetcher:
             # Gegenstelle setzen direkte Verbindungen voraus.
             trust_env=False,
             timeout=httpx.Timeout(25.0, connect=10.0),
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            transport=_guarded_transport(),
         )
-        self._extraction_pool()
+        self._mp_context()
 
     async def close(self) -> None:
-        # Laufende Extraktionen (per shield vom Aufrufer entkoppelt) beim Herunterfahren abbrechen.
+        # Laufende Extraktionen (per shield vom Aufrufer entkoppelt) beim Herunterfahren abbrechen;
+        # ihre Worker-Prozesse beendet _run_job dabei selbst.
         pending = list(self._inflight.values())
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
         if self._client:
             await self._client.aclose()
-        if self._pool is not None:
-            _discard_pool(self._pool)
-            self._pool = None
+        for pid in list(self._pids):  # z. B. Feed-Parsing eines abgebrochenen Laufs
+            _kill(pid)
+        if self._threads is not None:
+            self._threads.shutdown(wait=False)
+            self._threads = None
 
-    def _extraction_pool(self) -> concurrent.futures.ProcessPoolExecutor:
-        """Der Prozess-Pool für Extraktion und Feed-Parsing; wird beim ersten Bedarf angelegt.
+    def _job_threads(self) -> concurrent.futures.ThreadPoolExecutor:
+        """Threads für Start und Einsammeln der Worker-Prozesse: je gleichzeitigem Auftrag einer
+        (EXTRACT_WORKERS + FEED_PARSE_WORKERS), dazu Reserve für das Einsammeln abgebrochener."""
+        if self._threads is None:
+            self._threads = concurrent.futures.ThreadPoolExecutor(
+                max_workers=EXTRACT_WORKERS + FEED_PARSE_WORKERS + 2, thread_name_prefix="kiosk-job")
+        return self._threads
 
-        Startmethode ist bewusst "forkserver" statt des Linux-Standards "fork": uvicorn hat zu
-        diesem Zeitpunkt schon Threads (asyncio.to_thread, httpx), und fork() in einem Prozess
-        mit Threads kann im Kind gehaltene Locks (Logging, malloc) einfrieren. Der Forkserver
-        wird einmal sauber per exec gestartet, die Worker forken von ihm. Die Worker führen nur
-        die Modulfunktionen extract(), parse_feed() und für Sitemaps pick_child() und
-        parse_sitemap() mit bytes, str, Source und Hostnamen aus und fassen
-        weder Datenbank noch Event-Loop an. Sie starten beim ersten Auftrag, laufen im selben
-        Container (pids_limit, mem_limit) und brauchen /dev/shm für die Semaphoren von multiprocessing.
-        max_tasks_per_child ersetzt jeden Worker nach EXTRACT_TASKS_PER_CHILD Aufträgen durch
-        einen frischen Prozess (begrenzt schleichend wachsenden Speicher; mit forkserver erlaubt).
-        """
-        if self._pool is None:
-            ctx = multiprocessing.get_context("forkserver")
-            # Der Forkserver lädt die Module der Aufträge (extract, parse_feed: trafilatura, lxml,
-            # feedparser) einmal vorab; jeder neue Worker (alle EXTRACT_TASKS_PER_CHILD Aufträge)
-            # forkt sie fertig geladen, statt sie erneut zu importieren. Wirkt nur, bevor der
-            # Forkserver startet (erster Auftrag); Importfehler ignoriert multiprocessing dabei.
-            ctx.set_forkserver_preload(["app.fetcher"])
-            self._pool = concurrent.futures.ProcessPoolExecutor(
-                max_workers=EXTRACT_WORKERS, mp_context=ctx, max_tasks_per_child=EXTRACT_TASKS_PER_CHILD)
-        return self._pool
+    @staticmethod
+    def _mp_context():
+        """Startmethode der Worker-Prozesse: bewusst "forkserver" statt des Linux-Standards "fork".
+        uvicorn hat zu diesem Zeitpunkt schon Threads (asyncio.to_thread, httpx), und fork() in einem
+        Prozess mit Threads kann im Kind gehaltene Locks (Logging, malloc) einfrieren. Der Forkserver
+        wird einmal sauber per exec gestartet (beim ersten Auftrag), die Worker forken von ihm. Sie
+        führen nur Modulfunktionen (extract, parse_feed, pick_child, parse_sitemap) mit bytes, str,
+        Source und Hostnamen aus, fassen weder Datenbank noch Event-Loop an und laufen im selben
+        Container (pids_limit, mem_limit)."""
+        ctx = multiprocessing.get_context("forkserver")
+        # Der Forkserver lädt die Module der Aufträge (trafilatura, lxml, feedparser) einmal vorab;
+        # jeder Worker forkt sie fertig geladen, statt sie je Auftrag zu importieren. Wirkt nur,
+        # bevor der Forkserver startet; Importfehler ignoriert multiprocessing dabei.
+        ctx.set_forkserver_preload(["app.fetcher"])
+        return ctx
 
-    def _replace_pool(self, pool: concurrent.futures.ProcessPoolExecutor) -> None:
-        """Verwirft den Pool (hängender oder gestorbener Worker); der nächste Auftrag legt einen
-        neuen an. Nur, wenn nicht schon ein anderer Aufruf ihn ersetzt hat."""
-        if self._pool is pool:
-            self._pool = None
-            _discard_pool(pool)
-
-    async def _run_extract(self, page: bytes, url: str):
-        """Führt extract() im Prozess-Pool aus, höchstens EXTRACT_TIMEOUT Sekunden reine Laufzeit."""
+    async def _run_extract(self, page: bytes, url: str, skip=None):
+        """Vorprüfung und extract() in einem eigenen Worker-Prozess, höchstens EXTRACT_TIMEOUT
+        Sekunden reine Laufzeit."""
         # extract wird zur Laufzeit aus dem Modul gelesen (in Tests austauschbar); an den Worker
         # geht nur eine Referenz auf die Modulfunktion plus bytes und str (picklebar).
-        return await self._run_in_pool(extract, page, url, timeout=EXTRACT_TIMEOUT, what="Extraktion")
+        return await self._run_job(_extract_job, extract, page, url, timeout=EXTRACT_TIMEOUT,
+                                   what="Extraktion", slots=self._job_sem, skip=skip)
 
-    async def _run_in_pool(self, fn, *args, timeout: float, what: str):
-        """Führt fn(*args) im Prozess-Pool aus, höchstens `timeout` Sekunden reine Laufzeit.
+    async def _run_job(self, fn, *args, timeout: float, what: str, slots: asyncio.Semaphore, skip=None):
+        """Führt fn(*args) in einem eigenen, frisch geforkten Worker-Prozess aus (ein Prozess je
+        Auftrag), höchstens `timeout` Sekunden ab dem freien Platz in `slots`.
 
-        Wartet zuerst auf einen freien Worker-Platz (_pool_sem), erst danach läuft das Zeitlimit.
-        Überschreitet ein Auftrag das Limit, wird der Pool verworfen (ExtractTimeout); die übrigen
-        laufenden Aufträge dieses Pools enden dann mit PoolDiscarded (zählt nicht als Versuch).
-        `what` benennt den Auftrag in den Fehlermeldungen.
+        Zeitüberschreitung: nur dieser Prozess wird beendet (ExtractTimeout). Endet der Prozess ohne
+        Ergebnis (Signal): JobCrashed; MemoryError (JOB_MEMORY_LIMIT): JobOutOfMemory; andere
+        Exceptions des Auftrags kommen unverändert an. Wird die aufrufende Aufgabe abgebrochen,
+        endet auch der Prozess. `what` benennt den Auftrag in den Fehlermeldungen. `skip`: wird mit
+        dem freien Platz noch einmal gefragt (Leistungsschalter); True: JobSkipped, kein Prozess.
         """
-        async with self._pool_sem:
-            pool = self._extraction_pool()
+        async with slots:
+            if skip is not None and skip():
+                raise JobSkipped(what)
+            ctx = self._mp_context()
+            recv, send = ctx.Pipe(duplex=False)
+            proc = ctx.Process(target=_job_main, daemon=True,
+                               args=(send, fn, args, JOB_MEMORY_LIMIT, math.ceil(timeout) + JOB_CPU_GRACE))
             loop = asyncio.get_running_loop()
+            # Start und Einsammeln in eigenen Threads (_job_threads), nicht im Standard-Executor, den
+            # getaddrinfo, scrypt und die Gruppierung brauchen: _collect wartet bis zum Zeitlimit.
+            # Der erste Auftrag startet den Forkserver (Import von trafilatura, ca. 1-2 s).
+            # Abgeschirmt: Ein Abbruch währenddessen wartet den Start ab, beendet den Prozess und
+            # sammelt ihn im Hintergrund ein (join, close).
+            starting = loop.run_in_executor(self._job_threads(), proc.start)
             try:
-                # submit wirft BrokenProcessPool sofort, wenn ein Worker schon vorher gestorben ist.
-                future = loop.run_in_executor(pool, fn, *args)
-                return await asyncio.wait_for(future, timeout=timeout)
-            except asyncio.TimeoutError:
-                # Nur hier verwerfen wir einen gesunden Pool selbst; stirbt ein Worker von allein
-                # (z. B. Speicher), wissen wir nicht, welcher Auftrag schuld war, und alle zählen.
-                self._discarded.add(pool)
-                self._replace_pool(pool)
-                raise ExtractTimeout(f"{what} Zeitüberschreitung") from None
-            except asyncio.CancelledError:
-                # Abgebrochen wurde nur der Pool-Auftrag (shutdown mit cancel_futures), nicht diese
-                # Aufgabe selbst: wie ein abgebrochener Pool behandeln, nie als CancelledError
-                # (und damit als 500) nach oben reichen.
-                task = asyncio.current_task()
-                if task is not None and task.cancelling():
-                    raise
-                if pool in self._discarded:
-                    raise PoolDiscarded(f"{what} unterbrochen (Pool neu gestartet)") from None
-                self._replace_pool(pool)
-                raise BrokenProcessPool("Pool-Auftrag abgebrochen") from None
-            except BrokenProcessPool:
-                if pool in self._discarded:
-                    raise PoolDiscarded(f"{what} unterbrochen (Pool neu gestartet)") from None
-                self._replace_pool(pool)
+                await asyncio.shield(starting)
+            except BaseException as e:
+                await asyncio.gather(starting, return_exceptions=True)
+                send.close()
+                if proc.pid is not None:
+                    _kill(proc.pid)
+                    loop.run_in_executor(self._job_threads(), _collect, recv, proc)
+                else:
+                    recv.close()
+                if isinstance(e, Exception):
+                    log.warning("%s: Worker-Prozess ließ sich nicht starten: %r", what, e)
+                    raise JobStartFailed(f"{what}: Worker-Prozess ließ sich nicht starten") from e
                 raise
+            send.close()  # sonst sähe _collect nach dem Ende des Prozesses kein EOF
+            pid = proc.pid
+            self._pids.add(pid)
+            waiter = loop.run_in_executor(self._job_threads(), _collect, recv, proc)
+            waiter.add_done_callback(lambda _w: self._pids.discard(pid))
+            try:
+                msg, code = await asyncio.wait_for(asyncio.shield(waiter), timeout=timeout)
+            except asyncio.TimeoutError:
+                _kill(pid, waiter)
+                await asyncio.gather(waiter, return_exceptions=True)
+                raise ExtractTimeout(f"{what}: Zeitüberschreitung") from None
+            except asyncio.CancelledError:
+                _kill(pid, waiter)
+                raise
+        if msg is None:
+            raise JobCrashed(f"{what}: abgebrochen (Worker-Prozess beendet, Code {code})")
+        ok, payload = msg
+        if ok:
+            return payload
+        if isinstance(payload, MemoryError):
+            raise JobOutOfMemory(f"{what}: zu viel Speicher (über {_num(JOB_MEMORY_LIMIT // 2**20)} MB)")
+        if not isinstance(payload, Exception):
+            # SystemExit, KeyboardInterrupt o. Ä. aus dem Worker nie in der Event-Loop weiterwerfen.
+            log.warning("%s: Worker-Prozess meldete %r", what, payload)
+            raise JobInfraError(f"{what}: Worker-Prozess unerwartet beendet")
+        raise payload
+
+    # ---- Leistungsschalter je Quelle ---------------------------------------
+
+    @staticmethod
+    def _trouble_key(url: str, source: str | None) -> str:
+        if source:
+            return source
+        try:
+            return (urlparse(url).hostname or "").lower()
+        except ValueError:          # kaputte URL: scheitert gleich beim Abruf
+            return ""
+
+    def _note_trouble(self, key: str) -> None:
+        self._trouble.setdefault(key, []).append(time.monotonic())
+
+    def _tripped(self, key: str) -> bool:
+        """True, wenn diese Quelle im laufenden Sammellauf (höchstens SOURCE_TROUBLE_TTL zurück) schon
+        SOURCE_TROUBLE_LIMIT Zeitüberschreitungen bzw. Abstürze hatte."""
+        since = max(self._cycle_started, time.monotonic() - SOURCE_TROUBLE_TTL)
+        return sum(t >= since for t in self._trouble.get(key, ())) >= SOURCE_TROUBLE_LIMIT
 
     async def run_forever(self) -> None:
         while True:
@@ -541,14 +931,23 @@ class Fetcher:
                     extracted = await self._extract_pending()
                     await self.update_stories(only_if_new_bodies=True)
                 except Exception:
-                    self.db.purge(self.settings.retention_days)  # aufräumen auch nach einem Fehler davor
+                    await self._purge()  # aufräumen auch nach einem Fehler davor
                     raise
-                purged = self.db.purge(self.settings.retention_days)
+                purged = await self._purge()
                 self.state.update(last_new=new, last_extracted=extracted, last_purged=purged)
                 self.state["runs"] += 1
                 log.info("Lauf fertig: %d neu, %d extrahiert, %d gelöscht", new, extracted, purged)
             finally:
                 self.state.update(running=False, last_finished=utcnow())
+
+    async def _purge(self) -> int:
+        """Alte Artikel löschen, blockweise (Database.purge_steps): Zwischen den Blöcken kommen
+        API-Anfragen dran, statt sekundenlang auf die eine Transaktion zu warten."""
+        purged = 0
+        for n in self.db.purge_steps(self.settings.retention_days):
+            purged += n
+            await asyncio.sleep(0)
+        return purged
 
     async def update_stories(self, only_if_new_bodies: bool = False) -> None:
         """Geschichten neu gruppieren (app/stories.py): nach jedem Abruf der Feeds und einmal beim
@@ -575,7 +974,9 @@ class Fetcher:
                     return await self._fetch_feed(src)
                 except Exception as e:  # noqa: BLE001
                     log.warning("Feed %s: %s", src.id, e)
-                    self.db.record_fetch(src.id, ok=False, error=f"{type(e).__name__}: {e}")
+                    # Eigene Fehler tragen schon eine deutsche Meldung (erscheint so in der Quellenliste),
+                    # bei fremden hilft der Typ bei der Diagnose.
+                    self.db.record_fetch(src.id, ok=False, error=error_text(e))
                     return 0
 
         results = await asyncio.gather(*(one(s) for s in sources))
@@ -614,10 +1015,10 @@ class Fetcher:
                 # Accept-Encoding auch pro Anfrage setzen (gilt dann unabhängig vom Client).
                 req_headers = {**(headers or {}), "Accept-Encoding": "identity"}
                 async with self._client.stream("GET", current, headers=req_headers) as r:
-                    # Schutz gegen DNS-Rebinding: check_url hat den Namen aufgelöst, httpx löst ihn
-                    # für die Verbindung aber erneut auf. Deshalb die tatsächliche Gegenstelle prüfen.
-                    # Rest-Risiko: Die Anfrage selbst ist zu diesem Zeitpunkt schon gesendet, nur die
-                    # Antwort wird verworfen. Ohne Netzwerk-Stream (MockTransport) keine Prüfung.
+                    # Schutz gegen DNS-Rebinding: Die Verbindung geht schon an die beim Aufbau geprüfte
+                    # Adresse (GuardedBackend, _guarded_transport). Zusätzlich die tatsächliche
+                    # Gegenstelle prüfen (zweite Ebene, z. B. falls das Backend fehlt). Ohne
+                    # Netzwerk-Stream (MockTransport) keine Prüfung.
                     peer = _server_addr(r)
                     if server_addr_blocked(peer):
                         raise BlockedURL(f"Verbindung zu nicht erlaubter Adresse: {peer!r}")
@@ -627,7 +1028,7 @@ class Fetcher:
                         continue
                     declared = r.headers.get("content-length", "")
                     if declared.isdigit() and int(declared) > max_bytes:
-                        raise TooLarge(f"Antwort zu groß ({int(declared)} Bytes, Limit {max_bytes})")
+                        raise TooLarge(f"Antwort zu groß ({_mb(int(declared))}, Grenze {_mb(max_bytes)})")
                     return Fetched(r.status_code, r.headers, await _read_limited(r, max_bytes), str(r.url))
             raise FetchError(f"Zu viele Umleitungen (> {MAX_REDIRECTS})")
 
@@ -670,10 +1071,9 @@ class Fetcher:
         kind = sitemap_kind(r.content)
         if kind is not None:
             return await self._fetch_sitemap(src, r, kind)
-        # Im Worker-Prozess mit Zeitlimit: Ein feindlicher Feed kostet dort Speicher und Zeit, nicht
-        # in der App (deren Speicher bliebe fragmentiert). Fehler landen in _fetch_all_feeds.
-        rows = await self._run_in_pool(parse_feed, src, r.content, timeout=FEED_PARSE_TIMEOUT,
-                                       what="Feed-Parsing")
+        # Im Worker-Prozess mit Vorprüfung und Zeitlimit: Ein feindlicher Feed kostet dort Speicher und
+        # Zeit, nicht in der App (deren Speicher bliebe fragmentiert). Fehler landen in _fetch_all_feeds.
+        rows = await self._parse_job(parse_feed, src, r.content, what="Feed-Parsing")
         # Hat nur include_paths alles verworfen, ist der Feed in Ordnung, nur ohne Gewolltes.
         return self._store_rows(src, rows, (http_token(r.headers.get("etag")),
                                             http_token(r.headers.get("last-modified"))),
@@ -693,8 +1093,7 @@ class Fetcher:
         """
         if kind == "sitemapindex":
             hosts = frozenset(h for h in (url_host(src.feed), url_host(r.url)) if h)
-            child = await self._run_in_pool(pick_child, r.content, hosts, timeout=FEED_PARSE_TIMEOUT,
-                                            what="Sitemap-Parsing")
+            child = await self._parse_job(pick_child, r.content, hosts, what="Sitemap-Parsing")
             if child is None:
                 self.db.record_fetch(src.id, ok=False, error="Sitemap-Index nennt keine zulässige Sitemap")
                 return 0
@@ -708,13 +1107,17 @@ class Fetcher:
             if sitemap_kind(r.content) != "urlset":
                 self.db.record_fetch(src.id, ok=False, error="Sitemap-Index verweist nicht auf eine URL-Liste")
                 return 0
-        rows = await self._run_in_pool(parse_sitemap, src, r.content, FEED_MAX_ENTRIES,
-                                       timeout=FEED_PARSE_TIMEOUT, what="Sitemap-Parsing")
+        rows = await self._parse_job(parse_sitemap, src, r.content, FEED_MAX_ENTRIES, what="Sitemap-Parsing")
         # Leer ist nur dann kein Fehler, wenn die URL-Liste gar keine Einträge hat (neue Quartals-
         # Sitemap kurz nach dem Wechsel) oder include_paths welche verworfen hat. Blieb aus anderen
         # Gründen nichts übrig (z. B. lauter unbrauchbare URLs), ist es ein Fehler wie beim Feed.
         return self._store_rows(src, rows, (None, None),
                                 empty_ok=getattr(rows, "total", 1) == 0 or getattr(rows, "filtered_out", 0) > 0)
+
+    async def _parse_job(self, fn, *args, what: str):
+        """Feed bzw. Sitemap im Worker-Prozess parsen (mit Vorprüfung, _feed_job), eigener Platz."""
+        return await self._run_job(_feed_job, fn, *args, timeout=FEED_PARSE_TIMEOUT, what=what,
+                                   slots=self._feed_sem)
 
     def _store_rows(self, src: Source, rows: list[dict[str, Any]],
                     validators: tuple[str | None, str | None], *, empty_ok: bool = False) -> int:
@@ -725,7 +1128,7 @@ class Fetcher:
             return 0
         # Uralte Einträge (manche Feeds führen Evergreen-Artikel) gar nicht erst anlegen,
         # sonst würden sie bei jedem Lauf neu eingefügt, extrahiert und wieder gelöscht.
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=self.settings.retention_days)).isoformat()
+        cutoff = _iso(datetime.now(timezone.utc) - timedelta(days=self.settings.retention_days))
         rows = [row for row in rows if row["published_at"] >= cutoff]
         new = self.db.upsert_articles(rows, max_new=FEED_MAX_NEW)
         # Grenze erreicht: Validatoren nicht speichern, sonst hielte ein 304 die übrigen Einträge
@@ -744,20 +1147,26 @@ class Fetcher:
         done = 0
         after: tuple[str, int] | None = None
         self._extracted_ids = []
+        # Neuer Lauf: Der Leistungsschalter beginnt für alle Quellen von vorn.
+        self._trouble.clear()
+        self._cycle_started = time.monotonic()
         while done < EXTRACT_MAX_PER_CYCLE:
             batch = self.db.pending_articles(min(EXTRACT_BATCH, EXTRACT_MAX_PER_CYCLE - done), before=after)
             if not batch:
                 break
             after = (batch[-1]["published_at"], batch[-1]["id"])
             results = await asyncio.gather(
-                *(self.extract_article(r["id"], r["url"]) for r in batch), return_exceptions=True,
+                *(self.extract_article(r["id"], r["url"], r["source_id"]) for r in batch), return_exceptions=True,
             )
+            # Gezählt (Budget je Lauf, last_extracted) wird nur, was wirklich versucht wurde: nicht,
+            # was der Leistungsschalter übersprang oder was schon lief bzw. nicht mehr fällig war.
             for row, res in zip(batch, results):
                 if isinstance(res, Exception):
                     log.error("Extraktion %s (%s) unerwartet gescheitert: %r", row["id"], row["url"], res)
-                else:
+                    done += 1
+                elif res is not False:
                     self._extracted_ids.append(row["id"])
-            done += len(batch)
+                    done += 1
         return done
 
     def _spawn(self, article_id: int, coro) -> asyncio.Task:
@@ -777,7 +1186,7 @@ class Fetcher:
         task.add_done_callback(_done)
         return task
 
-    async def extract_article(self, article_id: int, url: str) -> None:
+    async def extract_article(self, article_id: int, url: str, source: str | None = None) -> bool:
         """Hintergrund-Extraktion: lädt eine Artikelseite und speichert den bereinigten Volltext.
 
         Läuft für diese ID schon eine Extraktion (z. B. auf Anforderung, start_extraction), wird
@@ -789,18 +1198,19 @@ class Fetcher:
         async with self._extract_sem:
             # Zwischen Prüfung und Eintrag liegt kein await: keine doppelte Extraktion.
             if article_id in self._inflight:
-                return  # läuft schon (Abruf auf Anforderung), dessen Ergebnis genügt
+                return False  # läuft schon (Abruf auf Anforderung), dessen Ergebnis genügt
             # Kann seit dem Lesen der Liste per API erledigt oder neu eingeplant worden sein.
             if not self.db.is_due_pending(article_id):
-                return
-            task = self._spawn(article_id, self._extract(article_id, url))
-            await asyncio.shield(task)
+                return False
+            task = self._spawn(article_id, self._extract(article_id, url, source))
+            return await asyncio.shield(task)
 
     def is_extracting(self, article_id: int) -> bool:
         """True, solange für diese ID eine Extraktion läuft."""
         return article_id in self._inflight
 
-    def start_extraction(self, article_id: int, url: str, *, retry: bool = False) -> bool:
+    def start_extraction(self, article_id: int, url: str, *, retry: bool = False,
+                         source: str | None = None) -> bool:
         """Startet eine Extraktion auf Anforderung im Hintergrund, ohne auf sie zu warten
         (Leseansicht fragt per Polling nach). Gibt zurück, ob jetzt eine läuft.
 
@@ -816,7 +1226,7 @@ class Fetcher:
         if self._ondemand_count >= PRIORITY_QUEUE_MAX:
             return False
         self._ondemand_count += 1
-        task = self._spawn(article_id, self._extract_priority(article_id, url))
+        task = self._spawn(article_id, self._extract_priority(article_id, url, source))
 
         def _finished(_t: asyncio.Task) -> None:
             self._ondemand_count -= 1
@@ -829,9 +1239,9 @@ class Fetcher:
         task.add_done_callback(_finished)
         return True
 
-    async def _extract_priority(self, article_id: int, url: str) -> None:
+    async def _extract_priority(self, article_id: int, url: str, source: str | None) -> None:
         async with self._priority_sem:
-            await self._extract(article_id, url)
+            await self._extract(article_id, url, source, on_demand=True)
 
     def _fail(self, article_id: int, error: str) -> None:
         # Vorhandener Text bleibt erhalten (siehe Database.store_extraction).
@@ -842,12 +1252,14 @@ class Fetcher:
         status = self.db.schedule_retry(article_id, error, retry_after)
         log.info("Extraktion %s (%s): %s -> %s", article_id, url, error, status)
 
-    async def _extract(self, article_id: int, url: str) -> None:
+    async def _extract(self, article_id: int, url: str, source: str | None = None, *,
+                       on_demand: bool = False) -> bool:
         """Ein Extraktionsversuch. Geht dabei unerwartet etwas schief (auch in der Buchführung,
         z. B. beim Speichern eines Fehlers), zählt das als vorübergehender Fehlschlag: Sonst bliebe
-        der Artikel 'pending' und fällig und würde in jedem Lauf erneut geholt."""
+        der Artikel 'pending' und fällig und würde in jedem Lauf erneut geholt. Gibt zurück, ob
+        wirklich ein Versuch stattfand (False: vom Leistungsschalter übersprungen)."""
         try:
-            await self._extract_once(article_id, url)
+            return await self._extract_once(article_id, url, source, on_demand=on_demand) is not False
         except QueryTimeout:
             # Nur möglich, wenn doch eine Frist galt (Hintergrund läuft ohne): kein Fehler des
             # Artikels, zählt nicht als Versuch.
@@ -858,8 +1270,29 @@ class Fetcher:
                 self.db.schedule_retry(article_id, f"Interner Fehler: {type(e).__name__}: {e}")
             except Exception:  # noqa: BLE001
                 log.exception("Extraktion %s: Fehlschlag ließ sich nicht speichern", article_id)
+        return True
 
-    async def _extract_once(self, article_id: int, url: str) -> None:
+    def _skip_tripped(self, article_id: int, url: str, key: str) -> bool:
+        """Leistungsschalter der Quelle ausgelöst: Artikel in diesem Lauf nicht versuchen. Er bleibt
+        fällig, kein Versuch zählt, nichts wird gespeichert."""
+        if not self._tripped(key):
+            return False
+        log.info("Extraktion %s (%s): übersprungen, %s hatte in diesem Lauf %d Zeitüberschreitungen "
+                 "bzw. Abstürze", article_id, url, key, SOURCE_TROUBLE_LIMIT)
+        return True
+
+    async def _extract_once(self, article_id: int, url: str, source: str | None = None, *,
+                            on_demand: bool = False) -> bool | None:
+        """Ein Versuch. Den Leistungsschalter der Quelle prüft nur der Hintergrund (vor dem Abruf, vor
+        dem Parsen und noch einmal mit dem freien Worker-Platz). Wer einen Artikel öffnet oder "Erneut
+        versuchen" drückt (`on_demand`), bekommt einen echten Versuch statt eines stillen Nichts, nach
+        dem die Oberfläche 30 s wartet; begrenzt ist das durch PRIORITY_CONCURRENCY,
+        PRIORITY_QUEUE_MAX und RETRY_MIN_INTERVAL. Seine Zeitüberschreitungen zählen trotzdem für
+        den Schalter."""
+        key = self._trouble_key(url, source)
+        tripped = (lambda: False) if on_demand else (lambda: self._skip_tripped(article_id, url, key))
+        if tripped():
+            return False
         try:
             r = await self._get(url, max_bytes=ARTICLE_MAX_BYTES)
         except BlockedURL as e:
@@ -875,11 +1308,12 @@ class Fetcher:
             self._fail(article_id, f"Ungültige URL: {type(e).__name__}: {e}")
             return
         except (ResolveError, FetchError, httpx.HTTPError, TimeoutError) as e:
-            self._retry(article_id, url, f"{type(e).__name__}: {e}")
+            log.info("Extraktion %s (%s): %r", article_id, url, e)   # Einzelheiten; gespeichert wird Deutsch
+            self._retry(article_id, url, error_text(e))
             return
         except Exception as e:  # noqa: BLE001
             log.warning("Extraktion %s (%s): %s", article_id, url, e)
-            self._retry(article_id, url, f"{type(e).__name__}: {e}")
+            self._retry(article_id, url, error_text(e))
             return
 
         if r.status_code != 200:
@@ -894,27 +1328,36 @@ class Fetcher:
         if "html" not in ctype and "xml" not in ctype:
             self._fail(article_id, f"Kein HTML ({ctype[:40]})")
             return
+        # Der Abruf kann gedauert haben: Hat die Quelle inzwischen ausgelöst, gar nicht erst parsen.
+        if tripped():
+            return False
         try:
-            result = await self._run_extract(r.content, r.url)
-        except ExtractTimeout as e:
-            self._retry(article_id, url, str(e))
-            return
-        except PoolDiscarded as e:
+            result = await self._run_extract(r.content, r.url, skip=tripped)
+        except JobSkipped:
+            return False
+        except JobStartFailed as e:
+            # Kein Prozess (z. B. pids_limit): nicht die Schuld des Artikels, neu eingeplant ohne
+            # gezählten Versuch des Artikels. Für das Budget des Laufs zählt er aber (die Seite wurde
+            # geholt): So holt ein Lauf, in dem keine Prozesse starten, nicht endlos weiter Seiten.
             self.db.requeue(article_id, str(e))
-            log.info("Extraktion %s (%s): %s, erneut eingeplant", article_id, url, e)
+            log.warning("Extraktion %s (%s): %s", article_id, url, e)
+            return True
+        except JobInfraError as e:
+            self._retry(article_id, url, str(e))
+            return True
+        except MarkupRejected as e:
+            # Vorprüfung: Die Seite wird beim nächsten Versuch nicht harmloser (wie TooLarge).
+            self._fail(article_id, str(e))
             return
-        except BrokenProcessPool as e:
-            # Worker gestorben (z. B. Speicher, auch durch einen Nachbarauftrag wie einen feindlichen
-            # Feed): beim ersten Mal ohne Zählung neu einplanen, siehe _crash_suspects.
-            if article_id in self._crash_suspects:
-                self._crash_suspects.discard(article_id)
-                self._retry(article_id, url, f"Extraktion abgebrochen: {type(e).__name__}")
-            else:
-                if len(self._crash_suspects) >= 1000:
-                    self._crash_suspects.clear()
-                self._crash_suspects.add(article_id)
-                self.db.requeue(article_id, "Extraktion abgebrochen (Worker gestorben), erneut eingeplant")
-                log.info("Extraktion %s (%s): Worker gestorben, erneut eingeplant", article_id, url)
+        except JobOutOfMemory as e:
+            self._note_trouble(key)
+            self._fail(article_id, str(e))
+            return
+        except (ExtractTimeout, JobCrashed) as e:
+            # Nur dieser Auftrag ist betroffen (eigener Prozess); zählt als Versuch und für den
+            # Leistungsschalter der Quelle.
+            self._note_trouble(key)
+            self._retry(article_id, url, str(e))
             return
         except Exception as e:  # noqa: BLE001
             log.warning("Extraktion %s (%s): %s", article_id, url, e)
@@ -928,7 +1371,6 @@ class Fetcher:
         feed_image = row["image_url"] if row and row["extracted_at"] is None else None
         replace_image = bool(feed_image and is_small_image_url(feed_image)
                              and result.image_url and not is_small_image_url(result.image_url))
-        self._crash_suspects.discard(article_id)
         self.db.store_extraction(
             article_id, status=result.status, body_html=result.body_html, body_text=result.body_text,
             body_len=result.body_len, paywalled=result.paywalled, image_url=result.image_url,
@@ -943,7 +1385,7 @@ async def _read_limited(r: httpx.Response, max_bytes: int) -> bytes:
         # Nur bei vorgefertigten Antworten ohne Netzwerk (MockTransport in Tests): Der Inhalt liegt
         # schon vollständig im Speicher, es bleibt die Größenprüfung.
         if len(r.content) > max_bytes:
-            raise TooLarge(f"Antwort zu groß (über {max_bytes} Bytes)")
+            raise TooLarge(f"Antwort zu groß (über {_mb(max_bytes)})")
         return r.content
     if r.status_code in (204, 304):
         return b""  # nie ein Body, auch wenn Content-Encoding gesetzt ist
@@ -955,13 +1397,13 @@ async def _read_limited(r: httpx.Response, max_bytes: int) -> bytes:
         nonlocal total
         total += len(data)
         if total > max_bytes:
-            raise TooLarge(f"Antwort zu groß (über {max_bytes} Bytes)")
+            raise TooLarge(f"Antwort zu groß (über {_mb(max_bytes)})")
         chunks.append(data)
 
     async for chunk in r.aiter_raw():
         raw_total += len(chunk)
         if raw_total > max_bytes:
-            raise TooLarge(f"Antwort zu groß (über {max_bytes} Bytes)")
+            raise TooLarge(f"Antwort zu groß (über {_mb(max_bytes)})")
         if decoder is None:
             add(chunk)
             continue
@@ -982,6 +1424,30 @@ async def _read_limited(r: httpx.Response, max_bytes: int) -> bytes:
         if not decoder.eof:
             raise FetchError("Komprimierte Antwort unvollständig")
     return b"".join(chunks)
+
+
+def _guarded_transport() -> httpx.AsyncHTTPTransport:
+    """Transport mit GuardedBackend (netguard): Die Verbindung geht an genau die beim Aufbau geprüfte
+    Adresse (Schutz vor DNS-Rebinding). httpx 0.27 reicht kein network_backend durch, deshalb wird es
+    im httpcore-Pool des Transports gesetzt (vor der ersten Verbindung)."""
+    transport = httpx.AsyncHTTPTransport(limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                                         trust_env=False)
+    pool = transport._pool
+    if not hasattr(pool, "_network_backend"):   # andere httpcore-Version: lieber laut scheitern
+        raise RuntimeError("httpcore ohne _network_backend: Schutz vor DNS-Rebinding nicht einsetzbar")
+    pool._network_backend = GuardedBackend()
+    return transport
+
+
+def _kill(pid: int, waiter: asyncio.Future | None = None) -> None:
+    """SIGKILL an einen Worker-Prozess, solange _collect ihn noch nicht eingesammelt hat (danach
+    könnte die PID schon einem anderen Prozess gehören)."""
+    if waiter is not None and waiter.done():
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)   # eigener Kindprozess des Forkservers, gleiche uid
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def _server_addr(response: httpx.Response) -> Any:

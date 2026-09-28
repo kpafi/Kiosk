@@ -27,9 +27,14 @@ Gleicher Server wie secure-chat und MailDigest (203.0.113.10, SSH-Alias `kiosk-s
 - Deploy: `bash deploy/deploy.sh` aus dem Repo-Root. Beim ersten Lauf wird ein Passwort erzeugt und in
   `/opt/kiosk/.env` abgelegt (nicht im Terminal ausgegeben). Fehlt `KIOSK_FETCH_DENY_IPS` in der `.env`,
   trägt jeder Deploy den Wert von `FETCH_DENY_IPS` oben in `deploy.sh` ein (die Adressen der Box); ein
-  vorhandener Wert bleibt unverändert. Hochgeladen wird nur, was Build und Betrieb brauchen (ohne
-  `tests/`, `docs/`, `design/`, `.claude/`, `pytest.ini`, `requirements-dev.txt`); Reste früherer Deploys
-  davon löscht der Rechte-Schritt. Ablauf: Code per rsync, Backup-Skript und Cron
+  vorhandener Wert bleibt unverändert. Hochgeladen wird nur, was Build und Betrieb brauchen (Allowlist:
+  Dockerfile, .dockerignore, docker-compose.yml, requirements.txt, app/, static/, sources.yaml, deploy/,
+  README.md, .env.example), und zwar der committete Stand (`git archive HEAD`); mit nicht committeten
+  Änderungen oder ungetrackten (nicht ignorierten) Dateien unter diesen Pfaden bricht der Deploy ab und
+  nennt sie (`KIOSK_ALLOW_DIRTY=1` deployt trotzdem genau HEAD, ohne diese Änderungen und Dateien).
+  `.env*` auf dem Server wird nie überschrieben oder gelöscht. Reste früherer Deploys (`tests/` usw.)
+  löscht der Rechte-Schritt. Steht in der `.env` noch `KIOSK_PASSWORD`, obwohl es schon Benutzer gibt,
+  warnt der Deploy am Ende (die Datei ändert er nicht). Ablauf: Code per rsync, Backup-Skript und Cron
   installieren, Image als `kiosk:candidate` bauen (mit Build-Zeitstempel, sichtbar in `/api/status` als
   `build`), Pre-Deploy-Backup der Datenbank (gibt auch die Zahl der Artikel aus), Container mit
   `kiosk:candidate` starten, bis zu 300 s auf `/healthz` warten

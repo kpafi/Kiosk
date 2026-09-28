@@ -25,7 +25,14 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    mem_limit: 768m
+    # Speicher: bis zu 3 Worker-Prozesse gleichzeitig (2 Extraktion + 1 Feed-Parsing, app/fetcher.py),
+    # jeder mit höchstens 320 MB Adressraum (JOB_MEMORY_LIMIT, setrlimit), zusammen 960 MB, dazu die
+    # App selbst (uvicorn, SQLite-Cache, Geschichten) und der Forkserver der Worker (ca. 75 MB mit
+    # vorgeladenem trafilatura/lxml/feedparser, ohne eigene Grenze): Reserve 320 MB = 1280 MB. So trifft der
+    # OOM-Killer des Containers nie die App, bevor ein Worker an seiner eigenen Grenze scheitert.
+    # Üblich sind App ca. 200 MB und ein bis zwei Worker mit 100-200 MB; die Box (3,7 GB) teilen sich
+    # Kiosk, secure-chat und MailDigest.
+    mem_limit: 1280m
     pids_limit: 256
     cpus: "1.5"
     logging:

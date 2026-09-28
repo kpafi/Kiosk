@@ -749,3 +749,104 @@ process.exit(0);
     assert got["focus"] == [["650px", "650", "700"], ["700px", "700", "700"]]   # abgebrochen, nicht gespeichert
     assert got["keys"] == [["684px", "684", "684"], ["760px", "760", "760"], ["320px", "320", "320"], 3]
     assert got["reset"] == ["520px", "520", None]
+
+
+def test_match_sources_finds_newspapers_in_search():
+    """Zeitungen in der Suche (sourceMatch.js): Wortanfänge in Name und Kurzname, ohne Leerzeichen,
+    Akzente und ae/oe/ue, FTS-Operatoren; Reihenfolge und Monogramm."""
+    script = """
+const { matchSources, monogram, monograms } = await import(process.argv[1] + '/sourceMatch.js');
+const S = [
+  { id: 'spiegel', name: 'Der Spiegel', short: 'SPIEGEL' },
+  { id: 'sz', name: 'Süddeutsche Zeitung', short: 'SZ' },
+  { id: 'faz', name: 'Frankfurter Allgemeine', short: 'FAZ' },
+  { id: 'ntv', name: 'n-tv', short: 'N-TV' },
+  { id: 'thelocalde', name: 'The Local Germany', short: 'LOCAL DE' },
+  { id: 'thelocalat', name: 'The Local Austria', short: 'LOCAL AT' },
+  { id: 'thelocalch', name: 'The Local Switzerland', short: 'LOCAL CH', enabled: false },
+  { id: 'taipeitimes', name: 'Taipei Times', short: 'TAIPEI TIMES', enabled: false },
+  { id: 'japantimes', name: 'The Japan Times', short: 'JAPAN TIMES' },
+  { id: 'dw', name: 'Deutsche Welle', short: 'DW' },
+  { id: 'hurriyet', name: 'Hürriyet Daily News', short: 'HÜRRIYET' },
+  { id: 'globeandmail', name: 'The Globe and Mail', short: 'GLOBE & MAIL' },
+  { id: 'tagesspiegel', name: 'Tagesspiegel', short: 'TAGESSPIEGEL' },
+  { id: 'fr', name: 'Frankfurter Rundschau', short: 'FR' },
+  { id: 'derstandard', name: 'Der Standard', short: 'STANDARD' },
+];
+const ids = (q, list = S) => matchSources(list, q).map((s) => s.id);
+const queries = ['spiegel', 'Spiegel', 'der spiegel', 'derspiegel', 'SPIEGEL', 'sz', 'faz', 'süddeutsche',
+  'suddeutsche', 'sueddeutsche', 'Süddeutsche Zeitung', 'local', 'times', 'taiwan', 'trump', 'spiegel ukraine',
+  'n-tv', 'ntv', 's', ' s ', '', '"spiegel"', 'spiegel AND', 'AND OR', 'hurriyet', 'huerriyet', 'globe mail',
+  'japan', 'taipei', 'the', 'dw', 'a*', '"s"', 's.', 'de', 'DE', 'ai', 'eu', 'fr', 'SZ', 'n tv', 'spiegel NOT taz',
+  '-spiegel', 'spiegel -ukraine', 'Su\u0308ddeutsche'];
+// Rangfolge: genau vor Liebling vor eingeschaltet vor erstes Wort vor Name.
+const R = [
+  { id: 'b', name: 'Beta Local', enabled: true },
+  { id: 'a', name: 'Alpha Local', enabled: true },
+  { id: 'c', name: 'Local Courier', enabled: true },
+  { id: 'd', name: 'Delta Local', enabled: false },
+  { id: 'e', name: 'Echo Local', enabled: false, is_favorite: true },
+  { id: 'f', name: 'Local', short: 'LOC', enabled: false },
+];
+console.log(JSON.stringify({
+  q: Object.fromEntries(queries.map((q) => [q, ids(q)])),
+  rank: ids('local', R),
+  rankFav: ids('loc', R),
+  none: [matchSources(null, 'spiegel'), matchSources(S, null)],
+  dedupe: Object.fromEntries(monograms([
+    { id: 'tehran', short: 'TEHRAN TIMES' }, { id: 'taipei', short: 'TAIPEI TIMES' }, { id: 'focus', short: 'FOCUS' },
+    { id: 'foto', name: 'Fotomagazin' }, { id: 'a1', short: 'ABC' }, { id: 'a2', short: 'ABC' },
+    { id: 'heise', short: 'HEISE' }, { id: 'helsinki', short: 'HELSINKI' }, { id: 'spiegel', short: 'SPIEGEL' },
+    { id: 'lde', short: 'LOCAL DE' }, { id: 'ldk', short: 'LOCAL DK' },
+    { id: 'tagesschau', short: 'TAGESSCHAU' }, { id: 'tagesspiegel', short: 'TAGESSPIEGEL' },
+    { id: 'derstandard', short: 'STANDARD' }, { id: 'newstatesman', short: 'STATESMAN' }])),
+  dedupeNone: [...monograms(null)],
+  nfc: ids('muenchner', [{ id: 'mm', name: 'Mu\\u0308nchner Merkur', short: 'MM' }]),
+  mono: [...S.map(monogram), monogram({ short: 'EL PAÍS' }), monogram({ short: 'HEISE SEC' }), monogram({ short: 'M&G' }),
+         monogram({ name: 'Der Spiegel' }), monogram({ short: 'BALKAN INS.' }), monogram({}), monogram({ short: 'ABC AU' })],
+}));
+"""
+    res = subprocess.run([NODE, "--input-type=module", "-e", script, str(JS.as_uri())],
+                         capture_output=True, text=True, timeout=30, env={"PATH": ""})
+    assert res.returncode == 0, res.stderr
+    got = json.loads(res.stdout)
+    q = got["q"]
+    for query in ("spiegel", "Spiegel", "der spiegel", "derspiegel", "SPIEGEL", '"spiegel"', "spiegel AND"):
+        assert q[query] == ["spiegel"], query   # Tagesspiegel nicht: nur Wortanfänge
+    assert q["sz"] == ["sz"] and q["faz"] == ["faz"]
+    for query in ("süddeutsche", "suddeutsche", "sueddeutsche", "Süddeutsche Zeitung"):
+        assert q[query] == ["sz"], query
+    assert q["hurriyet"] == ["hurriyet"] and q["huerriyet"] == ["hurriyet"]
+    # Eingeschaltete vor ausgeschalteten, dann nach Name
+    assert q["local"] == ["thelocalat", "thelocalde", "thelocalch"]
+    assert q["times"] == ["japantimes", "taipeitimes"]
+    assert q["japan"] == ["japantimes"] and q["taipei"] == ["taipeitimes"]
+    assert q["n-tv"] == ["ntv"] and q["ntv"] == ["ntv"]
+    assert q["globe mail"] == ["globeandmail"]
+    assert q["dw"] == ["dw"]
+    assert set(q["the"]) == {"thelocalde", "thelocalat", "thelocalch", "japantimes", "globeandmail"}
+    for query in ("taiwan", "trump", "spiegel ukraine", "s", " s ", "", "AND OR", "a*", '"s"', "s.", "ai", "eu"):
+        assert q[query] == [], query
+    # Unter 3 Zeichen nur genauer Kurzname oder ID: „de“ bringt keinen Block, „sz“/„dw“/„fr“ schon
+    assert q["de"] == [] and q["DE"] == []
+    assert q["SZ"] == ["sz"] and q["fr"] == ["fr"] and q["n tv"] == ["ntv"]
+    # Keine Ausschlüsse (wie die Artikelsuche): „-spiegel“ sucht „spiegel“, NOT fällt weg, jedes Wort muss passen
+    assert q["-spiegel"] == ["spiegel"]
+    for query in ("spiegel NOT taz", "spiegel -ukraine"):
+        assert q[query] == [], query
+    # Zerlegte Umlaute (u + Trema) wie fertige
+    assert q["Su\u0308ddeutsche"] == ["sz"]
+    assert got["nfc"] == ["mm"]   # zerlegtes ü im Namen wird auch zu ue
+    # genau (Name) zuerst, dann Liebling, eingeschaltet, erstes Wort, Name
+    assert got["rank"] == ["f", "e", "c", "a", "b", "d"]
+    # „loc“: Kurzname LOC ist genau
+    assert got["rankFav"] == ["f", "e", "c", "a", "b", "d"]
+    assert got["none"] == [[], []]
+    assert got["mono"] == ["SP", "SZ", "FAZ", "NTV", "LDE", "LAT", "LCH", "TT", "JT", "DW", "HU", "GM", "TA",
+                           "FR", "ST", "EP", "HS", "MG", "DS", "BI", "", "ABC"]
+    # Gleiche Monogramme in der angezeigten Liste werden dreistellig, sonst bleiben sie
+    assert got["dedupe"] == {"tehran": "TET", "taipei": "TAT", "focus": "FOC", "foto": "FOT", "a1": "ABC", "a2": "ABC",
+                             "heise": "HEI", "helsinki": "HEL", "spiegel": "SP", "lde": "LDE", "ldk": "LDK",
+                             # dreistellig immer noch gleich: Stelle, an der sie sich trennen
+                             "tagesschau": "TSC", "tagesspiegel": "TSP", "derstandard": "SAN", "newstatesman": "SAT"}
+    assert got["dedupeNone"] == []

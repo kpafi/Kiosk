@@ -76,6 +76,13 @@ Kiosk ist ein privater Zeitungskiosk auf einem schwarzen Display: eine ruhige, c
 - Gemerkt hat zwei Reiter als Chips: „Später lesen“ und „Favoriten“. Der Stern in der Leseansicht merkt einen Artikel als Favorit, das Lesezeichen legt ihn auf „Später lesen“.
 - Einstellungen: Erscheinungsbild als drei Chips (System, Dunkel, Hell), Abrufintervall und Aufbewahrung als Zeilen mit Wert und Pfeil, Textgröße als Chips, Abmelden als Pille mit `rule`-Kontur am Ende. Jede Zeile ist `tap` hoch und durch `hairline` getrennt.
 
+## Zeitungen in der Suche
+
+- Passt die Suche auf Zeitungen, stehen sie über den Artikeln unter dem `section`-Titel ZEITUNGEN (rechts die Zahl in `caption`), die Artikel folgen unter ARTIKEL.
+- Die Zeitungen liegen als ein Block auf `raised` mit `radius-md`, ohne Kontur und Schatten, Zeilen durch `hairline` getrennt. Höchstens drei Zeilen, darunter „N weitere Zeitungen“ in `meta` und `muted` mit Chevron.
+- Eine Zeile: links ein Kreis mit `rule`-Kontur und Monogramm in `dot` (LDE, SZ, SP), daneben der Name in `sans` 18px, darunter in `meta` Land und Ungelesen („DE / 12 UNGELESEN HEUTE“, gefüllter `star` davor bei Lieblingszeitungen), rechts ein Pfeil in einem kleinen `rule`-Kreis. Die ganze Zeile führt zur Zeitung.
+- Ausgeschaltete Zeitungen stehen gedämpft da: Name und Monogramm in `muted`, der Kreis gestrichelt, die Meta-Zeile „CH / AUSGESCHALTET“. Sie bleiben antippbar.
+
 ## Layout
 
 - Eine Spalte bis `measure`, zentriert. Kopf: KIOSK links, Suche und Menü rechts als runde Schaltflächen mit `rule`-Kontur.

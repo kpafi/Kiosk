@@ -19,6 +19,7 @@ const SHELL = [
   '/js/layout.js',
   '/js/saver.js',
   '/js/listwidth.js',
+  '/js/sourceMatch.js',
   '/js/ui/dom.js',
   '/js/ui/icons.js',
   '/js/ui/row.js',

@@ -7,6 +7,7 @@ import hmac
 import ipaddress
 import os
 import re
+import secrets
 import time
 from collections import OrderedDict
 from typing import Any, Callable
@@ -19,6 +20,14 @@ from .config import USERNAME_RE, Settings
 SECURE_COOKIE_NAME = "__Host-kiosk_session"
 PLAIN_COOKIE_NAME = "kiosk_session"
 COOKIE_NAMES = (SECURE_COOKIE_NAME, PLAIN_COOKIE_NAME)
+# Bekanntes Gerät (OWASP "device cookie"): nach erfolgreichem Login gesetzt, an den Benutzernamen
+# gebunden, überlebt das Abmelden. Wer es vorzeigt, ist von der globalen Notbremse und der Bremse je
+# Benutzername ausgenommen (die ein Angreifer sonst für alle auslösen könnte), nicht aber von der je
+# IP; Fehlversuche mit dem Cookie zählen je Gerät (MAX_DEVICE_ATTEMPTS).
+SECURE_DEVICE_COOKIE_NAME = "__Host-kiosk_device"
+PLAIN_DEVICE_COOKIE_NAME = "kiosk_device"
+DEVICE_MAX_AGE = 365 * 86400
+_DEVICE_RE = re.compile(r"d:([a-z0-9._-]{2,32}):([0-9a-f]{32})")
 
 # Login-Bremse: je IP höchstens MAX_ATTEMPTS, je Benutzername MAX_USER_ATTEMPTS Versuche in
 # WINDOW_SECONDS, dazu eine Notbremse über alle Anfragen (GLOBAL_MAX_ATTEMPTS pro
@@ -30,6 +39,8 @@ WINDOW_SECONDS = 15 * 60
 MAX_TRACKED_KEYS = 1000
 GLOBAL_MAX_ATTEMPTS = 200
 GLOBAL_WINDOW_SECONDS = 60
+# Fehlversuche je bekanntem Gerät (Device-Cookie) in WINDOW_SECONDS.
+MAX_DEVICE_ATTEMPTS = 10
 
 _PAYLOAD_RE = re.compile(r"u:([0-9]{1,18}):([0-9]{1,18}):([0-9a-f]{16})")
 
@@ -39,10 +50,12 @@ LOGIN_ERROR = "Benutzername oder Passwort falsch"
 # Zähler echter Namen nicht aus der begrenzten Liste verdrängen.
 INVALID_NAME_KEY = "?ungueltig"
 
-# scrypt-Parameter für neue Hashes (ca. 16 MiB Speicher, einige 10 ms pro Hash).
+# scrypt-Parameter für neue Hashes: N=2^14, r=8 (16 MiB Speicher) mit p=5 nach der OWASP-Empfehlung
+# (p=1 lag darunter), ca. 150-200 ms pro Hash. Ältere Hashes (p=1) prüft verify_password mit ihren
+# eigenen Parametern; needs_rehash erkennt sie, der Login ersetzt sie dann (main.login).
 SCRYPT_N = 2**14
 SCRYPT_R = 8
-SCRYPT_P = 1
+SCRYPT_P = 5
 SCRYPT_DKLEN = 32
 
 
@@ -98,6 +111,16 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(digest, expected)
 
 
+def needs_rehash(stored: str) -> bool:
+    """True, wenn der Hash nicht mit den aktuellen Parametern (SCRYPT_N/R/P, SCRYPT_DKLEN) erstellt ist."""
+    try:
+        scheme, n, r, p, _salt, hash_b64 = stored.split("$")
+        return (scheme, int(n), int(r), int(p), len(base64.b64decode(hash_b64))) != (
+            "scrypt", SCRYPT_N, SCRYPT_R, SCRYPT_P, SCRYPT_DKLEN)
+    except ValueError:
+        return True
+
+
 # Hash für unbekannte Benutzer: Die Prüfung dauert gleich lang wie bei einem echten Konto.
 _DUMMY_HASH = hash_password("kiosk-dummy-passwort")
 
@@ -107,7 +130,13 @@ def burn_time(password: str) -> None:
 
 
 class _Limiter:
-    """Zählt Fehlversuche je Schlüssel in einem gleitenden Zeitfenster, begrenzt auf max_keys Schlüssel."""
+    """Zählt Fehlversuche je Schlüssel in einem gleitenden Zeitfenster, begrenzt auf max_keys Schlüssel.
+
+    Ist die Liste voll, fliegt nicht einfach der älteste Schlüssel: Sonst könnte ein Angreifer mit
+    max_keys erfundenen Namen den Zähler eines echten Namens verdrängen und dort weiter raten. Es
+    fliegt der Schlüssel mit den wenigsten Versuchen im Fenster (bei Gleichstand der älteste), nie
+    einer, der gerade gesperrt ist; ein Name mit k Versuchen verschwindet erst, wenn alle anderen
+    mindestens k haben (k * max_keys Versuche, gebremst von der globalen Notbremse)."""
 
     def __init__(self, limit: int, window: float, max_keys: int):
         self.limit, self.window, self.max_keys = limit, window, max_keys
@@ -128,8 +157,25 @@ class _Limiter:
         recent = [t for t in self.attempts.pop(key, []) if now - t < self.window]
         recent.append(now)
         self.attempts[key] = recent[-self.limit:]
+        if len(self.attempts) > self.max_keys:
+            self._prune(now)
         while len(self.attempts) > self.max_keys:
-            self.attempts.popitem(last=False)  # ältesten Eintrag verwerfen
+            self._evict(now, keep=key)
+
+    def _evict(self, now: float, keep: str) -> None:
+        """Verwirft den Schlüssel mit den wenigsten Versuchen im Fenster (Gleichstand: den ältesten),
+        nie einen gesperrten und nie `keep` (den gerade gezählten). Sind alle anderen gesperrt, den
+        ältesten davon: Der Speicher bleibt begrenzt (praktisch unerreichbar, siehe Klassendoku)."""
+        victim, fewest = None, None
+        for k, ts in self.attempts.items():
+            if k == keep:
+                continue
+            n = sum(1 for t in ts if now - t < self.window)
+            if n < self.limit and (fewest is None or n < fewest):
+                victim, fewest = k, n
+        if victim is None:
+            victim = next(k for k in self.attempts if k != keep)
+        del self.attempts[victim]
 
     def clear(self, key: str) -> None:
         self.attempts.pop(key, None)
@@ -161,7 +207,10 @@ class Auth:
         self.cookie_name = SECURE_COOKIE_NAME if settings.cookie_secure else PLAIN_COOKIE_NAME
         self._by_ip = _Limiter(MAX_ATTEMPTS, WINDOW_SECONDS, MAX_TRACKED_KEYS)
         self._by_user = _Limiter(MAX_USER_ATTEMPTS, WINDOW_SECONDS, MAX_TRACKED_KEYS)
+        self._by_device = _Limiter(MAX_DEVICE_ATTEMPTS, WINDOW_SECONDS, MAX_TRACKED_KEYS)
         self._global = _Limiter(GLOBAL_MAX_ATTEMPTS, GLOBAL_WINDOW_SECONDS, 1)
+        self.device_cookie_name = SECURE_DEVICE_COOKIE_NAME if settings.cookie_secure else PLAIN_DEVICE_COOKIE_NAME
+        self._device_signer = TimestampSigner(settings.secret, salt="kiosk-device-v1")
 
     def fingerprint(self, password_hash: str) -> str:
         return hmac.new(self._secret, password_hash.encode(), hashlib.sha256).hexdigest()[:16]
@@ -197,29 +246,61 @@ class Auth:
             return None
         return user
 
+    # ---- Bekanntes Gerät ------------------------------------------------
+
+    def issue_device(self, username: str) -> str:
+        """Neues Device-Cookie für diesen Benutzernamen (eigene Zufalls-ID je Login)."""
+        return self._device_signer.sign(f"d:{username}:{secrets.token_hex(16)}".encode()).decode()
+
+    def device_id(self, cookies: dict[str, str], username: str | None) -> str | None:
+        """ID des Geräts, wenn das Device-Cookie (nur der Name des aktuellen Modus) gültig signiert,
+        nicht abgelaufen und an genau diesen Benutzernamen gebunden ist; sonst None."""
+        token = cookies.get(self.device_cookie_name)
+        if not token or not username:
+            return None
+        try:
+            payload = self._device_signer.unsign(token.encode(), max_age=DEVICE_MAX_AGE).decode()
+        except (BadSignature, SignatureExpired, UnicodeDecodeError):
+            return None
+        m = _DEVICE_RE.fullmatch(payload)
+        if not m or not hmac.compare_digest(m[1], username):
+            return None
+        return m[2]
+
     # ---- Login-Bremse --------------------------------------------------
 
-    def rate_limited(self, ip: str, username: str) -> bool:
-        return (self._global.limited("*") or self._by_ip.limited(ip)
-                or self._by_user.limited(username))
+    def rate_limited(self, ip: str, username: str, device: str | None = None) -> bool:
+        """Gebremst? Mit bekanntem Gerät (`device`, siehe device_id) zählen nur die Grenzen je IP und
+        je Gerät, ohne die globale Notbremse und die je Benutzername."""
+        if self._by_ip.limited(ip):
+            return True
+        if device is not None:
+            return self._by_device.limited(device)
+        return self._global.limited("*") or self._by_user.limited(username)
 
-    def note_failure(self, ip: str, username: str) -> None:
-        self._global.note("*")
+    def note_failure(self, ip: str, username: str, device: str | None = None) -> None:
         self._by_ip.note(ip)
+        if device is not None:
+            self._by_device.note(device)
+            return
+        self._global.note("*")
         self._by_user.note(username)
 
-    def reserve(self, ip: str, username: str) -> bool:
+    def reserve(self, ip: str, username: str, device: str | None = None) -> bool:
         """Prüft die Grenzen und zählt den Versuch im selben synchronen Schritt (ohne await
         dazwischen), also vor der Passwortprüfung: Parallele Anfragen können die Bremse so nicht
         überholen. False = gebremst, nichts gezählt. Nach erfolgreichem Login clear() aufrufen."""
-        if self.rate_limited(ip, username):
+        if self.rate_limited(ip, username, device):
             return False
-        self.note_failure(ip, username)
+        self.note_failure(ip, username, device)
         return True
 
-    def clear(self, ip: str, username: str) -> None:
+    def clear(self, ip: str, username: str, device: str | None = None) -> None:
         """Nach erfolgreichem Login: Die IP bekommt nur die eigene Reservierung zurück (ihre
         übrigen Fehlversuche bleiben, sonst könnte ein eigenes Konto die Bremse für Rateversuche
-        gegen andere Namen immer wieder zurücksetzen); die Fehlversuche des Namens verfallen."""
+        gegen andere Namen immer wieder zurücksetzen); die Fehlversuche des Namens und des Geräts
+        verfallen."""
         self._by_ip.release(ip)
         self._by_user.clear(username)
+        if device is not None:
+            self._by_device.clear(device)

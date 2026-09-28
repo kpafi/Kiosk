@@ -65,6 +65,11 @@ CREATE INDEX IF NOT EXISTS idx_articles_status ON articles (text_status);
 -- bestehende Datenbanken bekommen den Tausch so ohne neue Schema-Version.
 DROP INDEX IF EXISTS idx_articles_source;
 CREATE INDEX IF NOT EXISTS idx_articles_source_counts ON articles (source_id, published_at, paywalled);
+-- Artikelliste über viele Quellen (ALLE, Profile): nach Zeit mit Quelle und paywalled im Index, damit
+-- die Liste in Zeitreihenfolge läuft, ohne für jeden Eintrag die Artikelzeile samt Volltext zu lesen,
+-- bis LIMIT erreicht ist (siehe LIST_INDEX). Wie oben ohne neue Schema-Version: SCHEMA läuft bei jedem
+-- Start, ältere Versionen der App stören sich an dem zusätzlichen Index nicht.
+CREATE INDEX IF NOT EXISTS idx_articles_list ON articles (published_at DESC, id DESC, source_id, paywalled);
 
 -- Bereits gesehene Feed-Einträge. Bleiben nach dem Löschen der Artikel (purge) länger erhalten,
 -- damit Einträge ohne Datum (published_at = Zeitpunkt des ersten Abrufs) nicht nach Ablauf der
@@ -214,6 +219,10 @@ SEEN_REFRESH = timedelta(days=1)
 # Leerraum am Rand eines Anreißers, wie stories._fields ihn abschneidet (Länge „kurzer Anreißer“ gleich
 # in SQL und Python): Leerzeichen, Tab, Zeilenumbrüche, geschütztes Leerzeichen.
 SUMMARY_TRIM = " \t\n\r\xa0"
+# Große Schreibvorgänge in Blöcken mit je eigener Transaktion, dazwischen kommt die Event-Loop dran:
+# purge (Artikel je Block) und „alles gelesen“ (Artikel-IDs je Block).
+PURGE_BATCH = 200          # ca. 50-70 ms je Block (FTS-Trigger, Cascade), 80 000 Artikel
+MARK_READ_ID_STEP = 2000   # ca. 45 ms je Block für einen frischen Benutzer
 SAME_URL_WINDOW = timedelta(hours=6)  # gleiche Adresse und gleicher Titel so nah beieinander: derselbe Artikel
 
 # Lesestand des Benutzers aus user_articles (Alias ua, per LEFT JOIN; ohne Zeile: 0).
@@ -223,6 +232,14 @@ USER_JOIN = "LEFT JOIN user_articles ua ON ua.article_id = a.id AND ua.user_id =
 # Zähler je Quelle nur aus dem Index (siehe SCHEMA): Der Planer wählt ihn nicht immer von selbst
 # (z. B. ohne Aufbewahrungsgrenze), und jede Artikelzeile samt Volltext zu lesen kostet viel.
 COUNT_INDEX = "INDEXED BY idx_articles_source_counts"
+# Artikelliste über mehrere Quellen: Mit "a.source_id IN (...)" nimmt der Planer sonst den Index über
+# (source_id, guid) bzw. (source_id, published_at), liest ALLE Artikel dieser Quellen samt Spalten und
+# sortiert sie (TEMP B-TREE; 80 000 Artikel: 110-130 ms je Seite, auch für Seite 2 und „Nächster“). In
+# Zeitreihenfolge über idx_articles_list endet die Abfrage nach LIMIT passenden Zeilen (unter 1 ms);
+# selbst wenn fast nichts passt (fast alles gelesen, leere Quellen), prüft sie nur Indexeinträge
+# (ca. 45 ms statt 125 ms). Nicht für eine einzelne Quelle (ihr Index liefert schon die Reihenfolge),
+# für Suche (bm25) und für Gemerkt/Später (dort sind die wenigen Zeilen aus user_articles der beste Start).
+LIST_INDEX = "INDEXED BY idx_articles_list"
 
 ARTICLE_LIST_COLS = ", ".join(
     f"a.{c}" for c in (
@@ -438,13 +455,22 @@ class Database:
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
+        """Schreibende Transaktion. BEGIN IMMEDIATE nimmt die Schreibsperre gleich am Anfang (wartet
+        dabei höchstens busy_timeout): Viele Methoden lesen erst und schreiben dann (set_flag,
+        mark_all_read, schedule_retry, put_favorite, create_profile, reorder, seed_profiles). Mit
+        einem einfachen BEGIN scheitert der Wechsel vom Lesen zum Schreiben sofort mit "database is
+        locked", wenn ein anderer Prozess (python -m app.users, Backup) inzwischen geschrieben hat;
+        busy_timeout hilft dann nicht. Zurückgerollt wird bei jedem Abbruch, auch bei
+        CancelledError oder KeyboardInterrupt."""
         with self._lock:
-            self._conn.execute("BEGIN")
+            self._conn.execute("BEGIN IMMEDIATE")
             try:
                 yield self._conn
                 self._conn.execute("COMMIT")
-            except Exception:
-                self._conn.execute("ROLLBACK")
+            except BaseException:
+                # Manche Fehler (z. B. SQLITE_FULL) beenden die Transaktion schon selbst.
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
                 raise
 
     def _progress(self) -> int:
@@ -710,8 +736,17 @@ class Database:
             c.execute("UPDATE articles SET next_attempt_at=NULL, text_error=? "
                       "WHERE id=? AND text_status='pending'", (error[:500], article_id))
 
-    def published_at_of(self, article_id: int) -> str | None:
-        r = self.one("SELECT published_at FROM articles WHERE id=?", (article_id,))
+    def published_at_of(self, article_id: int, user_id: int | None = None) -> str | None:
+        """published_at des Artikels; für einen Benutzer nur, wenn er ihn sehen darf (wie
+        get_article): Ein alter Artikel, den nur ein anderer gemerkt hat, gilt als nicht vorhanden."""
+        where, params = ["a.id=?"], [article_id]
+        if user_id is not None:
+            where, params = _article_filter(sources=None, unread=False, starred=False, free_only=False,
+                                            cutoff=self.retention_cutoff())
+            where.append("a.id=?")
+            params.append(article_id)
+        r = self.one(f"SELECT a.published_at FROM articles a {USER_JOIN} WHERE {' AND '.join(where)}",
+                     (user_id, *params))
         return r["published_at"] if r else None
 
     def retention_cutoff(self) -> str | None:
@@ -719,7 +754,7 @@ class Database:
         sichtbar sind, die sie gemerkt haben; None = keine Aufbewahrungsgrenze gesetzt."""
         if not self.retention_days:
             return None
-        return (datetime.now(timezone.utc) - timedelta(days=self.retention_days)).isoformat()
+        return _iso(datetime.now(timezone.utc) - timedelta(days=self.retention_days))
 
     def today_start(self, now: datetime | None = None) -> str:
         """Beginn des heutigen Tages (00:00 in self.tz) wie published_at gespeichert: Ab hier zählen
@@ -735,11 +770,25 @@ class Database:
         """Artikelliste. Ohne Suche per Keyset-Cursor `before` = (published_at, id),
         mit Suche (bm25-Sortierung) per `offset`. `terms` (Profil-Begriffe) filtern nur,
         die Sortierung bleibt chronologisch. Flags und Filter gelten für `user_id`."""
+        sql, params = self.list_articles_sql(
+            user_id, sources=sources, query=query, unread=unread, starred=starred, free_only=free_only,
+            before=before, limit=limit, offset=offset, later=later, terms=terms, since=since)
+        return self.q(sql, params)
+
+    def list_articles_sql(self, user_id: int, *, sources: list[str] | None,
+                          query: str | None, unread: bool, starred: bool, free_only: bool,
+                          before: tuple[str, int] | None, limit: int, offset: int = 0,
+                          later: bool = False, terms: list[str] | None = None,
+                          since: str | None = None) -> tuple[str, tuple]:
+        """SQL und Parameter für list_articles (getrennt, damit Tests den Plan prüfen können)."""
         where, params = _article_filter(sources=sources, unread=unread, starred=starred,
                                         free_only=free_only, later=later, terms=terms, since=since,
                                         cutoff=self.retention_cutoff())
         join = ""
         order = "a.published_at DESC, a.id DESC"
+        index = ""
+        if not query and not starred and not later and (sources is None or len(sources) > 1):
+            index = LIST_INDEX
         if query:
             join = "JOIN articles_fts f ON f.rowid = a.id"
             where.append("articles_fts MATCH ?")
@@ -749,7 +798,7 @@ class Database:
             where.append("(a.published_at, a.id) < (?, ?)")
             params += [before[0], before[1]]
         sql = (
-            f"SELECT {ARTICLE_LIST_COLS} FROM articles a {USER_JOIN} {join} "
+            f"SELECT {ARTICLE_LIST_COLS} FROM articles a {index} {USER_JOIN} {join} "
             + (("WHERE " + " AND ".join(where)) if where else "")
             + f" ORDER BY {order} LIMIT ?"
         )
@@ -757,7 +806,7 @@ class Database:
         if query and offset:
             sql += " OFFSET ?"
             params.append(offset)
-        return self.q(sql, tuple(params))
+        return sql, tuple(params)
 
     def count_articles(self, user_id: int, *, cap: int, sources: list[str] | None = None, query: str | None = None,
                        unread: bool = False, starred: bool = False, free_only: bool = False,
@@ -813,23 +862,41 @@ class Database:
                       max_id: int | None = None) -> int:
         """Markiert alle Artikel der Menge als gelesen (sources None = alle, [] = keine), mit
         `max_id` nur Artikel bis zu dieser ID. Gibt die Zahl der markierten Artikel ohne Paywall
-        zurück (so viele, wie die Oberfläche als ungelesen gezählt hat)."""
+        zurück (so viele, wie die Oberfläche als ungelesen gezählt hat). Am Stück; die API nimmt
+        mark_all_read_steps und gibt der Event-Loop zwischen den Blöcken Luft."""
+        return sum(self.mark_all_read_steps(user_id, sources, terms, max_id))
+
+    def mark_all_read_steps(self, user_id: int, sources: list[str] | None, terms: list[str] | None = None,
+                            max_id: int | None = None) -> Iterator[int]:
+        """Wie mark_all_read, in Blöcken von MARK_READ_ID_STEP Artikel-IDs mit je einer eigenen
+        Transaktion; liefert je Block die Zahl der markierten Artikel ohne Paywall. Ein frischer
+        Benutzer mit allem ungelesen schreibt sonst Zehntausende Zeilen in einer Transaktion (ca. 0,8 s,
+        in der die Event-Loop steht).
+
+        Die Menge steht beim Aufruf fest: höchstens bis zur damals höchsten ID (bzw. `max_id`), mit
+        der Aufbewahrungsgrenze von da; später geholte Artikel bleiben ungelesen, wie am Stück."""
         where, params = _article_filter(sources=sources, unread=True, starred=False,
                                         free_only=False, terms=terms, cutoff=self.retention_cutoff())
-        if max_id is not None:
-            where.append("a.id <= ?")
-            params.append(max_id)
-        cond = " AND ".join(where)
-        with self.tx() as c:
-            visible = c.execute(f"SELECT COUNT(*) AS n FROM articles a {USER_JOIN} WHERE {cond} "
-                                "AND a.paywalled=0", (user_id, *params)).fetchone()["n"]
-            # WHERE ist Pflicht vor ON CONFLICT (sonst mehrdeutig für den SQLite-Parser); cond ist nie leer.
-            c.execute(
-                "INSERT INTO user_articles (user_id, article_id, read, updated_at) "
-                f"SELECT ?, a.id, 1, ? FROM articles a {USER_JOIN} WHERE {cond} "
-                "ON CONFLICT (user_id, article_id) DO UPDATE SET read=1, updated_at=excluded.updated_at",
-                (user_id, utcnow(), user_id, *params))
-            return visible
+        bounds = self.one("SELECT MIN(id) AS lo, MAX(id) AS hi FROM articles", time_limit=None)
+        if bounds["lo"] is None:
+            return
+        hi = bounds["hi"] if max_id is None else min(max_id, bounds["hi"])
+        cond = " AND ".join([*where, "a.id > ?", "a.id <= ?"])
+        now = utcnow()
+        # Blöcke über die Artikel-ID (Primärschlüssel): NOT INDEXED hält den Planer beim Bereich der ID,
+        # statt je Block alle Artikel der Quellen über deren Index zu lesen.
+        for start in range(bounds["lo"] - 1, hi, MARK_READ_ID_STEP):
+            window = (start, min(start + MARK_READ_ID_STEP, hi))
+            with self.tx() as c:
+                visible = c.execute(f"SELECT COUNT(*) AS n FROM articles a NOT INDEXED {USER_JOIN} WHERE {cond} "
+                                    "AND a.paywalled=0", (user_id, *params, *window)).fetchone()["n"]
+                # WHERE ist Pflicht vor ON CONFLICT (sonst mehrdeutig für den SQLite-Parser); cond ist nie leer.
+                c.execute(
+                    "INSERT INTO user_articles (user_id, article_id, read, updated_at) "
+                    f"SELECT ?, a.id, 1, ? FROM articles a NOT INDEXED {USER_JOIN} WHERE {cond} "
+                    "ON CONFLICT (user_id, article_id) DO UPDATE SET read=1, updated_at=excluded.updated_at",
+                    (user_id, now, user_id, *params, *window))
+            yield visible
 
     def article_counts(self, user_id: int, unread_sources: list[str] | None = None, *,
                        time_limit: float | None = _FROM_CONTEXT) -> dict[str, int]:
@@ -857,18 +924,39 @@ class Database:
         return {r["source_id"]: r["n"] for r in rows}
 
     def purge(self, retention_days: int) -> int:
+        """Löscht alte Artikel am Stück (siehe purge_steps); gibt die Zahl der gelöschten zurück."""
+        return sum(self.purge_steps(retention_days))
+
+    def purge_steps(self, retention_days: int) -> Iterator[int]:
         """Löscht alte Artikel. Was irgendein Benutzer gemerkt hat (Favorit oder „Später lesen“),
         bleibt; der Lesestand gelöschter Artikel verschwindet per Cascade.
-        seen_guids bleiben doppelt so lange erhalten."""
+        seen_guids bleiben doppelt so lange erhalten.
+
+        In Blöcken zu PURGE_BATCH Artikeln, je Block eine Transaktion; liefert je Block die Zahl der
+        gelöschten Artikel (für seen_guids 0). Jede gelöschte Zeile kostet den FTS-Trigger und die
+        Cascade nach user_articles: 26 000 Artikel in einer Transaktion hielten die Event-Loop über
+        7 s an. Der Sammler gibt zwischen den Blöcken ab (Fetcher._purge)."""
         now = datetime.now(timezone.utc)
-        cutoff = (now - timedelta(days=retention_days)).isoformat()
+        cutoff = _iso(now - timedelta(days=retention_days))
         seen_cutoff = _iso(now - timedelta(days=2 * retention_days))
-        with self.tx() as c:
-            cur = c.execute(
-                "DELETE FROM articles WHERE published_at < ? AND NOT EXISTS (SELECT 1 FROM user_articles ua "
-                "WHERE ua.article_id = articles.id AND (ua.starred=1 OR ua.later=1))", (cutoff,))
-            c.execute("DELETE FROM seen_guids WHERE first_seen < ?", (seen_cutoff,))
-            return cur.rowcount
+        while True:
+            with self.tx() as c:
+                n = c.execute(
+                    "DELETE FROM articles WHERE id IN (SELECT a.id FROM articles a WHERE a.published_at < ? "
+                    "AND NOT EXISTS (SELECT 1 FROM user_articles ua WHERE ua.article_id = a.id "
+                    "AND (ua.starred=1 OR ua.later=1)) LIMIT ?)", (cutoff, PURGE_BATCH)).rowcount
+            yield n
+            if n < PURGE_BATCH:
+                break
+        while True:
+            # Ohne Trigger und Cascade, also billig: größere Blöcke.
+            with self.tx() as c:
+                n = c.execute(
+                    "DELETE FROM seen_guids WHERE (source_id, guid) IN (SELECT source_id, guid FROM seen_guids "
+                    "WHERE first_seen < ? LIMIT ?)", (seen_cutoff, 10 * PURGE_BATCH)).rowcount
+            yield 0
+            if n < 10 * PURGE_BATCH:
+                break
 
     def stats(self, user_id: int | None = None) -> dict[str, Any]:
         """Kennzahlen der Datenbank; unread und starred gelten für `user_id`. unread zählt hier alle
@@ -1364,7 +1452,9 @@ def _fts_query(raw: str) -> str:
     Anführungszeichen werden dabei verdoppelt.
     """
     words = [w.strip('"\'*()^:-') for w in raw.split()]
-    words = [w for w in words if w][:SEARCH_MAX_WORDS]
+    # Nur Stücke mit Wortzeichen: "–", "&", "/" oder "+" allein ergäben eine leere Phrase, und die
+    # findet nichts ("Merz – Macron" hätte keinen Treffer). Die Obergrenze gilt nach dem Filtern.
+    words = [w for w in words if _TOKEN_RE.search(w)][:SEARCH_MAX_WORDS]
     if not words:
         return '""'
     return " AND ".join(_phrase(w) for w in words)

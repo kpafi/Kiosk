@@ -30,5 +30,9 @@ HEALTHCHECK --interval=60s --timeout=5s --start-period=180s \
 # SQLite-Verbindung setzen einen einzigen Prozess voraus. --workers nicht erhöhen.
 # Proxy-Header nur von Caddy akzeptieren: Der kommt über docker-proxy vom Gateway des fest
 # vorgegebenen Compose-Netzes herein (docker-compose.yml: 172.19.0.0/16, Gateway 172.19.0.1).
+# Ohne Server-Kopfzeile (Version) und ohne Zugriffsprotokoll: Caddy verwirft seine Logs bewusst, das
+# Protokoll von uvicorn landete mit allen Suchbegriffen (?q=...) und Artikel-IDs in docker logs.
+# Fehler und Meldungen der App (logging) bleiben.
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8100", "--workers", "1", \
-     "--proxy-headers", "--forwarded-allow-ips", "127.0.0.1,172.19.0.1"]
+     "--proxy-headers", "--forwarded-allow-ips", "127.0.0.1,172.19.0.1", \
+     "--no-server-header", "--no-access-log"]

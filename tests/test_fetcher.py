@@ -556,7 +556,7 @@ ARTICLE_HTML = ("<html><head><title>T</title></head><body><article><h1>Titel</h1
                 + "</article></body></html>")
 
 
-async def test_hung_extraction_times_out_and_pool_is_recreated(db, settings, monkeypatch):
+async def test_hung_extraction_times_out_and_only_its_process_is_killed(db, settings, monkeypatch):
     import uuid
     token = uuid.uuid4().hex
     pidfile = _pidfile(token)
@@ -567,13 +567,11 @@ async def test_hung_extraction_times_out_and_pool_is_recreated(db, settings, mon
         200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
     try:
         monkeypatch.setattr(fetcher_mod, "extract", _sleepy_extract)
-        old_pool = f._extraction_pool()
         # Der Sammellauf kommt nach dem Zeitlimit weiter, statt 60 s zu hängen.
         assert await asyncio.wait_for(f._extract_pending(), timeout=15) == 1
         row = db.get_article(first)
         assert row["text_status"] == "pending" and row["attempts"] == 1
         assert row["text_error"] == "Extraktion Zeitüberschreitung"
-        assert f._pool is None  # verworfen, wird beim nächsten Auftrag neu angelegt
         pid = int(pidfile.read_text())
         pidfile.unlink()
         for _ in range(50):
@@ -581,45 +579,60 @@ async def test_hung_extraction_times_out_and_pool_is_recreated(db, settings, mon
                 break
             await asyncio.sleep(0.1)
         assert _gone_or_zombie(pid), "hängender Worker wurde nicht beendet"
+        assert not f._pids
 
-        # Zweite Extraktion mit neuem Pool funktioniert.
+        # Die nächste Extraktion bekommt ihren eigenen Prozess und funktioniert.
         monkeypatch.setattr(fetcher_mod, "extract", extract_mod.extract)
         db.upsert_articles([make_row("alpha", 2, ago(minutes=5), url=f"{PUBLIC}/a/2")])
         second = db.one("SELECT id FROM articles WHERE guid='alpha-2'")["id"]
         await asyncio.wait_for(f.extract_article(second, f"{PUBLIC}/a/2"), timeout=30)
-        assert f._pool is not None and f._pool is not old_pool
         assert db.get_article(second)["text_status"] in ("full", "partial")
     finally:
         await f.close()
-    assert f._pool is None
 
 
-async def test_broken_pool_is_transient_and_replaced(db, settings, monkeypatch):
-    from concurrent.futures.process import BrokenProcessPool
+def _crashing_extract(page, url):
+    """Läuft im Worker-Prozess: stirbt ohne Ergebnis (wie nach SIGKILL durch den OOM-Killer)."""
+    import os
+    import signal
+    os.kill(os.getpid(), signal.SIGKILL)
+
+
+def _hungry_extract(page, url):
+    """Läuft im Worker-Prozess: will weit mehr Speicher als JOB_MEMORY_LIMIT."""
+    return bytearray(2 * 1024 ** 3)
+
+
+async def test_crashed_worker_counts_one_attempt(db, settings, monkeypatch):
     aid = _article(db)
     f = make_fetcher(db, settings, lambda r: httpx.Response(
         200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
-
-    class Broken:
-        def submit(self, *a, **kw):
-            raise BrokenProcessPool("Worker gestorben")
-
-        def shutdown(self, **kw):
-            pass
-
-    # Erster Absturz: Schuld unbekannt (z. B. ein feindlicher Feed im selben Pool), ohne Zählung
-    # sofort wieder fällig.
-    f._pool = Broken()
-    await f.extract_article(aid, f"{PUBLIC}/artikel")
+    monkeypatch.setattr(fetcher_mod, "extract", _crashing_extract)
+    try:
+        await asyncio.wait_for(f.extract_article(aid, f"{PUBLIC}/artikel"), timeout=30)
+    finally:
+        await f.close()
     row = db.get_article(aid)
-    assert row["text_status"] == "pending" and row["attempts"] == 0 and row["next_attempt_at"] is None
-    assert "Worker gestorben" in row["text_error"] and f._pool is None
-    # Zweiter Absturz mit demselben Artikel: zählt als Versuch.
-    f._pool = Broken()
-    await f.extract_article(aid, f"{PUBLIC}/artikel")
-    row = db.get_article(aid)
-    assert row["text_status"] == "pending" and row["attempts"] == 1 and "abgebrochen" in row["text_error"]
-    assert f._pool is None and aid not in f._crash_suspects
+    # Der Absturz gehört eindeutig zu diesem Auftrag (eigener Prozess): ein Versuch, später erneut.
+    assert row["text_status"] == "pending" and row["attempts"] == 1
+    assert "Worker-Prozess beendet" in row["text_error"]
+
+
+async def test_memory_limit_fails_only_that_job(db, settings, monkeypatch):
+    aid = _article(db)
+    f = make_fetcher(db, settings, lambda r: httpx.Response(
+        200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
+    monkeypatch.setattr(fetcher_mod, "extract", _hungry_extract)
+    try:
+        await asyncio.wait_for(f.extract_article(aid, f"{PUBLIC}/artikel"), timeout=30)
+        row = db.get_article(aid)
+        assert row["text_status"] == "failed" and "zu viel Speicher" in row["text_error"]
+        # Der nächste Auftrag läuft normal.
+        monkeypatch.setattr(fetcher_mod, "extract", extract_mod.extract)
+        result = await f._run_extract(ARTICLE_HTML.encode(), f"{PUBLIC}/x")
+        assert result.status in ("full", "partial")
+    finally:
+        await f.close()
 
 
 def _timed_extract(page, url):
@@ -637,19 +650,17 @@ async def test_timeout_measures_run_time_not_queue_time(db, settings, monkeypatc
     f = make_fetcher(db, settings, lambda r: httpx.Response(200))
     try:
         page = ARTICLE_HTML.encode()
-        await asyncio.gather(*(f._run_extract(page, f"{PUBLIC}/d/0") for _ in range(2)))  # Pool warm
-        pool = f._pool
+        await asyncio.gather(*(f._run_extract(page, f"{PUBLIC}/d/0") for _ in range(2)))  # Forkserver warm
         results = await asyncio.wait_for(
             asyncio.gather(*(f._run_extract(page, f"{PUBLIC}/d/0.8") for _ in range(6))), timeout=30)
         assert len(results) == 6 and all(r.status in ("full", "partial") for r in results)
-        assert f._pool is pool  # nie verworfen
     finally:
         await f.close()
 
 
-async def test_hung_job_only_counts_for_itself(db, settings, monkeypatch):
-    """Ein hängender Auftrag: nur er zählt einen Versuch; der laufende Nachbar wird ohne Zählung
-    neu eingeplant (auch als Abruf auf Anforderung ohne CancelledError), wartende laufen danach."""
+async def test_hung_job_does_not_touch_its_neighbours(db, settings, monkeypatch):
+    """Ein hängender Auftrag: nur er zählt einen Versuch; der gleichzeitig laufende Nachbar (hier ein
+    Abruf auf Anforderung) und die wartenden laufen ungestört zu Ende (je Auftrag ein Prozess)."""
     monkeypatch.setattr(fetcher_mod, "EXTRACT_TIMEOUT", 2)
     monkeypatch.setattr(fetcher_mod, "extract", _timed_extract)
     urls = {"hung": f"{PUBLIC}/d/60", "nb": f"{PUBLIC}/d/1.6", "w1": f"{PUBLIC}/d/0.1", "w2": f"{PUBLIC}/d/0.2"}
@@ -658,7 +669,7 @@ async def test_hung_job_only_counts_for_itself(db, settings, monkeypatch):
     f = make_fetcher(db, settings, lambda r: httpx.Response(
         200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
     try:
-        await asyncio.gather(*(f._run_extract(b"<p>x</p>", f"{PUBLIC}/d/0") for _ in range(2)))  # Pool warm
+        await asyncio.gather(*(f._run_extract(b"<p>x</p>", f"{PUBLIC}/d/0") for _ in range(2)))  # warm
         hung = asyncio.create_task(f.extract_article(ids["hung"], urls["hung"]))
         await asyncio.sleep(0.8)
         nb = asyncio.create_task(on_demand(f, ids["nb"], urls["nb"]))
@@ -669,50 +680,142 @@ async def test_hung_job_only_counts_for_itself(db, settings, monkeypatch):
         row = db.get_article(ids["hung"])
         assert row["text_status"] == "pending" and row["attempts"] == 1
         assert row["text_error"] == "Extraktion Zeitüberschreitung"
-        row = db.get_article(ids["nb"])
-        assert row["text_status"] == "pending" and row["attempts"] == 0 and row["next_attempt_at"] is None
-        assert "Pool neu gestartet" in row["text_error"]
-        for k in ("w1", "w2"):
-            assert db.get_article(ids[k])["text_status"] in ("full", "partial")
+        for k in ("nb", "w1", "w2"):
+            row = db.get_article(ids[k])
+            assert row["text_status"] in ("full", "partial") and row["attempts"] == 0, k
     finally:
         await f.close()
 
 
-async def test_cancelled_pool_future_is_not_a_cancelled_request(db, settings):
-    """Bricht der Pool einen Auftrag ab (shutdown mit cancel_futures), kommt beim Aufrufer kein
-    CancelledError an, sondern ein normaler vorübergehender Fehler."""
-    import concurrent.futures
+async def test_close_kills_running_job(db, settings, monkeypatch):
+    """Herunterfahren mitten in einer Extraktion: Der Worker-Prozess endet mit, der Aufrufer bekommt
+    CancelledError (kein hängender Prozess, kein gespeicherter Fehlschlag)."""
+    import uuid
+    token = uuid.uuid4().hex
+    monkeypatch.setattr(fetcher_mod, "extract", _sleepy_extract)
     aid = _article(db)
     f = make_fetcher(db, settings, lambda r: httpx.Response(
         200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
+    task = asyncio.create_task(f._run_extract(ARTICLE_HTML.encode(), f"{PUBLIC}/a/{token}"))
+    pidfile = _pidfile(token)
+    for _ in range(200):
+        if pidfile.exists() and pidfile.read_text():
+            break
+        await asyncio.sleep(0.05)
+    pid = int(pidfile.read_text())
+    pidfile.unlink()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await f.close()
+    for _ in range(50):
+        if _gone_or_zombie(pid):
+            break
+        await asyncio.sleep(0.1)
+    assert _gone_or_zombie(pid)
+    assert db.get_article(aid)["attempts"] == 0
 
-    class Cancelling:
-        def submit(self, *a, **kw):
-            fut = concurrent.futures.Future()
-            asyncio.get_running_loop().call_later(0.05, fut.cancel)
-            return fut
 
-        def shutdown(self, **kw):
-            pass
+async def test_source_breaker_skips_rest_of_source_after_two_timeouts(db, settings, monkeypatch):
+    """Nach SOURCE_TROUBLE_LIMIT Zeitüberschreitungen einer Quelle in einem Lauf: Die übrigen Artikel
+    dieser Quelle bleiben ohne Versuch fällig, andere Quellen laufen weiter; der nächste Lauf
+    beginnt von vorn."""
+    monkeypatch.setattr(fetcher_mod, "EXTRACT_TIMEOUT", 1)
+    monkeypatch.setattr(fetcher_mod, "extract", _timed_extract)
+    rows = [make_row("alpha", i, ago(minutes=i + 1), url=f"{PUBLIC}/alpha{i}/60") for i in range(6)]
+    rows.append(make_row("beta", 1, ago(minutes=30), url=f"{PUBLIC}/beta/0"))
+    db.upsert_articles(rows)
+    f = make_fetcher(db, settings, lambda r: httpx.Response(
+        200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
+    try:
+        await asyncio.wait_for(f._extract_pending(), timeout=30)
+        alpha = db.q("SELECT attempts, text_status, text_error FROM articles WHERE source_id='alpha'")
+        # Zwei Zeitüberschreitungen lösen aus; ein Auftrag, der schon lief, als die zweite kam, darf
+        # noch zu Ende laufen (höchstens SOURCE_TROUBLE_LIMIT + gleichzeitige Extraktionen - 1).
+        tried = sum(r["attempts"] for r in alpha)
+        assert 2 <= tried <= 3 and sorted(r["attempts"] for r in alpha)[-tried:] == [1] * tried
+        assert all(r["text_status"] == "pending" for r in alpha)
+        assert all(r["text_error"] is None for r in alpha if r["attempts"] == 0)
+        assert db.one("SELECT text_status FROM articles WHERE source_id='beta'")["text_status"] in ("full", "partial")
+        assert f._tripped("alpha") and not f._tripped("beta")
+        # Neuer Lauf: Schalter zurückgesetzt, die vier übersprungenen kommen dran (die zwei mit
+        # Versuch erst nach ihrer Wartezeit).
+        monkeypatch.setattr(fetcher_mod, "extract", extract_mod.extract)
+        await asyncio.wait_for(f._extract_pending(), timeout=30)
+        alpha = db.q("SELECT attempts, text_status FROM articles WHERE source_id='alpha'")
+        done = [r["text_status"] for r in alpha if r["attempts"] == 0]
+        assert len(done) == 6 - tried and all(st in ("full", "partial") for st in done)
+    finally:
+        await f.close()
 
-    f._pool = Cancelling()
-    await on_demand(f, aid, f"{PUBLIC}/artikel")
+
+# Feindliche Seiten aus dem Pentest (gekürzt auf das Nötige): werden vor trafilatura abgelehnt.
+HOSTILE_PAGES = {
+    "short_p": b"<html><body><article>" + b"<p>Kurzer Satz.</p>" * 250_000 + b"</article></body></html>",
+    "italics": b"<html><body><div>" + b"<i>a</i>" * 650_000 + b"</div></body></html>",
+    "deep_div": b"<html><body>" + b"<div>" * 100_000 + b"<p>x</p>" + b"</div>" * 100_000 + b"</body></html>",
+    "attrs": b"<html><body><div " + b" ".join(b'a%d="1"' % i for i in range(100_000)) + b"><p>x</p></div></body></html>",
+    "bool_attrs": b"<html><body><div " + b" ".join(b"a%d" % i for i in range(30_000)) + b"><p>x</p></div></body></html>",
+}
+
+
+@pytest.mark.parametrize("name", sorted(HOSTILE_PAGES))
+def test_markup_guard_rejects_hostile_pages_quickly(name):
+    raw = HOSTILE_PAGES[name]
+    start = time.perf_counter()
+    problem = fetcher_mod.markup_problem(raw, max_tags=fetcher_mod.MAX_PAGE_TAGS,
+                                         max_attrs=fetcher_mod.MAX_TAG_ATTRS, max_lt=fetcher_mod.MAX_PAGE_LT)
+    assert problem and time.perf_counter() - start < 1
+
+
+def test_markup_guard_accepts_big_real_world_shapes():
+    # Live-Blog-artig: 4 000 Tags, Skripte voller "<", ein Attribut mit JSON voller Leerzeichen und
+    # "=" (Guardian props="…"), CDATA-Text, Kommentare, "a < b" im Text.
+    props = "{&quot;a&quot;: " + ", ".join(f"&quot;k{i}&quot;: &quot;v = {i} x y z&quot;" for i in range(3000)) + "}"
+    page = ("<!DOCTYPE html><html><head><style>a<b{}</style><script>" + "if (a < b) x();" * 20_000
+            + "</script></head><body><!-- " + "<x>" * 5000 + " -->"
+            + f'<gu-island name="x" props="{props}" data-x=\'{{"a": "b c d e"}}\'></gu-island>'
+            + "<article>" + "<p>Absatz mit <a href='/x?a=1&b=2'>Link</a> und 1 < 2.</p>" * 1300
+            + "</article></body></html>").encode()
+    assert fetcher_mod.markup_problem(page, max_tags=fetcher_mod.MAX_PAGE_TAGS,
+                                      max_attrs=fetcher_mod.MAX_TAG_ATTRS, max_lt=fetcher_mod.MAX_PAGE_LT) is None
+    feed = ('<?xml version="1.0"?><rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/"><channel>'
+            + "".join(f'<item xmlns:dc="http://purl.org/dc/elements/1.1/"><title>t{i}</title><link>https://a/{i}</link>'
+                      f"<description><![CDATA[{'Ein Wort ' * 400}<p>x</p>]]></description></item>" for i in range(300))
+            + "</channel></rss>").encode()
+    assert fetcher_mod.markup_problem(feed, max_tags=fetcher_mod.MAX_FEED_TAGS, max_attrs=fetcher_mod.MAX_TAG_ATTRS,
+                                      max_prefixes=fetcher_mod.MAX_FEED_PREFIXES) is None
+
+
+async def test_hostile_page_fails_fast_without_retries(db, settings):
+    aid = _article(db)
+    f = make_fetcher(db, settings, lambda r: httpx.Response(
+        200, headers={"content-type": "text/html"}, content=HOSTILE_PAGES["short_p"]))
+    try:
+        start = time.perf_counter()
+        await asyncio.wait_for(f.extract_article(aid, f"{PUBLIC}/artikel"), timeout=30)
+        assert time.perf_counter() - start < 10
+    finally:
+        await f.close()
     row = db.get_article(aid)
-    assert row["text_status"] == "pending" and row["attempts"] == 0 and "abgebrochen" in row["text_error"]
-    assert f._pool is None
-    f._pool = Cancelling()      # zweites Mal: zählt
-    await on_demand(f, aid, f"{PUBLIC}/artikel")
-    row = db.get_article(aid)
-    assert row["text_status"] == "pending" and row["attempts"] == 1 and "abgebrochen" in row["text_error"]
+    assert row["text_status"] == "failed" and row["text_error"].startswith("Seite abgelehnt: zu viel Markup")
 
-    # Gehört der Pool zu den wegen Zeitüberschreitung verworfenen: ohne Zählung neu eingeplant.
-    db.q("UPDATE articles SET next_attempt_at=NULL WHERE id=?", (aid,))
-    pool = Cancelling()
-    f._pool = pool
-    f._discarded.add(pool)
-    await on_demand(f, aid, f"{PUBLIC}/artikel")
-    row = db.get_article(aid)
-    assert row["attempts"] == 1 and row["next_attempt_at"] is None
+
+@pytest.mark.parametrize("body", [
+    b"".join(b'<n%d:x xmlns:n%d="urn:%d"/>' % (i, i, i) for i in range(150_000)),     # feedbomb ns
+    b"<x " + b" ".join(b'a%d="1"' % i for i in range(300_000)) + b"/>",                 # feedbomb attrs
+])
+async def test_hostile_feed_is_rejected_before_feedparser(db, settings, body):
+    raw = (b'<rss version="2.0"><channel><item><title>x</title><link>https://a/1</link>' + body
+           + b"</item></channel></rss>")[:5 * 1024 * 1024]
+    f = make_fetcher(db, settings, lambda r: httpx.Response(200, content=raw))
+    try:
+        start = time.perf_counter()
+        assert await asyncio.wait_for(f._fetch_all_feeds(), timeout=30) == 0
+        assert time.perf_counter() - start < 10
+        assert db.source_states()["alpha"]["last_error"].startswith("MarkupRejected: Feed abgelehnt: zu viele")
+    finally:
+        await f.close()
 
 
 # ---- _extract_pending: vollständig und robust ------------------------------------
@@ -724,7 +827,7 @@ async def test_extract_pending_pages_past_articles_that_stay_pending(db, setting
     f = make_fetcher(db, settings, lambda r: httpx.Response(503))
     calls: list[int] = []
 
-    async def stays_pending(article_id, url):
+    async def stays_pending(article_id, url, source=None):
         calls.append(article_id)  # nichts gespeichert: bleibt pending und fällig
 
     monkeypatch.setattr(f, "extract_article", stays_pending)
@@ -739,7 +842,7 @@ async def test_unexpected_extraction_error_does_not_abort_run(db, settings, monk
     f = make_fetcher(db, settings, lambda r: httpx.Response(503))
     calls: list[int] = []
 
-    async def flaky(article_id, url):
+    async def flaky(article_id, url, source=None):
         calls.append(article_id)
         if article_id == ids[1]:
             raise RuntimeError("unerwartet")
@@ -855,7 +958,7 @@ async def test_feed_parsing_runs_in_worker_with_timeout(db, settings, monkeypatc
     try:
         assert await asyncio.wait_for(f._fetch_all_feeds(), timeout=20) == 0
         assert db.source_states()["alpha"]["last_error"] == "ExtractTimeout: Feed-Parsing Zeitüberschreitung"
-        assert f._pool is None   # hängender Worker samt Pool verworfen
+        assert not f._pids   # hängender Worker-Prozess beendet
     finally:
         await f.close()
 
@@ -1004,9 +1107,83 @@ def test_forkserver_preloads_job_modules(db, settings, monkeypatch):
     ctx = multiprocessing.get_context("forkserver")
     monkeypatch.setattr(type(ctx), "set_forkserver_preload", lambda self, mods: calls.append(mods))
     f = make_fetcher(db, settings, lambda r: httpx.Response(200))
-    pool = f._extraction_pool()
+    f._mp_context()
+    assert calls == [["app.fetcher"]]
+    assert fetcher_mod.parse_feed.__module__ == "app.fetcher" and fetcher_mod.extract.__module__ == "app.extract"
+
+
+async def test_rebinding_is_stopped_before_the_request_is_sent(db, settings, monkeypatch):
+    """DNS-Rebinding: check_url sah eine öffentliche Adresse, beim Verbindungsaufbau liefert DNS eine
+    lokale. GuardedBackend löst selbst auf, prüft und verbindet nur mit geprüften Adressen: Beim
+    lokalen Dienst kommt keine Anfrage an."""
+    import socket
+    hits = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            hits.append(self.path)
+            self.send_response(200)
+            self.send_header("content-length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    async def ok(url):
+        return None
+
+    monkeypatch.setattr(fetcher_mod, "check_url", ok)
+    f = Fetcher(db, Catalog([]), settings)
+    await f.start()
+    loop = asyncio.get_running_loop()
+    real = loop.getaddrinfo
+
+    async def rebinding(host, *args, **kw):
+        if host == "rebind.example":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+        return await real(host, *args, **kw)
+
+    monkeypatch.setattr(loop, "getaddrinfo", rebinding)
     try:
-        assert calls == [["app.fetcher"]]
-        assert fetcher_mod.parse_feed.__module__ == "app.fetcher" and fetcher_mod.extract.__module__ == "app.extract"
+        with pytest.raises(BlockedURL, match="nicht erlaubter Adresse"):
+            await f._fetch_once(f"http://rebind.example:{port}/geheim", headers=None, max_bytes=1000)
+        assert hits == []
     finally:
-        pool.shutdown()
+        await f.close()
+        server.shutdown()
+        server.server_close()
+
+
+async def test_guarded_backend_connects_to_checked_public_address(monkeypatch):
+    """Erlaubte Namen: Verbindung zur geprüften Adresse, Hostname bleibt für SNI/Host unverändert
+    (das Backend bekommt nur host/port; start_tls erhält den Namen von httpcore getrennt)."""
+    import socket
+    from app.netguard import GuardedBackend
+    calls = []
+
+    class Inner:
+        async def connect_tcp(self, host, port, **kw):
+            calls.append((host, port))
+            return "stream"
+
+        async def sleep(self, s):
+            pass
+
+    loop = asyncio.get_running_loop()
+
+    async def resolve(host, port, **kw):
+        return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2606:4700::1", port, 0, 0)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+
+    monkeypatch.setattr(loop, "getaddrinfo", resolve)
+    backend = GuardedBackend(Inner())
+    assert await backend.connect_tcp("news.example", 443) == "stream"
+    assert calls == [("2606:4700::1", 443)]
+    with pytest.raises(BlockedURL):
+        await backend.connect_tcp("localhost", 80)
+    with pytest.raises(BlockedURL):
+        await backend.connect_unix_socket("/var/run/docker.sock")

@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+import app.db as db_mod
 from app.db import SCHEMA_VERSION, Database, MigrationError, _fts_query, day_start
 from conftest import UID, ago, make_row
 
@@ -760,3 +761,118 @@ def test_hourly_bulletin_with_fixed_url_and_title_is_not_deduped(db):
     # ... auch mit „#“ in der GUID, solange ihr Stamm weder die Adresse noch der gespeicherte Stamm ist
     third = make_row("tagesschau", 3, (now - timedelta(hours=1)).isoformat(), title="tagesschau in 100 Sekunden")
     assert db.upsert_articles([{**third, "url": url, "guid": "ts100#2000"}]) == 1
+
+
+# ---- Paket B: Suche, Plan der Liste, Blöcke, Transaktionen ------------------------------
+
+def test_fts_query_drops_chunks_without_word_characters(db):
+    assert _fts_query("Merz – Macron") == '"Merz"* AND "Macron"*'
+    assert _fts_query("A & B / C + D") == '"A" AND "B" AND "C" AND "D"'
+    assert _fts_query("– & /") == '""'
+    # Die Obergrenze gilt nach dem Filtern: acht Striche verdrängen keine Wörter.
+    words = [f"wort{i}" for i in range(9)]
+    q = _fts_query(" ".join(["–"] * 8 + words))
+    assert q.count("AND") == db_mod.SEARCH_MAX_WORDS - 1 and '"wort7"*' in q and "wort8" not in q
+    db.upsert_articles([make_row("alpha", 1, ago(hours=1), title="Merz trifft Macron")])
+    assert len(list_all(db, query="Merz – Macron")) == 1
+
+
+def _plan(db, sql, params) -> str:
+    return " / ".join(r[3] for r in db._conn.execute("EXPLAIN QUERY PLAN " + sql, params))
+
+
+def test_list_over_many_sources_runs_in_time_order_without_sorting(db):
+    """ALLE bzw. Profile mit vielen Quellen: kein Sortieren aller Artikel der Quellen (TEMP B-TREE),
+    sondern der Index nach Zeit (idx_articles_list), der nach LIMIT Zeilen endet."""
+    db.retention_days = 90
+    sources = [f"s{i}" for i in range(28)]
+    db.upsert_articles([make_row(sources[i % 28], i, ago(minutes=i)) for i in range(300)])
+    for kw in ({"unread": True}, {"unread": False}, {"unread": True, "terms": ["Titel"]},
+               {"unread": True, "before": (ago(minutes=100), 10**9)}):
+        params = dict(sources=sources, query=None, starred=False, free_only=True, before=None, limit=50)
+        params.update(kw)
+        sql, args = db.list_articles_sql(UID, **params)
+        plan = _plan(db, sql, args)
+        assert "USE TEMP B-TREE FOR ORDER BY" not in plan and "idx_articles_list" in plan, (kw, plan)
+    # Ergebnis wie ohne Hinweis: neueste zuerst, nur die Quellen
+    rows = list_all(db, sources=sources[:3], unread=True, free_only=True)
+    assert [r["id"] for r in rows] == [r["id"] for r in db.q(
+        "SELECT id FROM articles WHERE source_id IN ('s0','s1','s2') ORDER BY published_at DESC, id DESC")]
+    # Eine Quelle, Suche und Gemerkt behalten ihren eigenen Plan.
+    for kw in ({"sources": ["s1"]}, {"query": "Titel"}, {"starred": True}, {"later": True}):
+        params = dict(sources=sources, query=None, unread=False, starred=False, free_only=False, before=None,
+                      limit=50)
+        params.update(kw)
+        sql, _ = db.list_articles_sql(UID, **params)
+        assert "idx_articles_list" not in sql, kw
+
+
+def test_purge_in_batches_deletes_everything_old(db, monkeypatch):
+    monkeypatch.setattr(db_mod, "PURGE_BATCH", 3)
+    db.upsert_articles([make_row("alpha", i, ago(days=200)) for i in range(10)]
+                       + [make_row("alpha", 99, ago(days=1))])
+    keep = db.one("SELECT id FROM articles WHERE guid='alpha-5'")["id"]
+    for r in db.q("SELECT id FROM articles"):
+        store_full(db, r["id"], "Text")
+    db.retention_days = None
+    db.set_flag(UID, keep, "starred", True)
+    steps = list(db.purge_steps(90))
+    assert sum(steps) == 9 and max(steps) <= 3 and len(steps) >= 4
+    assert {r["guid"] for r in db.q("SELECT guid FROM articles")} == {"alpha-5", "alpha-99"}
+    fts_integrity(db)
+
+
+def test_mark_all_read_in_blocks_is_exact(db, monkeypatch):
+    monkeypatch.setattr(db_mod, "MARK_READ_ID_STEP", 3)
+    db.upsert_articles([make_row("alpha", i, ago(hours=i + 1)) for i in range(10)]
+                       + [make_row("beta", i, ago(hours=i + 1)) for i in range(5)])
+    ids = [r["id"] for r in db.q("SELECT id FROM articles WHERE source_id='alpha' ORDER BY id")]
+    db.q("UPDATE articles SET paywalled=1 WHERE id=?", (ids[0],))
+    db.set_flag(UID, ids[1], "read", True)
+    steps = list(db.mark_all_read_steps(UID, ["alpha"], max_id=ids[7]))
+    assert len(steps) > 2
+    assert sum(steps) == 6            # ids[2..7]: ohne den Bezahlartikel und den schon gelesenen
+    read = {r["article_id"] for r in db.q("SELECT article_id FROM user_articles WHERE user_id=? AND read=1", (UID,))}
+    assert read == set(ids[:8])       # Bezahlartikel mitmarkiert (wie bisher), nichts über max_id
+    # Ohne max_id: alle bis zur höchsten ID beim Aufruf; beta bleibt ungelesen.
+    assert db.mark_all_read(UID, ["alpha"]) == 2
+    assert not db.q("SELECT 1 FROM user_articles ua JOIN articles a ON a.id = ua.article_id WHERE a.source_id='beta'")
+
+
+def test_write_transactions_are_immediate_and_roll_back_on_cancel(db):
+    import asyncio
+    stmts = []
+    db.upsert_articles([make_row("alpha", 1, ago(hours=1))])
+    db._conn.set_trace_callback(stmts.append)
+    db.set_flag(UID, db.max_article_id(), "read", True)
+    db._conn.set_trace_callback(None)
+    assert "BEGIN IMMEDIATE" in stmts
+    with pytest.raises(asyncio.CancelledError):
+        with db.tx() as c:
+            c.execute("INSERT INTO meta (key, value) VALUES ('x', '1')")
+            raise asyncio.CancelledError()
+    assert not db._conn.in_transaction and db.get_meta("x") is None
+
+
+def test_read_then_write_waits_for_other_writer(db):
+    """Ein anderer Prozess (CLI) schreibt gerade: Mit BEGIN IMMEDIATE wartet die Transaktion
+    (busy_timeout), statt beim Wechsel vom Lesen zum Schreiben mit "database is locked" zu scheitern."""
+    import sqlite3
+    import threading
+    db.upsert_articles([make_row("alpha", 1, ago(hours=1))])
+    aid = db.one("SELECT id FROM articles")["id"]
+    other = sqlite3.connect(db.path, isolation_level=None, check_same_thread=False)
+    other.execute("BEGIN IMMEDIATE")
+    other.execute("INSERT INTO meta (key, value) VALUES ('y', '1')")
+    timer = threading.Timer(0.3, lambda: other.execute("COMMIT"))
+    timer.start()
+    try:
+        assert db.schedule_retry(aid, "HTTP 503") == "pending"
+    finally:
+        timer.join()
+        other.close()
+
+
+def test_cutoffs_use_stored_timestamp_format(db):
+    db.retention_days = 90
+    assert "." not in db.retention_cutoff() and db.retention_cutoff().endswith("+00:00")

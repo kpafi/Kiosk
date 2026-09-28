@@ -148,7 +148,9 @@ def test_probe_does_not_read_env_credentials():
     assert "KIOSK_PASSWORD" not in snippet and "KIOSK_ADMIN_USER" not in snippet and ".env" not in snippet
     script = (ROOT / "deploy" / "deploy.sh").read_text(encoding="utf-8")
     # KIOSK_PASSWORD kommt nur noch beim ersten Anlegen der .env vor.
-    assert script.count("KIOSK_PASSWORD") == 1 and "PYLOGIN" not in script
+    # (außerdem im Hinweis am Ende, der nur prüft, ob die Zeile noch da ist, und sie nie ausgibt)
+    outside = script.replace(_heredoc("PWCHECK"), "")
+    assert outside.count("KIOSK_PASSWORD") == 1 and "PYLOGIN" not in script
 
 
 def test_deploy_does_not_print_password():
@@ -395,7 +397,7 @@ def test_deploy_order_and_rollback_guards():
     assert "backup.sh predeploy" in script and "--build-arg KIOSK_BUILD=" in script
     assert "umask 077" in script.split("== .env")[1].split("printf")[0]
     assert 'grep 8100" || true' in script
-    assert "--exclude .pytest_cache/" in script
+    assert "git archive --format=tar HEAD" in script
     assert 'HEALTH_WAIT="${KIOSK_HEALTH_WAIT:-300}"' in script
 
 
@@ -771,15 +773,52 @@ def test_deny_list_value_defined_once_at_top():
     assert 'bash -s -- "$DEST" "$FETCH_DENY_IPS" <<\'ENV\'' in script
 
 
-def test_rsync_skips_development_files():
+def test_rsync_uploads_allowlist_from_head(tmp_path):
+    """Auf die Box kommt nur die Allowlist aus dem committeten Stand (git archive HEAD); .env* (außer
+    .env.example), data/, bin/ und backups/ auf dem Server bleiben unberührt."""
     script = (ROOT / "deploy" / "deploy.sh").read_text(encoding="utf-8")
-    for path in ("/.claude/", "/design/", "/docs/", "/tests/", "/pytest.ini", "/requirements-dev.txt"):
-        assert f"--exclude {path}" in script, path
+    paths = re.search(r"DEPLOY_PATHS=\((.*?)\)", script, re.S).group(1).split()
+    assert set(paths) == {"Dockerfile", ".dockerignore", "docker-compose.yml", "requirements.txt", "app", "static",
+                          "sources.yaml", "deploy", "README.md", ".env.example"}
+    for dev in ("tests", "docs", "design", ".claude", "pytest.ini", "requirements-dev.txt", ".env"):
+        assert dev not in paths
+    rsync = re.search(r"rsync -az .*?\n(?:.*\\\n)*.*\n", script).group(0)
+    assert '"$stage/" "$BOX:$DEST/"' in rsync and "./ " not in rsync
+    # Filterregeln an einer lokalen Kopie ausprobieren (Ziel = "Server").
+    stage, dest = tmp_path / "stage", tmp_path / "dest"
+    for rel in ("app/main.py", ".env.example", "Dockerfile"):
+        (stage / rel).parent.mkdir(parents=True, exist_ok=True)
+        (stage / rel).write_text("neu")
+    for rel in (".env", ".env.bak", "data/kiosk.db", "bin/backup.sh", "backups/x.gz", "tests/alt.py"):
+        (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+        (dest / rel).write_text("server")
+    filters = re.findall(r"--(?:exclude|include) (\S+)", rsync)
+    args = ["rsync", "-a", "--delete"]
+    for flag, pat in re.findall(r"--(exclude|include) (\S+)", rsync):
+        args.append(f"--{flag}={pat.strip(chr(39))}")
+    assert filters
+    r = subprocess.run([*args, f"{stage}/", f"{dest}/"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    kept = {str(p.relative_to(dest)) for p in dest.rglob("*") if p.is_file()}
+    assert kept == {"app/main.py", ".env.example", "Dockerfile", ".env", ".env.bak", "data/kiosk.db",
+                    "bin/backup.sh", "backups/x.gz"}
+    assert (dest / ".env").read_text() == "server"
+
+
+def test_deploy_refuses_dirty_tree_and_uses_head():
+    script = (ROOT / "deploy" / "deploy.sh").read_text(encoding="utf-8")
+    code = script.split('echo "== Code nach $BOX:$DEST"')[1].split('echo "== .env"')[0]
+    assert 'git status --porcelain --untracked-files=no -- "${DEPLOY_PATHS[@]}"' in code
+    assert "exit 2" in code and "KIOSK_ALLOW_DIRTY" in code
+    assert code.index("git archive") < code.index("rsync")
     perms = _heredoc("PERMS")
     assert '"$dest/tests"' in perms and '"$dest/docs"' in perms
-    # Was Build und Betrieb brauchen, bleibt drin.
-    for needed in ("app/", "static/", "sources.yaml", "requirements.txt", "deploy/", "Dockerfile"):
-        assert f"--exclude /{needed}" not in script and f"--exclude {needed}" not in script
+
+
+def test_password_hint_never_prints_the_value():
+    hint = _heredoc("PWCHECK")
+    assert "grep -q" in hint and "KIOSK_PASSWORD=" in hint
+    assert "$pw" not in hint and "source" not in hint and ". $dest/.env" not in hint
 
 
 def test_backup_gives_up_when_database_stays_locked(tmp_path):
@@ -802,3 +841,39 @@ def test_backup_gives_up_when_database_stays_locked(tmp_path):
     assert r.returncode != 0 and "nach 1 s abgebrochen" in r.stderr
     assert "FEHLER: Kiosk-Backup (predeploy) fehlgeschlagen" in r.stderr
     assert not list((tmp_path / "backups").glob("kiosk-*"))
+
+
+@pytest.mark.parametrize("env_text, users, warns", [
+    ("KIOSK_PASSWORD=geheimes-start-passwort\nKIOSK_FETCH_INTERVAL=900\n", "2", True),
+    ("KIOSK_PASSWORD=geheimes-start-passwort\n", "0", False),
+    ("KIOSK_FETCH_INTERVAL=900\n", "2", False),
+])
+def test_password_hint_after_deploy(tmp_path, env_text, users, warns):
+    import os
+    dest = tmp_path / "kiosk"
+    dest.mkdir()
+    (dest / ".env").write_text(env_text)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "docker").write_text(f"#!/usr/bin/env bash\necho {users}\n")
+    (bin_dir / "docker").chmod(0o755)
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    r = subprocess.run(["bash", "-s", "--", str(dest)], input=_heredoc("PWCHECK"), env=env, text=True,
+                       capture_output=True)
+    assert r.returncode == 0
+    assert ("WARNUNG" in r.stderr) is warns
+    assert "geheimes-start-passwort" not in r.stdout + r.stderr
+    assert (dest / ".env").read_text() == env_text          # nie automatisch geändert
+
+
+def test_caddy_strips_range_and_server_and_sets_isolation_headers():
+    for needed in ("request_header -Range", "request_header -If-Range", "-Server", "Permissions-Policy",
+                   "Cross-Origin-Opener-Policy same-origin", "Cross-Origin-Resource-Policy same-origin"):
+        assert needed in BLOCK, needed
+
+
+def test_uvicorn_without_server_header_and_access_log():
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "\"--no-server-header\"" in dockerfile and "\"--no-access-log\"" in dockerfile
+    req = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+    assert "starlette>=0.49.1" in req

@@ -498,7 +498,7 @@ def test_cli_add_list_and_validation(cli, capsys):
     try:
         anna = db.get_user_by_name("anna")
         assert anna["display_name"] == "Anna M." and anna["is_admin"] == 0
-        assert verify_password(PW, anna["password_hash"]) and anna["password_hash"].startswith("scrypt$16384$8$1$")
+        assert verify_password(PW, anna["password_hash"]) and anna["password_hash"].startswith("scrypt$16384$8$5$")
         assert [p["builtin"] for p in db.list_profiles(anna["id"])] == ["de", "world", "business", "military"]
     finally:
         db.close()
@@ -804,3 +804,24 @@ def test_source_counts_respect_retention(db):
     assert db.source_counts(other)["alpha"] == {"total": 1, "unread": 1, "unread_all": 1}
     db.retention_days = None   # ohne Grenze zählt alles
     assert db.source_counts(other)["alpha"] == {"total": 2, "unread": 1, "unread_all": 2}
+
+
+def test_next_and_cursor_do_not_reveal_old_articles_of_others(two):
+    """L2: /next und ?before=<id> lösen die ID mit derselben Sichtbarkeit auf wie GET
+    /api/articles/{id}: Ein alter Artikel, den nur ein anderer gemerkt hat, gilt als unbekannt."""
+    admin, anna = two
+    state.db.upsert_articles([make_row("alpha", 1, ago(hours=2)), make_row("alpha", 2, ago(days=100))])
+    new, old = [r["id"] for r in state.db.q("SELECT id FROM articles ORDER BY id")]
+    state.db.retention_days = None
+    assert admin.post(f"/api/articles/{old}/star", json={"value": True}).status_code == 200
+    state.db.retention_days = 90
+    missing = max(new, old) + 100
+    r_old, r_missing = anna.get(f"/api/articles/{old}/next"), anna.get(f"/api/articles/{missing}/next")
+    assert r_old.status_code == r_missing.status_code == 404 and r_old.json() == r_missing.json()
+    c_old = anna.get("/api/articles", params={"before": str(old)})
+    c_missing = anna.get("/api/articles", params={"before": str(missing)})
+    assert c_old.status_code == c_missing.status_code == 400 and c_old.json() == c_missing.json()
+    # Wer ihn gemerkt hat, kommt weiter.
+    assert admin.get(f"/api/articles/{old}/next", params={"unread": "false"}).status_code == 200
+    assert admin.get("/api/articles", params={"before": str(old), "unread": "false"}).status_code == 200
+    assert anna.get(f"/api/articles/{new}/next").status_code == 200

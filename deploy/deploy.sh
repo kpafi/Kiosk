@@ -69,22 +69,35 @@ MSG
 }
 
 echo "== Code nach $BOX:$DEST"
-ssh "$BOX" "mkdir -p $DEST/data"
-# /bin/ und /backups/ gibt es nur auf dem Server; ohne Exclude würde --delete sie löschen.
-# Auf die Box kommt nur, was Build und Betrieb brauchen: Dockerfile, .dockerignore,
+# Allowlist: Auf die Box kommt nur, was Build und Betrieb brauchen: Dockerfile, .dockerignore,
 # docker-compose.yml, requirements.txt, app/, static/, sources.yaml, deploy/ (backup.sh,
-# Caddyfile.kiosk), dazu README.md und .env.example als Doku. Ältere Deploys luden auch
+# Caddyfile.kiosk), dazu README.md und .env.example als Doku. Und zwar der committete Stand
+# (git archive HEAD), nie das Arbeitsverzeichnis: keine halbfertigen Änderungen, keine
+# ungetrackten Dateien (.env*, Testdatenbanken, venv). Ältere Deploys luden auch
 # Entwicklungsdateien hoch; die entfernt der Schritt "Besitzer und Rechte".
+DEPLOY_PATHS=(Dockerfile .dockerignore docker-compose.yml requirements.txt app static sources.yaml deploy
+              README.md .env.example)
+dirty=$(git status --porcelain --untracked-files=no -- "${DEPLOY_PATHS[@]}")
+if [ -n "$dirty" ] && [ "${KIOSK_ALLOW_DIRTY:-}" != 1 ]; then
+  echo "Nicht committete Änderungen an deploybaren Dateien; deployt würde nur HEAD:" >&2
+  printf '%s\n' "$dirty" >&2
+  echo "Erst committen (oder KIOSK_ALLOW_DIRTY=1 setzen, dann geht HEAD ohne diese Änderungen raus)." >&2
+  exit 2
+fi
+stage=$(mktemp -d)
+trap 'rm -rf "$stage"' EXIT
+git archive --format=tar HEAD -- "${DEPLOY_PATHS[@]}" | tar -x -C "$stage"
+echo "Stand: $(git rev-parse --short HEAD)"
+ssh "$BOX" "mkdir -p $DEST/data"
+# /data/, /bin/ und /backups/ gibt es nur auf dem Server, ebenso .env: Ausgeschlossenes löscht
+# --delete nicht. .env* als Muster, damit nie eine Umgebungsdatei hochgeladen oder gelöscht wird
+# (außer der Doku .env.example).
 # Auf dem Server gehört der Code root und ist nur für root schreibbar (sonst kämen uid und
 # Modi 775/664 vom Laptop mit). Nichts davon wird direkt ausgeführt: backup.sh installiert der
 # nächste Schritt mit eigenem Modus, deploy.sh und user.sh laufen auf dem Laptop.
 rsync -az --delete --itemize-changes --chown=root:root --chmod=D755,F644 \
-  --exclude /data/ --exclude /bin/ --exclude /backups/ --exclude .env \
-  --exclude venv/ --exclude .venv/ --exclude '__pycache__/' \
-  --exclude .git/ --exclude '*.pyc' --exclude .pytest_cache/ \
-  --exclude /.claude/ --exclude /design/ --exclude /docs/ --exclude /tests/ \
-  --exclude /pytest.ini --exclude /requirements-dev.txt --exclude /.gitignore \
-  ./ "$BOX:$DEST/"
+  --exclude /data/ --exclude /bin/ --exclude /backups/ --include /.env.example --exclude '.env*' \
+  "$stage/" "$BOX:$DEST/"
 
 echo "== .env"
 # Neue .env mit Zufallspasswort (nie ausgegeben); KIOSK_FETCH_DENY_IPS wird ergänzt, wenn der
@@ -382,4 +395,21 @@ docker tag "$new" kiosk:good
 echo "kiosk:latest = kiosk:good = $new"
 TAG
 ssh "$BOX" "ss -ltnp | grep 8100" || true
+
+# Das Startpasswort aus .env legt nur beim allerersten Start den Admin an; danach liegt es nutzlos im Klartext in
+# .env. Nur ein Hinweis, die Datei auf dem Server wird nicht automatisch geändert.
+ssh "$BOX" bash -s -- "$DEST" <<'PWCHECK' || true
+dest=$1
+if grep -q '^[[:space:]]*KIOSK_PASSWORD=' "$dest/.env" 2>/dev/null; then
+  users=$(docker exec kiosk python -c "import sqlite3; print(sqlite3.connect('file:/data/kiosk.db?mode=ro', uri=True).execute('SELECT COUNT(*) FROM users').fetchone()[0])" 2>/dev/null || echo "?")
+  if [ "$users" != 0 ]; then
+    cat >&2 <<MSG
+WARNUNG: $dest/.env enthält noch KIOSK_PASSWORD, es gibt aber schon Benutzer ($users).
+Das Startpasswort wird nicht mehr gebraucht (Passwörter: python -m app.users passwd <name>),
+liegt aber im Klartext auf dem Server. Zeile von Hand entfernen und neu starten:
+  sed -i '/^[[:space:]]*KIOSK_PASSWORD=/d' $dest/.env && cd $dest && docker compose up -d --no-build
+MSG
+  fi
+fi
+PWCHECK
 echo "Fertig: https://$HOST (Build $BUILD)"

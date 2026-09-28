@@ -67,7 +67,8 @@ focus --profile-de`.
 Benutzernamen: 2 bis 32 Zeichen aus `a-z`, `0-9`, `.`, `_`, `-` (Groß- und Kleinschreibung zählt beim
 Anmelden nicht). Passwörter: mindestens 12 Zeichen ohne Leerzeichen am Rand, nicht gleich dem
 Benutzernamen, gespeichert als scrypt-Hash
-(`scrypt$n$r$p$salt$hash`, n=2^14, r=8, p=1). Ohne `--password-stdin` wird das Passwort zweimal
+(`scrypt$n$r$p$salt$hash`, n=2^14, r=8, p=5 nach OWASP; ältere Hashes mit p=1 ersetzt der nächste
+erfolgreiche Login, die Sitzungen dieses Benutzers auf anderen Geräten enden dabei einmal). Ohne `--password-stdin` wird das Passwort zweimal
 verdeckt abgefragt. Anzeigenamen: höchstens 64 Zeichen (nach NFC-Normalisierung), keine
 Steuerzeichen. Der Admin aus `KIOSK_PASSWORD` heißt anfangs wie sein Benutzername mit großem
 Anfangsbuchstaben („Admin“). Der letzte aktive Admin lässt sich nicht löschen, sperren oder herabstufen.
@@ -291,7 +292,9 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
   einem Feed zählen nur die 300 neuesten Einträge (nach Datum, Einträge ohne Datum dahinter), je Quelle
   und Lauf kommen höchstens 150 neue Artikel dazu (der Rest beim nächsten Lauf; wird die Grenze erreicht,
   speichert der Abruf kein ETag/Last-Modified, damit kein 304 den Rest zurückhält). feedparser läuft in
-  den Worker-Prozessen der Textextraktion (höchstens 30 s, sonst wie eine hängende Extraktion).
+  einem eigenen Worker-Prozess (höchstens 30 s, ein Platz nur fürs Feed-Parsing). Vorher prüft eine
+  lineare Vorprüfung den Feed: höchstens 100 000 Tags, 256 Attribute in einem Tag und 200 verschiedene
+  Namensraum-Präfixe (feedparser wird darüber quadratisch langsam), sonst `Feed abgelehnt: …`.
   ETag und Last-Modified werden nur gespeichert und gesendet, wenn sie aus druckbarem ASCII bestehen;
   ein gescheiterter Abruf löscht beide (der nächste Abruf geht ohne Bedingung). Angefordert wird unkomprimiert
   (`Accept-Encoding: identity`); schickt ein Server trotzdem gzip/deflate (auch rohes deflate), wird
@@ -319,23 +322,30 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
   eine leere Sitemap.
 - `guid_pattern` (optional): regulärer Ausdruck mit genau einer Gruppe, auf die Eintrags-URL angewandt;
   die Gruppe ist die GUID (GEA: `_arid,(\d+)`, die Artikelnummer), passt er nicht, bleibt die übliche.
-- Private, lokale und Metadaten-Adressen werden bei jedem Hop abgelehnt, zusätzlich wird nach dem
-  Verbindungsaufbau die tatsächliche Gegenstelle geprüft (DNS-Rebinding). Rest-Risiko: Die Anfrage
-  ist dann bereits gesendet, verworfen wird nur die Antwort. Erlaubt sind nur die Standard-Ports
+- Private, lokale und Metadaten-Adressen werden bei jedem Hop abgelehnt. Gegen DNS-Rebinding löst
+  der Verbindungsaufbau den Namen selbst noch einmal auf, prüft alle Adressen und verbindet sich nur mit
+  einer geprüften (`netguard.GuardedBackend`; SNI, Zertifikat und Host-Kopfzeile bleiben beim Namen);
+  zusätzlich wird die tatsächliche Gegenstelle geprüft. Erlaubt sind nur die Standard-Ports
   (80 für http, 443 für https); andere Ports sind sofort endgültig `failed`. Weitere Ziele sperrt
   `KIOSK_FETCH_DENY_IPS` (z. B. öffentliche Adressen des eigenen Servers), geprüft wie die privaten
   Adressen bei der Namensauflösung und an der Gegenstelle.
 - Extrahierter Text: höchstens ca. 500 000 Zeichen bereinigtes HTML (danach endet er am nächsten
   Element, Status `partial`) und höchstens 100 Bilder.
-- Die Textextraktion (trafilatura) läuft in 2 eigenen Worker-Prozessen und darf höchstens 90 s reine
-  Laufzeit brauchen (es sind nie mehr Aufträge im Pool als Worker, die Wartezeit auf einen freien Worker
-  zählt nicht mit). Hängt sie, wird der Worker-Pool beendet und neu angelegt; der Artikel gilt als
-  vorübergehend gescheitert (`Extraktion Zeitüberschreitung`, zählt als Versuch). Ein Artikel, dessen
-  Extraktion dabei nur mit abgebrochen wurde, bleibt ohne gezählten Versuch sofort fällig. Stirbt ein
-  Worker von selbst (z. B. Speicher, auch durch einen feindlichen Feed im selben Pool), ist der Schuldige
-  unbekannt: Betroffene Artikel werden beim ersten Mal ohne gezählten Versuch neu eingeplant, erst ein
-  zweiter Absturz mit demselben Artikel zählt. Jeder Worker wird
-  nach 25 Aufträgen durch einen frischen Prozess ersetzt (begrenzt den Speicherverbrauch).
+- Die Textextraktion (trafilatura) läuft in eigenen Worker-Prozessen, einer je Auftrag (vom Forkserver
+  geforkt, höchstens 2 gleichzeitig), und darf höchstens 90 s reine Laufzeit brauchen (die Wartezeit auf
+  einen freien Platz zählt nicht mit). Hängt sie, wird nur dieser Prozess beendet; der Artikel gilt als
+  vorübergehend gescheitert (`Extraktion Zeitüberschreitung`, zählt als Versuch), andere Aufträge laufen
+  ungestört weiter. Jeder Prozess hat höchstens 384 MB Adressraum (mehr: `zu viel Speicher`, endgültig
+  `failed`) und eine CPU-Zeit-Grenze knapp über dem Zeitlimit; stirbt er ohne Ergebnis (Signal, z. B.
+  OOM-Killer), zählt das als Versuch nur für diesen Artikel.
+- Vor trafilatura prüft eine lineare Vorprüfung die Seite: höchstens 60 000 Tags außerhalb von
+  script/style/Kommentaren, 250 000 `<` insgesamt und 256 Attribute in einem Tag (echte Seiten, auch
+  große Live-Blogs von Guardian und FAZ: bis ca. 4 600 Tags). Darüber ist die Seite sofort endgültig
+  `failed` (`Seite abgelehnt: …`): trafilatura/lxml brauchen für solche Seiten quadratisch Zeit oder
+  Gigabytes Speicher.
+- Leistungsschalter je Quelle: Nach 2 Zeitüberschreitungen bzw. Abstürzen einer Quelle in einem
+  Sammellauf werden ihre übrigen Artikel in diesem Lauf nicht mehr versucht (kein Versuch gezählt,
+  bleiben fällig); der nächste Lauf beginnt von vorn.
 - Ungültige URLs (z. B. kaputte IPv6-Klammer, Port außerhalb des Bereichs, nicht unterstütztes Schema,
   auch in einer Umleitung) sind sofort endgültig `failed`.
 - Bereits gesehene Feed-Einträge (Quelle + GUID) stehen in `seen_guids` und werden nicht erneut angelegt,
@@ -410,19 +420,33 @@ entsprechen, teilen sich einen gemeinsamen Zähler. Jeder Versuch zählt schon v
 parallele Anfragen überholen die Bremse nicht); ein erfolgreicher Login setzt die Zähler für IP und
 Namen zurück. Höchstens zwei scrypt-Prüfungen laufen gleichzeitig. Abwägung: Wer viele IPs hat, kann
 einen Benutzernamen mit 30 falschen Versuchen für 15 Minuten sperren; die höhere Grenze je Name
-macht das teurer, ohne Passwort-Raten über viele IPs wirklich zu erleichtern.
+macht das teurer, ohne Passwort-Raten über viele IPs wirklich zu erleichtern. Bekannte Geräte
+(OWASP „device cookie“): Nach einem erfolgreichen Login bekommt der Browser `__Host-kiosk_device`
+(bzw. `kiosk_device` ohne Secure; HttpOnly, SameSite=Lax, ein Jahr, signiert und an den Benutzernamen
+gebunden, bleibt beim Abmelden). Wer es für diesen Namen vorzeigt, ist von der globalen Notbremse und der
+Grenze je Benutzername ausgenommen (die ein Angreifer sonst für alle auslösen könnte); die Grenze je IP
+gilt weiter, Fehlversuche mit dem Cookie zählen je Gerät (höchstens 10 in 15 Minuten). Ist die Liste der
+Zähler voll (1000), fliegt der Eintrag mit den wenigsten Versuchen, nie ein gesperrter: Erfundene Namen
+können den Zähler eines echten Namens nicht verdrängen.
 Mit `KIOSK_COOKIE_SECURE=true` wird nur `__Host-kiosk_session` akzeptiert, sonst nur `kiosk_session`;
 nach einem Umschalten ist also eine neue Anmeldung nötig.
 Schreibende API-Aufrufe mit fremdem `Origin` (bzw. `Sec-Fetch-Site: cross-site`) werden mit 403 abgelehnt.
 
 Statische Dateien (auch `sw.js`, Schriften, Icons) werden mit `Cache-Control: no-cache` ausgeliefert
-(die URLs sind nicht versioniert; per ETag nachgefragt), `/api/` ohne diesen Kopf.
+(die URLs sind nicht versioniert; per ETag nachgefragt), `/api/` ohne diesen Kopf. Jede Antwort trägt
+auch ohne Caddy `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `frame-ancestors 'none'`,
+`Cross-Origin-Opener-Policy`/`-Resource-Policy: same-origin` und `Permissions-Policy`; Range-Kopfzeilen mit
+mehr als 8 Bereichen werden ignoriert (ganze Datei). Im Container läuft uvicorn ohne `Server`-Kopfzeile und
+ohne Zugriffsprotokoll (Caddy verwirft seine Logs, das Protokoll von uvicorn enthielt Suchbegriffe).
+Artikel-Abrufe per `GET /api/articles/{id}` starten keine Extraktion, wenn der Browser sie als Bild, Frame
+o. Ä. (`Sec-Fetch-Dest` ≠ `empty`) oder von fremder Seite (`Sec-Fetch-Site`) schickt.
 
 Die App muss mit genau einem uvicorn-Worker laufen (Login-Bremse im Speicher, eine Sammler-Schleife,
 eine SQLite-Verbindung). Das Datenbankschema wird beim Start automatisch migriert (`meta.schema_version`,
 aktuell 8: Tabellen `users` und `user_articles`, Profile/Favoriten/Einstellungen mit `user_id`; seit 7
 `profiles.in_chips`, bestehende Profile bekommen 1; seit 8 `articles.story_id` mit Index, gefüllt vom
-ersten Lauf nach dem Start). Die alten
+ersten Lauf nach dem Start). Indizes ohne neue Schema-Version legt jeder Start an
+(`idx_articles_list` für die Liste über viele Quellen, ca. 0,1 s je 80 000 Artikel). Die alten
 Spalten `articles.read/starred/later` bleiben physisch stehen, werden aber nicht mehr benutzt.
 Den Test der Migration auf einer Kopie der Produktionsdatenbank aktiviert
 `KIOSK_PRODCOPY_DB=/pfad/zur/kopie.db .venv/bin/python -m pytest tests/test_users.py`.

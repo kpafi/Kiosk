@@ -463,7 +463,7 @@ async def test_sitemap_parsing_runs_in_worker_with_timeout(db, settings, monkeyp
     try:
         assert await asyncio.wait_for(f._fetch_all_feeds(), timeout=20) == 0
         assert db.source_states()["alpha"]["last_error"] == "ExtractTimeout: Sitemap-Parsing Zeitüberschreitung"
-        assert f._pool is None
+        assert not f._pids   # hängender Worker-Prozess beendet
     finally:
         await f.close()
 

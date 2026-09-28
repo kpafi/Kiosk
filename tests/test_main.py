@@ -11,6 +11,7 @@ import app.db as db_mod
 from app.extract import html_to_text
 import app.main as main_mod
 from app.main import app, state
+from app.auth import hash_password, verify_password
 from conftest import ago, make_row
 
 ORIGIN = "https://testserver"
@@ -618,7 +619,7 @@ def test_huge_ids_are_client_errors(authed):
 def extract_calls(monkeypatch):
     calls = []
 
-    def fake(article_id, url, *, retry=False):
+    def fake(article_id, url, *, retry=False, source=None):
         calls.append((article_id, True))
         return True
 
@@ -633,7 +634,7 @@ def test_article_detail_does_not_block_on_extraction(authed, monkeypatch):
 
     release = []
 
-    async def hang(article_id, url):  # hängt, bis der Test ihn freigibt
+    async def hang(article_id, url, source=None):  # hängt, bis der Test ihn freigibt
         while not release:
             await asyncio.sleep(0.01)
         state.db.store_extraction(article_id, status="full", body_html="<p>x</p>", body_text="x",
@@ -768,9 +769,9 @@ def test_invalid_usernames_share_one_limiter_bucket(client, monkeypatch):
     keys = []
     real = state.auth.reserve
 
-    def spy(ip, username):
+    def spy(ip, username, device=None):
         keys.append(username)
-        return real(ip, username)
+        return real(ip, username, device)
 
     monkeypatch.setattr(state.auth, "reserve", spy)
     for name in ("x", "Kein gültiger Name!", "ä" * 20, "a" * 40):
@@ -851,7 +852,7 @@ def test_article_reports_not_extracting_when_start_refused(authed, monkeypatch):
     aid = state.db.one("SELECT id FROM articles")["id"]
     calls = []
 
-    def refuse(article_id, url, *, retry=False):
+    def refuse(article_id, url, *, retry=False, source=None):
         calls.append(retry)
         return False
 
@@ -885,3 +886,147 @@ def test_query_timeout_in_middleware_is_503(authed, monkeypatch):
     monkeypatch.setattr(state.db, "get_user", slow)   # läuft in der Middleware (Cookie prüfen)
     r = authed.get("/api/me")
     assert r.status_code == 503 and "dauert zu lange" in r.json()["detail"]
+
+
+# ---- Paket B ---------------------------------------------------------------------------
+
+def test_refresh_without_fetcher_is_503(authed):
+    """KIOSK_DISABLE_FETCHER: kein {"started": true}, auf das nie ein Lauf folgt. 503 (nicht 409:
+    das zeigt die Oberfläche als "Läuft bereits" bzw. "Wird im nächsten Lauf geholt")."""
+    r = authed.post("/api/refresh")
+    assert r.status_code == 503 and "ausgeschaltet" in r.json()["detail"]
+
+
+def test_only_fts_syntax_errors_are_bad_search_requests(authed, monkeypatch):
+    import sqlite3
+    _seed(1)
+    for message, expected in (("fts5: syntax error near \"x\"", 400), ("database is locked", 500)):
+        def broken(*a, message=message, **kw):
+            raise sqlite3.OperationalError(message)
+
+        monkeypatch.setattr(state.db, "list_articles", broken)
+        if expected == 400:
+            assert authed.get("/api/articles", params={"q": "Wahl"}).status_code == 400
+        else:  # Serverfehler (500), nicht als "Ungültige Suchanfrage" verkleidet
+            with pytest.raises(sqlite3.OperationalError):
+                authed.get("/api/articles", params={"q": "Wahl"})
+
+
+def test_search_with_dash_finds_words(authed):
+    state.db.upsert_articles([make_row("alpha", 1, ago(hours=1), title="Merz trifft Macron")])
+    assert [it["title"] for it in authed.get("/api/articles", params={"q": "Merz – Macron"}).json()["items"]] \
+        == ["Merz trifft Macron"]
+
+
+@pytest.mark.parametrize("headers, starts", [
+    ({}, True),                                                           # curl, ältere Browser
+    ({"Sec-Fetch-Dest": "empty", "Sec-Fetch-Site": "same-origin"}, True),  # fetch() der Oberfläche
+    ({"Sec-Fetch-Dest": "image", "Sec-Fetch-Site": "same-origin"}, False),  # <img> in einem Artikel
+    ({"Sec-Fetch-Dest": "empty", "Sec-Fetch-Site": "cross-site"}, False),
+    ({"Sec-Fetch-Dest": "document", "Sec-Fetch-Site": "none"}, False),   # direkt im Browser geöffnet
+])
+def test_retry_only_from_own_script(authed, extract_calls, headers, starts):
+    _seed(1)
+    aid = state.db.one("SELECT id FROM articles")["id"]
+    state.db.store_extraction(aid, status="failed", body_html=None, body_len=0, paywalled=False, error="x")
+    r = authed.get(f"/api/articles/{aid}", params={"retry": "true"}, headers=headers)
+    assert r.status_code == 200 and bool(extract_calls) is starts
+
+
+def test_pending_article_as_image_starts_nothing(authed, extract_calls):
+    _seed(1)
+    aid = state.db.one("SELECT id FROM articles")["id"]
+    body = authed.get(f"/api/articles/{aid}", headers={"Sec-Fetch-Dest": "image"}).json()
+    assert body["extracting"] is False and not extract_calls
+
+
+def _device_cookie(client):
+    from app.auth import SECURE_DEVICE_COOKIE_NAME
+    return client.cookies.get(SECURE_DEVICE_COOKIE_NAME)
+
+
+def test_login_sets_known_device_cookie(client):
+    r = login(client)
+    cookies = [v for k, v in r.headers.multi_items() if k == "set-cookie"]
+    device = next(c for c in cookies if c.startswith("__Host-kiosk_device="))
+    low = device.lower()
+    assert "httponly" in low and "secure" in low and "samesite=lax" in low and "path=/" in low
+    assert "domain" not in low and "max-age=31536000" in low
+    # Abmelden beendet die Sitzung, das Gerät bleibt bekannt.
+    assert client.post("/api/logout").status_code == 204
+    assert _device_cookie(client)
+
+
+def test_known_device_is_exempt_from_global_and_user_brake(client):
+    import time as _t
+    assert login(client).status_code == 204
+    client.post("/api/logout")
+    now = _t.monotonic()
+    auth = state.auth
+    auth._global.attempts["*"] = [now] * auth._global.limit            # Notbremse ausgelöst
+    auth._by_user.attempts["admin"] = [now] * auth._by_user.limit      # Name gesperrt
+    assert login(client).status_code == 204                             # bekanntes Gerät kommt rein
+    other = TestClient(app, base_url=ORIGIN)       # ohne with: dieselbe App, ohne Gerät: gebremst
+    auth._global.attempts["*"] = [now] * auth._global.limit
+    assert login(other).status_code == 429
+    # Die Grenze je IP gilt auch für bekannte Geräte.
+    auth._by_ip.attempts["testclient"] = [now] * auth._by_ip.limit
+    assert login(client).status_code == 429
+
+
+def test_device_cookie_is_bound_to_username_and_signature(client):
+    import time as _t
+    assert login(client).status_code == 204
+    state.db.create_user("anna", hash_password("anna-passwort-123"), display_name="Anna")
+    now = _t.monotonic()
+    state.auth._global.attempts["*"] = [now] * state.auth._global.limit
+    assert login(client, "anna-passwort-123", "anna").status_code == 429   # Cookie gilt nur für admin
+    from app.auth import SECURE_DEVICE_COOKIE_NAME
+    token = _device_cookie(client)
+    client.cookies.set(SECURE_DEVICE_COOKIE_NAME, token[:-2] + ("A" if token[-1] != "A" else "B") + token[-1])
+    assert login(client).status_code == 429                                  # manipuliert: zählt nicht
+
+
+def test_old_scrypt_hash_is_upgraded_on_login(client):
+    import base64
+    import hashlib
+    import os
+    salt = os.urandom(16)
+    old = hashlib.scrypt(b"anna-passwort-123", salt=salt, n=2**14, r=8, p=1, dklen=32)
+    old_hash = f"scrypt$16384$8$1${base64.b64encode(salt).decode()}${base64.b64encode(old).decode()}"
+    uid = state.db.create_user("anna", old_hash, display_name="Anna")
+    assert login(client, "anna-passwort-123", "anna").status_code == 204
+    new_hash = state.db.get_user(uid)["password_hash"]
+    assert new_hash.startswith("scrypt$16384$8$5$") and verify_password("anna-passwort-123", new_hash)
+    assert client.get("/api/me").json()["username"] == "anna"     # neue Sitzung passt zum neuen Hash
+    assert login(client, "anna-passwort-123", "anna").status_code == 204
+    assert state.db.get_user(uid)["password_hash"] == new_hash       # nur einmal umgestellt
+
+
+def test_security_headers_on_every_response(client):
+    for r in (client.get("/"), client.get("/js/app.js"), client.get("/api/articles"), client.get("/healthz"),
+              client.get("/manifest.webmanifest")):
+        assert r.headers["x-content-type-options"] == "nosniff"
+        assert r.headers["x-frame-options"] == "DENY"
+        assert "frame-ancestors 'none'" in r.headers["content-security-policy"]
+        assert r.headers["cross-origin-resource-policy"] == "same-origin"
+        assert r.headers["cross-origin-opener-policy"] == "same-origin"
+        assert "camera=()" in r.headers["permissions-policy"]
+
+
+def test_range_requests_on_static_files_are_cheap(client):
+    """CVE-2025-62727: Tausende Bereiche in einer Range-Kopfzeile ließen Starlette < 0.49.1 quadratisch
+    rechnen. Mit der neuen Version (und Caddy ohne Range) antwortet die App sofort."""
+    import starlette
+    assert tuple(int(x) for x in starlette.__version__.split(".")[:3]) >= (0, 49, 1)
+    t0 = time.monotonic()
+    r = client.get("/css/app.css", headers={"Range": "bytes=" + "1" * 60_000 + ",0-1"})   # CVE-Form
+    assert time.monotonic() - t0 < 2 and r.status_code in (200, 206, 400, 416)
+    # Viele getrennte Bereiche (paarweises Zusammenfassen): ignoriert, ganze Datei.
+    ranges = ",".join(f"{i}-{i}" for i in range(0, 16000, 2))
+    t0 = time.monotonic()
+    r = client.get("/css/app.css", headers={"Range": f"bytes={ranges}"})
+    assert time.monotonic() - t0 < 1 and r.status_code == 200
+    # Ein einzelner Bereich funktioniert weiter.
+    r = client.get("/css/app.css", headers={"Range": "bytes=0-9"})
+    assert r.status_code == 206 and len(r.content) == 10

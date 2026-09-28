@@ -9,6 +9,7 @@ import multiprocessing
 import io
 import logging
 import math
+import re
 import time
 import weakref
 import zlib
@@ -25,7 +26,8 @@ import httpx
 
 from .config import Settings
 from .db import Database, QueryTimeout, request_time_limit, utcnow
-from .extract import drop_title_echo, extract, is_placeholder, is_small_image_url, safe_http_url, strip_html
+from .extract import (clean_author, drop_title_echo, extract, is_placeholder, is_small_image_url,
+                      is_text_card_image, safe_http_url, strip_html)
 from .netguard import BlockedURL, ResolveError, check_url, server_addr_blocked, set_deny_networks
 from .sitemap import ParsedRows, parse_sitemap, pick_child, sitemap_kind, url_host
 from .sources import Catalog, Source
@@ -224,6 +226,23 @@ def _entry_datetime(entry: Any) -> str:
 
 
 def _entry_image(entry: Any) -> str | None:
+    """Bild des Feed-Eintrags; Texttafeln (Meduza) zählen nicht, BBC-Vorschaubilder kommen in größerer
+    Breite (siehe _feed_image)."""
+    return _feed_image(_entry_image_raw(entry))
+
+
+# BBC liefert im Feed ein 240 px breites Vorschaubild (…/ace/standard/240/…); dasselbe Bild gibt es in
+# 976 px. Das og:image der Seite (branded_news) trägt ein eingebranntes BBC-Logo, deshalb nicht das.
+_BBC_THUMB_RE = re.compile(r"^(https://ichef\.bbci\.co\.uk/ace/standard/)240/")
+
+
+def _feed_image(url: str | None) -> str | None:
+    if not url or is_text_card_image(url):
+        return None
+    return _BBC_THUMB_RE.sub(r"\g<1>976/", url)
+
+
+def _entry_image_raw(entry: Any) -> str | None:
     for m in entry.get("media_content", []) or []:
         url = m.get("url")
         if url and (m.get("medium") == "image" or str(m.get("type", "")).startswith(IMAGE_TYPES) or not m.get("type")):
@@ -250,9 +269,45 @@ def _entry_summary(entry: Any, title: str = "") -> str:
     return ""
 
 
+# Autorenfeld mit Beiwerk: ZEIT „DIE ZEIT: Politik - Mounia Meiborg“ (ohne Autor „DIE ZEIT: News -“),
+# SZ „Von Robert Roßmann, Berlin“ bzw. „Kommentar von …“ und im Liveblog „Alle Entwicklungen im
+# Liveblog“ statt eines Namens. „Von“ nur vor einem großgeschriebenen Namen („Von der Leyen, Ursula“
+# bleibt, ebenso „Von Hippel, Frank“: bliebe nur ein Wort, gehört „Von“ zum Namen); der Ort fällt nur weg,
+# wenn er ein einzelnes großgeschriebenes Wort ist und davor nur Namen aus je zwei Wörtern stehen, ohne
+# Komma („Von Anna Meier und Paul Schulz, Berlin“ → „Anna Meier, Paul Schulz“), oder ein bekannter Ort aus
+# zwei Wörtern nach genau einem Namen („Von Anna Muster, New York“ → „Anna Muster“); „Von Anna Meier, Paul
+# Schulz“ bleibt „Anna Meier, Paul Schulz“.
+_ZEIT_AUTHOR_RE = re.compile(r"^DIE ZEIT:.*?\s-(?:\s+|$)")
+_BYLINE_RE = re.compile(
+    r"^(?:(?:Eine?\s+)?(?:Kommentar|Analyse|Interview|Gastbeitrag|Essay|Kolumne|Reportage)\s+)?[Vv]on\s+"
+    r"(?=[A-ZÄÖÜ])(.+)$", re.S)
+_BYLINE_PLACE_RE = re.compile(r"^(.+),\s*([A-ZÄÖÜ][\wäöüß.-]*(?:\s[A-ZÄÖÜ][\wäöüß-]*)?)$", re.S)
+# Orte aus zwei Wörtern nur mit diesen Anfängen („New York“); „Paul Schulz“ könnte ein zweiter Name sein
+_TWO_WORD_PLACES = {"New", "Los", "Las", "San", "Santa", "Sankt", "St.", "Bad", "Hong", "Tel", "Kuala", "Buenos",
+                    "Den", "La", "Le", "El", "Rio", "Addis", "Abu", "Sri", "Neu", "Frankfurt"}
+_FEED_AUTHOR_JUNK = {"alle entwicklungen im liveblog"}
+
+
 def _entry_author(entry: Any) -> str | None:
     author = strip_html(entry.get("author") or "", limit=200)
-    return None if is_placeholder(author) else author
+    author = _ZEIT_AUTHOR_RE.sub("", author)
+    m = _BYLINE_RE.match(author)
+    if m:
+        name = m.group(1)
+        place = _BYLINE_PLACE_RE.match(name)
+        if place and "," not in place.group(1):
+            names = re.split(r"\s+(?:und|&)\s+", place.group(1))
+            words = place.group(2).split()
+            one_name = len(names) == 1 and len(names[0].split()) >= 2
+            if all(len(n.split()) >= 2 for n in names) and (
+                    len(words) == 1 or (one_name and words[0] in _TWO_WORD_PLACES)):
+                name = place.group(1)   # ein Name oder eine Liste von Namen, danach ein Ort
+        # „Von Hippel, Frank“, „Von Meier“: „Von“ gehört zum Namen, wenn danach nur ein Wort bleibt
+        if len(name.split(",")[0].split()) >= 2:
+            author = name
+    if author.casefold() in _FEED_AUTHOR_JUNK:
+        return None
+    return clean_author(author)
 
 
 def parse_feed(source: Source, raw: bytes) -> ParsedRows:

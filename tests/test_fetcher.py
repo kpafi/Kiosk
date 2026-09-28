@@ -92,6 +92,39 @@ def test_parse_feed_drops_placeholder_summary_and_author():
     assert by_guid["g4"]["summary"] == "Echter Teaser" and by_guid["g4"]["author"] == "Anna"
 
 
+@pytest.mark.parametrize("raw,expected", [
+    ("DIE ZEIT: News -", None), ("DIE ZEIT: Politik - Mounia Meiborg", "Mounia Meiborg"),
+    ("DIE ZEIT: Zeit-Magazin - Anna Muster", "Anna Muster"),
+    ("Von Rainer Stadler", "Rainer Stadler"), ("Von Robert Roßmann, Berlin", "Robert Roßmann"),
+    ("Von Anna Muster, New York", "Anna Muster"), ("Ilanit Spinner, ARD Berlin", "Ilanit Spinner"), ("Von Julia Bergmann, Juri Auel und Nadja Lissok",
+                                                            "Julia Bergmann, Juri Auel, Nadja Lissok"),
+    ("Von Hippel, Frank", "Von Hippel, Frank"), ("Von Meier", "Von Meier"),
+    ("Von Anna Meier, Paul Schulz", "Anna Meier, Paul Schulz"), ("Von der Leyen, Ursula", "Von der Leyen, Ursula"),
+    ("Kommentar von Nicolas Richter, Berlin", "Nicolas Richter"), ("Ein Kommentar von Anna Muster", "Anna Muster"),
+    ("Von Anna Meier und Paul Schulz, Berlin", "Anna Meier, Paul Schulz"),
+    ("Alle Entwicklungen im Liveblog", None), ("Tagesschau De", None), ("Anna Muster", "Anna Muster"),
+    ("Vonne Müller", "Vonne Müller"),
+])
+def test_parse_feed_cleans_author_bylines(raw, expected):
+    rows = parse_feed(SRC, rss(f"<item><title>A</title><guid>g</guid><link>https://alpha.example/a/1</link>"
+                               f"<author>{raw}</author></item>"))
+    assert rows[0]["author"] == expected
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("https://ichef.bbci.co.uk/ace/standard/240/cpsprodpb/7e30/live/3900ff30.jpg",
+     "https://ichef.bbci.co.uk/ace/standard/976/cpsprodpb/7e30/live/3900ff30.jpg"),
+    ("https://ichef.bbci.co.uk/ace/standard/1024/cpsprodpb/x.jpg", "https://ichef.bbci.co.uk/ace/standard/1024/cpsprodpb/x.jpg"),
+    ("https://meduza.io/imgly/share/1790580532/en/news/2026/09/28/russian-strike", None),
+    ("https://alpha.example/bild.jpg", "https://alpha.example/bild.jpg"),
+])
+def test_parse_feed_image_rules(url, expected):
+    xml = ("<?xml version='1.0'?><rss version='2.0' xmlns:media='http://search.yahoo.com/mrss/'><channel><title>T"
+           "</title><item><title>A</title><guid>g</guid><link>https://alpha.example/a/1</link>"
+           f"<media:thumbnail width='240' height='135' url='{url}'/></item></channel></rss>").encode()
+    assert parse_feed(SRC, xml)[0]["image_url"] == expected
+
+
 def test_migration_v5_clears_placeholders(tmp_path):
     from app.db import Database
     d = Database(tmp_path / "k.db")

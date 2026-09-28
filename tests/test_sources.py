@@ -55,7 +55,7 @@ def test_short_defaults_to_upper_name_and_is_validated(tmp_path):
 def test_shipped_catalog_has_distinct_short_names():
     catalog = Catalog.load(ROOT / "sources.yaml")
     shorts = [s.short for s in catalog.all()]
-    assert len(shorts) == 95 and len(set(shorts)) == 95
+    assert len(shorts) == 93 and len(set(shorts)) == 93   # CNN und PBS am 28.09.2026 entfernt
     assert all(0 < len(x) <= 12 and x == x.upper() for x in shorts)
     assert catalog.get("spiegel").short == "SPIEGEL"
 
@@ -225,3 +225,49 @@ def test_in_all_is_validated_and_set_for_heise_security(tmp_path):
     assert [s.id for s in catalog.all() if not s.in_all] == ["focus", "heisesec"]   # FOCUS: siehe unten
     sec = catalog.get("heisesec")
     assert sec.default_enabled is True and "Nicht in ALLE" in sec.note
+
+
+def test_catalog_changes_of_2026_09_28():
+    catalog = Catalog.load(ROOT / "sources.yaml")
+    assert "cnn" not in catalog and "pbs" not in catalog
+    jt = catalog.get("japantimes")
+    assert jt.default_enabled is False and jt.note == "Nur Überschrift und Anreißer, die Seite sperrt Server-Zugriffe"
+    assert "als Paywall markiert" in catalog.get("scmp").note
+    heise, bbc = catalog.get("heise"), catalog.get("bbc")
+    assert not heise.wants_url("https://www.heise.de/bestenlisten/testsieger/top-10-der-beste-saugroboter/2dxtvlp")
+    assert heise.wants_url("https://www.heise.de/news/Nvidia-stellt-Sicherheitsnetz-vor-11468689.html?wt_mc=rss")
+    assert not bbc.wants_url("https://www.bbc.co.uk/sounds/play/live:bbc_radio_five_live?at_medium=RSS")
+    assert bbc.wants_url("https://www.bbc.co.uk/news/articles/c85ydnwqpzyzo?at_medium=RSS&at_campaign=rss")
+    hb = catalog.get("handelsblatt")
+    assert not hb.wants_url("https://www.handelsblatt.com/epaper-pdf/pdf-handelsblatt-vom-29.-september-2026/100258003.html")
+    assert hb.wants_url("https://www.handelsblatt.com/technik/ki/ki-mistral-steht-kurz-vor-dem-start/100257905.html")
+
+
+def test_source_removed_from_catalog_does_not_break_the_app(app_env):
+    """Artikel, Einstellung, Favorit und Stern einer Quelle, die aus sources.yaml verschwunden ist (CNN, PBS),
+    bleiben in der Datenbank; die App zeigt sie nicht mehr und stolpert nicht darüber."""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+    from app.state import state
+    from conftest import ago, make_row
+
+    with TestClient(app, base_url="https://testserver") as c:
+        assert c.post("/api/login", json={"username": "admin", "password": "geheim-und-lang"}).status_code == 204
+        uid = state.db.q("SELECT id FROM users WHERE username = ?", ("admin",))[0]["id"]
+        state.db.ensure_sources([("cnn", True)])
+        state.db.upsert_articles([make_row("cnn", 1, ago(hours=1), body_len=900), make_row("alpha", 1, ago(hours=1))])
+        cnn_id = state.db.q("SELECT id FROM articles WHERE source_id='cnn'")[0]["id"]
+        state.db.put_favorite(uid, "cnn", True)
+        state.db.set_flag(uid, cnn_id, "starred", True)
+        for path in ("/api/sources", "/api/articles", "/api/articles?starred=true", "/api/articles?source=cnn",
+                     "/api/overview", "/api/frontpage", "/api/status", "/api/favorites/sources", "/api/bar",
+                     "/api/counts", "/api/profiles"):
+            r = c.get(path)
+            assert r.status_code == 200, (path, r.status_code, r.text[:200])
+        # Ein gespeicherter Artikel der entfernten Quelle bleibt über seine ID lesbar (z. B. aus „Gemerkt“),
+        # mit der Quellen-ID als Namen
+        r = c.get(f"/api/articles/{cnn_id}")
+        assert r.status_code == 200 and r.json()["source_name"] == "cnn", (r.status_code, r.text[:200])
+        assert "cnn" not in {s["id"] for s in c.get("/api/sources").json()}
+        assert all(a["source_id"] != "cnn" for a in c.get("/api/articles").json()["items"])

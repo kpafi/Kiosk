@@ -11,6 +11,8 @@
 # default_enabled: false bedeutet nur, dass die Quelle beim ersten Start aus ist; sie lässt sich in der App einschalten.
 # Bewusst nicht aufgenommen: Boulevard (Bild, Sun, Daily Mail ...), reine Bezahlmedien ohne Gratisartikel (WSJ, FT, Economist, Nikkei),
 # und Seiten, die Server-Zugriffe blocken (Politico, Axios, The Hill, France 24, RFI, Sky News, Washington Post, AP).
+# Entfernt am 28.09.2026: CNN und PBS NewsHour (Feeds liefern keine aktuellen Einträge mehr). Artikel und
+# Einstellungen entfernter Quellen bleiben in der Datenbank; die App überspringt Quellen, die nicht im Katalog stehen.
 
 sources:
   # ---------------- Deutschland ----------------
@@ -25,7 +27,9 @@ sources:
   - {id: dlf,          name: Deutschlandfunk,         short: "DLF",           country: DE, lang: de, feed: "https://www.deutschlandfunk.de/nachrichten-100.rss",    homepage: "https://www.deutschlandfunk.de", default_enabled: false}
   - {id: tagesspiegel, name: Tagesspiegel,            short: "TAGESSPIEGEL",  country: DE, lang: de, feed: "https://www.tagesspiegel.de/contentexport/feed/home",   homepage: "https://www.tagesspiegel.de",  default_enabled: false}
   - {id: fr,           name: Frankfurter Rundschau,   short: "FR",            country: DE, lang: de, feed: "https://www.fr.de/rssfeed.rdf",                         homepage: "https://www.fr.de",            default_enabled: false}
-  - {id: handelsblatt, name: Handelsblatt,            short: "HANDELSBLATT",    country: DE, lang: de, feed: "https://www.handelsblatt.com/contentexport/feed/schlagzeilen", homepage: "https://www.handelsblatt.com", category: business, default_enabled: false}
+  # Handelsblatt: ohne die täglichen ePaper-Einträge (/epaper-pdf/, nur ein PDF-Download, kein Artikeltext).
+  - {id: handelsblatt, name: Handelsblatt,            short: "HANDELSBLATT",    country: DE, lang: de, feed: "https://www.handelsblatt.com/contentexport/feed/schlagzeilen", homepage: "https://www.handelsblatt.com", category: business, default_enabled: false,
+     include_paths: ['^/(?!epaper-pdf/)']}
   # FOCUS online: der Gesamtfeed (400 Einträge, gut 2 Tage) ohne Promi-, TV- und Königshaus-Meldungen
   # (kultur/stars, kultur/kino-tv, kultur/royals, rund ein Viertel des Feeds), ohne die KI-Auswertungen
   # von Leserkommentaren (die-debatte), ohne die KI-Tageszusammenfassungen eigener Artikel (tagesthema)
@@ -35,7 +39,9 @@ sources:
   - {id: focus,        name: FOCUS online,            short: "FOCUS",         country: DE, lang: de, feed: "https://www.focus.de/rss",                             homepage: "https://www.focus.de",
      in_all: false, note: "Nicht in ALLE (außer bei Konten, die sie dort ausdrücklich haben); eigene Ansicht oder Profil",
      include_paths: ['^/(?!kultur/(?:stars|kino-tv|royals)/|die-debatte/|tagesthema/|gesundheit/|familie/|panorama/oktoberfest/|reisen/fernreisen/|finanzen/(?:altersvorsorge|karriere)/|immobilien/kaufen/|auto/fahrberichte/)']}
-  - {id: heise,        name: heise online,            short: "HEISE",         country: DE, lang: de, feed: "https://www.heise.de/rss/heise-atom.xml",               homepage: "https://www.heise.de",         category: tech}
+  # heise: ohne die Bestenlisten (/bestenlisten/, Produktlisten mit ~100 Bildern, keine Meldungen)
+  - {id: heise,        name: heise online,            short: "HEISE",         country: DE, lang: de, feed: "https://www.heise.de/rss/heise-atom.xml",               homepage: "https://www.heise.de",         category: tech,
+     include_paths: ['^/(?!bestenlisten/)']}
   - {id: heisesec,     name: heise Security,          short: "HEISE SEC",     country: DE, lang: de, feed: "https://www.heise.de/security/rss/news-atom.xml",       homepage: "https://www.heise.de/security/", category: tech,
      in_all: false, note: "Nicht in ALLE (Meldungen stehen auch bei heise online); eigene Ansicht oder Profil"}
   - {id: golem,        name: Golem.de,                short: "GOLEM",         country: DE, lang: de, feed: "https://rss.golem.de/rss.php?feed=RSS2.0",              homepage: "https://www.golem.de",         category: tech, default_enabled: false}
@@ -58,7 +64,9 @@ sources:
   - {id: thelocalch,   name: The Local Switzerland,   short: "LOCAL CH",      country: CH, lang: en, feed: "https://feeds.thelocal.com/rss/ch",                     homepage: "https://www.thelocal.ch",      default_enabled: false}
 
   # ---------------- Großbritannien / Irland ----------------
-  - {id: bbc,          name: BBC News,                short: "BBC",           country: GB, lang: en, feed: "https://feeds.bbci.co.uk/news/rss.xml",                 homepage: "https://www.bbc.com/news"}
+  # BBC: ohne BBC Sounds (/sounds/, Radio-Livestreams ohne Text)
+  - {id: bbc,          name: BBC News,                short: "BBC",           country: GB, lang: en, feed: "https://feeds.bbci.co.uk/news/rss.xml",                 homepage: "https://www.bbc.com/news",
+     include_paths: ['^/(?!sounds/)']}
   - {id: guardian,     name: The Guardian,            short: "GUARDIAN",      country: GB, lang: en, feed: "https://www.theguardian.com/world/rss",                 homepage: "https://www.theguardian.com"}
   - {id: independent,  name: The Independent,         short: "INDEPENDENT",   country: GB, lang: en, feed: "https://www.independent.co.uk/rss",                    homepage: "https://www.independent.co.uk", default_enabled: false}
   - {id: newstatesman, name: New Statesman,           short: "STATESMAN",  country: GB, lang: en, feed: "https://www.newstatesman.com/feed",                     homepage: "https://www.newstatesman.com", default_enabled: false, note: "Politisches Magazin, Teile hinter Paywall"}
@@ -67,8 +75,6 @@ sources:
 
   # ---------------- USA / Kanada ----------------
   - {id: npr,          name: NPR,                     short: "NPR",           country: US, lang: en, feed: "https://feeds.npr.org/1001/rss.xml",                    homepage: "https://www.npr.org"}
-  - {id: cnn,          name: CNN,                     short: "CNN",           country: US, lang: en, feed: "https://rss.cnn.com/rss/edition.rss",                   homepage: "https://edition.cnn.com",      default_enabled: false}
-  - {id: pbs,          name: PBS NewsHour,            short: "PBS",           country: US, lang: en, feed: "https://www.pbs.org/newshour/feeds/rss/headlines",      homepage: "https://www.pbs.org/newshour", default_enabled: false}
   - {id: csm,          name: Christian Science Monitor, short: "CSMONITOR",     country: US, lang: en, feed: "https://rss.csmonitor.com/feeds/all",               homepage: "https://www.csmonitor.com",    default_enabled: false}
   - {id: latimes,      name: Los Angeles Times,       short: "LA TIMES",      country: US, lang: en, feed: "https://www.latimes.com/world-nation/rss2.0.xml",       homepage: "https://www.latimes.com",      default_enabled: false}
   - {id: nyt,          name: New York Times,          short: "NYT",           country: US, lang: en, feed: "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml", homepage: "https://www.nytimes.com",  default_enabled: false, note: "Nur Überschrift und Teaser, die Seite sperrt Server-Zugriffe"}
@@ -114,11 +120,11 @@ sources:
   - {id: hurriyet,     name: Hürriyet Daily News,     short: "HÜRRIYET",      country: TR, lang: en, feed: "https://www.hurriyetdailynews.com/rss/turkey",          homepage: "https://www.hurriyetdailynews.com", default_enabled: false}
 
   # ---------------- Asien ----------------
-  - {id: scmp,         name: South China Morning Post, short: "SCMP",          country: HK, lang: en, feed: "https://www.scmp.com/rss/91/feed",                     homepage: "https://www.scmp.com",         note: "Hongkong, Volltext meist nur die ersten Absätze"}
+  - {id: scmp,         name: South China Morning Post, short: "SCMP",          country: HK, lang: en, feed: "https://www.scmp.com/rss/91/feed",                     homepage: "https://www.scmp.com",         note: "Hongkong, als Paywall markiert, Volltext meist nur die ersten Absätze"}
   - {id: hongkongfp,   name: Hong Kong Free Press,    short: "HKFP",          country: HK, lang: en, feed: "https://hongkongfp.com/feed/",                          homepage: "https://hongkongfp.com",       default_enabled: false, note: "Unabhängig, gemeinnützig"}
   - {id: sixthtone,    name: Sixth Tone,              short: "SIXTH TONE",    country: CN, lang: en, feed: "https://www.sixthtone.com/rss",                         homepage: "https://www.sixthtone.com",    default_enabled: false, note: "Shanghai, staatlicher Verlag, gesellschaftliche Themen"}
   - {id: taipeitimes,  name: Taipei Times,            short: "TAIPEI TIMES",  country: TW, lang: en, feed: "https://www.taipeitimes.com/xml/index.rss",             homepage: "https://www.taipeitimes.com",  default_enabled: false}
-  - {id: japantimes,   name: The Japan Times,         short: "JAPAN TIMES",   country: JP, lang: en, feed: "https://www.japantimes.co.jp/feed/",                    homepage: "https://www.japantimes.co.jp", note: "Teile hinter Paywall"}
+  - {id: japantimes,   name: The Japan Times,         short: "JAPAN TIMES",   country: JP, lang: en, feed: "https://www.japantimes.co.jp/feed/",                    homepage: "https://www.japantimes.co.jp", default_enabled: false, note: "Nur Überschrift und Anreißer, die Seite sperrt Server-Zugriffe"}
   - {id: mainichi,     name: The Mainichi,            short: "MAINICHI",      country: JP, lang: en, feed: "https://mainichi.jp/rss/etc/english_latest.rss",        homepage: "https://mainichi.jp/english/", default_enabled: false}
   - {id: koreaherald,  name: The Korea Herald,        short: "KOREA HERALD",  country: KR, lang: en, feed: "https://www.koreaherald.com/rss/newsAll",               homepage: "https://www.koreaherald.com",  default_enabled: false}
   - {id: yonhap,       name: Yonhap News,             short: "YONHAP",        country: KR, lang: en, feed: "https://en.yna.co.kr/RSS/news.xml",                     homepage: "https://en.yna.co.kr",         default_enabled: false, note: "Nachrichtenagentur"}

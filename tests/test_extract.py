@@ -111,8 +111,26 @@ def test_paywall_regex(page, expected):
     assert is_paywalled(page) is expected
 
 
-def test_paywall_regex_only_scans_prefix():
-    assert not is_paywalled("x" * 200_001 + '"isAccessibleForFree":false')
+def test_paywall_marker_is_found_anywhere_in_the_page():
+    """Le Monde setzt das JSON-LD erst nach rund 240 000 Zeichen; gesucht wird in der ganzen Seite."""
+    assert is_paywalled("x" * 238_000 + '"isAccessibleForFree": "False"')
+    assert not is_paywalled("x" * extract_mod.PAYWALL_SCAN_CHARS + '"isAccessibleForFree":false')
+    # Die GEA-Klasse (Suche mit großem Faktor) nur im Anfang der Seite
+    assert not is_paywalled("x" * extract_mod.BLUR_SCAN_CHARS + '<p class="nfy-text-wrapper-blur">x</p>')
+
+
+@pytest.mark.parametrize("page,expected", [
+    # CSM setzt den Wert als URL auf jede Seite, auch auf frei lesbare: zählt nicht
+    ('"isAccessibleForFree":"http:\\/\\/schema.org\\/False"', False),
+    ('"isAccessibleForFree": "https://schema.org/False"', False),
+    # Nur das erste Vorkommen zählt (heise: empfohlene Artikel weiter unten mit eigener Angabe)
+    ('{"isAccessibleForFree":true}' + "x" * 200_000 + '{"isAccessibleForFree":false}', False),
+    ('{"isAccessibleForFree":"False"}' + "x" * 3_000 + '{"isAccessibleForFree":"False"}', True),   # Handelsblatt H+
+    # Handelsblatt: <app-paywall> steht auch in freien, vollständigen Artikeln und zählt nicht.
+    ('<app-paywall style="display: none;"><hmg-paywall></hmg-paywall></app-paywall>', False),
+])
+def test_paywall_regex_schema_url_values(page, expected):
+    assert is_paywalled(page) is expected
 
 
 GEA_BLUR = ('<p class=nfy-text-wrapper-blur aria-label="Unkenntlich gemachter Text" role=paragraph>'
@@ -135,11 +153,13 @@ def test_paywall_regex_gea(page, expected):
 
 
 def test_paywall_regex_stays_fast_on_hostile_input():
-    for page in ("class=" * 33_000, "class=" + "x" * 199_000, 'class="' + "a " * 99_000,
-                 "aria-label=" * 18_000, "isaccessibleforfree:" + " " * 199_000):
+    size = 5_000_000   # so viel liest der Abruf höchstens (fetcher.ARTICLE_MAX_BYTES)
+    for page in ("class=" * (size // 6), "class=" + "x" * size, 'class="' + "a " * (size // 2),
+                 "aria-label=" * (size // 11), "isaccessibleforfree:" + " " * size,
+                 ("isaccessibleforfree:" + " " * 50) * (size // 70), "isaccessibleforfree=http://schema.org/" * (size // 40)):
         t0 = time.monotonic()
         assert not is_paywalled(page)
-        assert time.monotonic() - t0 < 1
+        assert time.monotonic() - t0 < 1.5
 
 
 def test_gea_marker_lies_within_scan_window():
@@ -627,7 +647,8 @@ def test_spiegel_reading_times_and_buttons_are_not_extracted():
 def test_reading_time_backstop_works_without_precleaning(monkeypatch):
     """Zweite Sicherung: Auch ohne Vorab-Bereinigung (etwa bei anderem Markup) bleibt keine Liste
     „3 Min / 6 Min / 3 Min“ stehen."""
-    monkeypatch.setattr(extract_mod, "_precleaned", lambda page: page)
+    from trafilatura.utils import load_html
+    monkeypatch.setattr(extract_mod, "_cleaned_tree", lambda page: (load_html(page), False))
     result = extract(SPIEGEL_ARTICLE.encode(), SPIEGEL_URL)
     assert "Landenavigation" in result.body_text and "Update innerhalb weniger Wochen" in result.body_text
     assert not _MIN_LABEL_RE.search(result.body_text) and "<li>" not in result.body_html
@@ -788,3 +809,987 @@ def test_focus_promo_boxes_and_byline_are_dropped_but_author_box_stays():
     assert "Expertenkreises" in result.body_text
     assert "Newsletter" not in result.body_text and "Marvin Haas" not in result.body_text
     assert "marvin-haas.jpg" not in result.body_html
+
+
+# ---- Paket A: Volltext (Vorspann, Paywall, Liveblogs, Beifang, JSON-LD, Bilder, Autoren) ----------
+
+def _page(body: str, head: str = "") -> bytes:
+    return (f'<!doctype html><html><head><meta charset="utf-8"><title>T</title>{head}</head>'
+            f"<body>{body}</body></html>").encode()
+
+
+def _paras(*texts: str) -> str:
+    return "".join(f"<p>{t}</p>" for t in texts)
+
+
+ARTICLE_PARAS = _paras(
+    "Der Flugzeugbauer Boeing hat einen Fehler in der Software für die automatische Landenavigation gemeldet. "
+    "Betroffen sind nach Angaben des Unternehmens mehrere Hundert Maschinen weltweit.",
+    "Die Airlines wurden aufgefordert, bestimmte Anflugverfahren bis auf Weiteres zu unterlassen. Ingenieure "
+    "arbeiteten an einer dauerhaften Lösung, teilte das Unternehmen am Montag mit.",
+    "»Dass sich solche Fehler wiederholen, ist nicht hinnehmbar«, sagte ein Sprecher der Aufsichtsbehörde FAA. "
+    "Boeing steht seit Jahren unter strenger Beobachtung der Behörden.")
+LEAD = ("Der Hersteller meldet einen Softwarefehler bei Hunderten Maschinen. Die Aufsicht reagiert "
+        "ungewöhnlich scharf.")
+
+
+def _og(desc: str) -> str:
+    return f'<meta property="og:description" content="{desc}">'
+
+
+def test_lost_lead_from_page_header_is_prepended():
+    """SPIEGEL: Der Vorspann steht im Kopf (header[data-area=intro]) und fiel bei trafilatura weg."""
+    page = _page('<main><article><header><h2>Softwarefehler bei Boeing</h2><div data-area="intro">'
+                 f'<div class="RichText">{LEAD}</div></div></header>'
+                 f'<div data-area="body">{ARTICLE_PARAS}</div></article></main>', _og(LEAD))
+    result = extract(page, BASE)
+    assert result.body_text.count("Aufsicht reagiert ungewöhnlich scharf") == 1
+    assert result.body_text.index("Hunderten Maschinen") < result.body_text.index("Landenavigation")
+    assert f"<p>{LEAD}</p>" in result.body_html
+
+
+def test_truncated_description_finds_the_whole_lead():
+    """Daily Maverick kürzt og:description („…“); der Vorspann in div.top-summary beginnt damit."""
+    page = _page(f'<header class="titles"><h1>Kaffee</h1></header><div class="top-summary"><p>{LEAD}</p></div>'
+                 f"<article>{ARTICLE_PARAS}</article>", _og(LEAD[:70] + "…"))
+    result = extract(page, BASE)
+    assert result.body_text.startswith(LEAD)
+
+
+def test_lead_is_not_taken_from_links_lists_or_captions():
+    teaser = f'<ul><li><a href="/x">{LEAD}</a></li></ul><figure><figcaption>{LEAD}</figcaption></figure>'
+    page = _page(f"<nav>{teaser}</nav><article>{ARTICLE_PARAS}</article>", _og(LEAD))
+    assert "Aufsicht reagiert" not in extract(page, BASE).body_text
+    # Beschreibung schon im Text: nichts doppelt
+    page = _page(f"<article><p>{LEAD}</p>{ARTICLE_PARAS}</article>", _og(LEAD))
+    assert extract(page, BASE).body_text.count("Aufsicht reagiert") == 1
+
+
+def test_sz_teaser_text_is_the_lead():
+    """SZ: p[data-manual=teaserText], auch wenn die Beschreibung anders lautet."""
+    page = _page(f'<header><p data-manual="teaserText">{LEAD}</p></header><article>{ARTICLE_PARAS}</article>',
+                 _og("Eine ganz andere, kürzere Beschreibung der Seite für Suchmaschinen und soziale Netze."))
+    assert extract(page, BASE).body_text.startswith(LEAD)
+
+
+def test_left_to_read_alone_does_not_mark_paywall():
+    page = _page(f"<article>{ARTICLE_PARAS}<p>Half of this article left to read, he joked, is about "
+                 "cats and the weather in Paris during the summer.</p></article>")
+    assert extract(page, BASE).paywalled is False
+
+
+def test_le_monde_subscriber_note_marks_paywall_and_is_dropped():
+    page = _page(f"<article>{ARTICLE_PARAS}<p>You have 81.65% of this article left to read. The rest is for "
+                 "subscribers only.</p></article>")
+    result = extract(page, BASE)
+    assert result.paywalled is True and result.status == "partial"
+    assert "subscribers" not in result.body_text and "Landenavigation" in result.body_text
+
+
+def _guardian_block(n: int, title: str, text: str, avatar: bool = False) -> str:
+    img = ('<div><img src="https://i.guim.co.uk/img/uploads/2023/09/18/Rajeev_Syal.png?width=300" alt="Rajeev Syal">'
+           '</div><span>Rajeev Syal</span>') if avatar else ""
+    return (f'<article id="block-{n}"><header><div><a href="?page=with%3Ablock-{n}#block-{n}"><span>'
+            f'<gu-island name="RelativeTime"><time datetime="2026-09-28T15:{n}:21.000Z">{n}m ago</time></gu-island>'
+            f'</span><span>17.{n} CEST</span></a></div><h2>{title}</h2>{img}</header>'
+            f'<p><strong>{text}</strong></p><p>{text} Weitere Einzelheiten folgen im Laufe des Tages.</p>'
+            f'<blockquote><p>Zitat aus Eintrag {n}: Wir werden das nicht hinnehmen.</p></blockquote>'
+            f'<footer><gu-island name="ShareButton"><a href="mailto:?subject=x">Share</a></gu-island></footer>'
+            '</article>')
+
+
+def _guardian_pinned(body: str) -> str:
+    return ('<div id="pinned-post" data-component="pinned-post"><input type="checkbox" id="pinned-post-checkbox">'
+            '<div><div>Angeheftet <gu-island name="RelativeTime"><time datetime="2026-09-28T10:23:40.000Z">5h ago'
+            '</time></gu-island></div></div><div id="collapsible-body"><article><header><div><a href="#b"><span>'
+            f"12.23 CEST</span></a></div><h2>Zusammenfassung</h2></header>{body}</article></div></div>")
+
+
+def test_guardian_closing_post_is_kept_on_top(monkeypatch):
+    """Der angeheftete „Closing post“ steht in keinem Eintrag der Liste: er bleibt, die Einträge auch."""
+    monkeypatch.delenv("KIOSK_TZ", raising=False)
+    blocks = "".join(_guardian_block(n, f"Überschrift Eintrag {n}",
+                                     f"Eintrag {n} berichtet ausführlich über die Lage am Parteitag in Liverpool.")
+                     for n in range(10, 16))
+    closing = "".join(f"<p>Schlussbeitrag Punkt {n}: Die Konferenz endet heute Abend mit einer Rede der "
+                      f"Parteichefin, danach beginnt die Aussprache.</p>" for n in range(8))
+    page = _page(f'<main><div id="liveblog-body">{_guardian_pinned(closing)}{blocks}</div></main>')
+    result = extract(page, "https://www.theguardian.com/politics/live/2026/sep/28/x")
+    for n in range(8):
+        assert f"Schlussbeitrag Punkt {n}:" in result.body_text, n
+    for n in range(10, 16):
+        assert f"Überschrift Eintrag {n}" in result.body_text, n
+    assert result.body_text.index("Schlussbeitrag Punkt 0") < result.body_text.index("Überschrift Eintrag 10")
+    assert "Angeheftet" not in result.body_text and "5h ago" not in result.body_text
+
+
+def test_guardian_live_blog_keeps_all_blocks_with_headings_and_quotes(monkeypatch):
+    monkeypatch.delenv("KIOSK_TZ", raising=False)
+    blocks = "".join(_guardian_block(n, f"Überschrift Eintrag {n}",
+                                     f"Eintrag {n} berichtet ausführlich über die Lage am Parteitag in Liverpool.",
+                                     avatar=n == 12) for n in range(10, 16))
+    pinned = _guardian_pinned("<p>Eintrag 15 berichtet ausführlich über die Lage am Parteitag in Liverpool.</p>"
+                              "<p>Eintrag 15 berichtet ausführlich über die Lage am Parteitag in Liverpool. Weitere "
+                              "Einzelheiten folgen im Laufe des Tages.</p>")   # Kopie eines Eintrags
+    page = _page(f'<main><div id="liveblog-body">{pinned}{blocks}</div></main>')
+    result = extract(page, "https://www.theguardian.com/politics/live/2026/sep/28/x")
+    for n in range(10, 16):
+        assert f"Überschrift Eintrag {n}" in result.body_text, n
+        assert f"Zitat aus Eintrag {n}" in result.body_text, n
+    assert "<h2>" in result.body_html and "<blockquote>" in result.body_html
+    assert "Angeheftet" not in result.body_text and "m ago" not in result.body_text
+    assert result.body_text.count("Eintrag 15 berichtet") == 2   # nur der Eintrag, nicht die Kopie
+    assert "Rajeev_Syal.png" not in result.body_html and "Share" not in result.body_text
+    assert "Rajeev Syal" not in result.body_text   # Autorenname im Kopf des Eintrags
+    for n in range(10, 16):   # feste Zeit (datetime, Zeitzone der App) vor jedem Eintrag
+        assert re.search(rf"<p>\s*<strong>28\.09\. 17:{n}</strong>\s*</p>\s*<h2>Überschrift Eintrag {n}</h2>",
+                         result.body_html), n
+    # ohne datetime: die angezeigte feste Zeit
+    page = _page(f'<main><div id="liveblog-body">{blocks.replace(" datetime=", " data-x=")}</div></main>')
+    result = extract(page, "https://www.theguardian.com/politics/live/2026/sep/28/x")
+    assert re.search(r"<strong>17\.10 CEST</strong>", result.body_html)
+
+
+def test_live_blog_times_use_the_app_time_zone(monkeypatch):
+    from app.extract import _local_time
+    monkeypatch.setenv("KIOSK_TZ", "UTC")
+    assert _local_time("2026-09-28T12:43:55.000Z") == "28.09. 12:43"
+    monkeypatch.setenv("KIOSK_TZ", "Nicht/Da")
+    assert _local_time("2026-09-28T12:43:55.000Z") == "28.09. 14:43"   # Rückfall: Europe/Berlin
+    assert _local_time("gestern") is None
+    assert _local_time("2026-09-28") is None   # nur ein Datum: keine Uhrzeit erfinden
+    monkeypatch.setenv("KIOSK_TZ", "../../etc/passwd")
+    assert _local_time("2026-09-28T12:43:55Z") == "28.09. 14:43"
+
+
+def test_preclean_drops_screen_reader_text_and_teaser_boxes_but_keeps_srf_offscreen():
+    import lxml.html
+    from app.extract import _precleaned
+    junk = [
+        '<span class="visually-hidden">, external</span>', '<a class="screen-reader-text" href="#m">Skip links</a>',
+        '<span class="x sr-only">Zur Merkliste</span>', '<div data-testid="promo"><a href="/p">Promo BBC</a></div>',
+        '<div data-testid="topic-list">Related topics Fairford</div>',
+        '<div data-testid="metadata"><ul><li>Published 27 September</li></ul></div>',
+        '<div data-block="uploaderEmbed"><h2>Get in touch</h2><p>Share your experiences.</p></div>',
+        '<section class="more-on"><h2>Recommended Stories</h2></section>',
+        '<div class="bucketwrap internallink insettwocolumn">NPR intern</div>', '<b class="hide-caption">hide caption</b>',
+        '<b class="toggle-caption">toggle caption</b>', '<dl class="tspBz debug-piano"><dt>showPaywall:</dt><dd>false</dd></dl>',
+        '<div id="summy-content">Artikelzusammenfassung KI</div>', '<div class="tzi-bottom-container">Die taz schreibt</div>',
+        '<div class="c-inline-alert c-article-page__preferred-sources">WELT bevorzugt</div>',
+        '<div class="c-inline-teaser-list">Lesen Sie auch WELT</div>', '<figure class="c-inline-video">WELT Video</figure>',
+        '<div class="teaser-absatz columns">tagesschau Teaser</div>', '<li class="teaser-xs columns">tagesschau klein</li>',
+        '<div class="teaser">NDR Teaser</div>', '<div class="TeaserInline_wrapper__x1">ntv Teaser</div>',
+        '<div class="VideoInline_wrapper__y2">ntv Video</div>', '<app-storyline-related-topics>Verwandte Themen</app-storyline-related-topics>',
+        '<app-default-teaser>HB Teaser</app-default-teaser>', '<app-guidelines-reference>Richtlinien</app-guidelines-reference>',
+        '<div class="tik4-sharing">Teilen FAZ</div>', '<a-opt-in>heise Opt-in</a-opt-in>',
+        '<div class="ad--inread-header">Videos by heise</div>', '<div data-component="RecommendationBox">heise Empfehlung</div>',
+        '<figure class="branding"><img src="https://heise.example/newsletter.png" alt="KI-Update"></figure>',
+        '<a class="id-Story-googleFollowButton" href="https://profile.google.com/cp/x">Uns auf Google folgen</a>',
+        '<img src="/pu_gea/image/logo.png" alt="gea.de">', '<div class="nfy-teaser nfy-teaser-small nfy-ar-teaser">GEA Teaser</div>',
+        '<div class="nfy-detail-footer-inner nfy-ar-teaser-box nfy-teaser-box">GEA Kasten</div>', '<div class="bookmark-experience">Independent merken</div>',
+        '<div class="show-comments">Join our commenting forum</div>', '<div class="sc-1 js-comment">Go to comments</div>',
+        '<div class="contribute-article p-3">A Message from The Moscow Times</div>',
+        '<section class="catcher catcher--favoris">Read more Le Monde</section>', '<a class="js-article-read-also" href="/r">Le Monde auch</a>',
+        '<aside class="injection trinity-skip-it">CSM Recommended</aside>', '<div class="in-article-games">CNA Games</div>',
+        '<div class="js-tcf-notloaded tcf-notloaded" hidden><p>Sie entscheiden darüber</p></div>',
+        '<details data-gu-name="dateline"><summary>Mon 28 Sep 2026 17.31 CEST</summary></details>',
+        '<section data-area="embed"><p>Ich bin damit einverstanden, dass mir externe Inhalte angezeigt werden.</p>'
+        '</section>',
+        '<span>Sie nutzen Google? <a href="https://google.com/preferences/source?q=x">direkt aktivieren.</a></span>',
+    ]
+    keep = ['<span class="h-offscreen">Autor Tobias Müller</span>', "<p>Echter Artikeltext bleibt stehen.</p>",
+            '<section class="catcher-free">bleibt</section>']
+    page = _page("<article>" + "".join(junk) + "".join(keep) + "</article>").decode()
+    out = lxml.html.tostring(_precleaned(page.encode()), encoding="unicode")
+    for piece in junk:
+        el = lxml.html.fromstring(piece)
+        marker = el.text_content().strip() or el.xpath("descendant-or-self::img/@src")[0]
+        assert marker not in out, piece
+    assert "Autor Tobias Müller" in out and "Echter Artikeltext" in out and "bleibt" in out
+
+
+@pytest.mark.parametrize("para", [
+    "Klicken Sie hier, um sich Artikel von WELT in der Google-Suche bevorzugt anzeigen zu lassen.",
+    "Uns auf Google folgen", "Folgen Sie uns auf Google News, um nichts zu verpassen.",
+    "Sie nutzen Google? Richten Sie uns als bevorzugte Quelle ein.",
+    'Google: <a href="https://www.google.com/preferences/source?q=x">Jetzt einrichten</a>',
+    "If you rely on our team for trusted reporting, please select us as your Preferred Source on Google",
+    "Lesen Sie auch", "Lesen Sie mehr zum Thema", "Stand:", "Stand: 28.09.2026 18:07 Uhr", "Lesezeit: 3 Min.",
+    "Stand: 28. September 2026, 18:07 Uhr", "Stand: heute, 17:45 Uhr",
+    "Videos by heise", "Link kopieren", "Auf Facebook teilen", "Auf X teilen", "Per E-Mail teilen",
+    "At Meduza, we are committed to transparency about our use of artificial intelligence. " + "x " * 200,
+    "If you find any errors in this translation, please contact us at [email protected].",
+    "To read Meduza’s exclusive content in English, please subscribe to our newsletter.",
+    "Sign up for our weekly newsletter to get more English-language news coverage from EL PAÍS USA Edition",
+    "Sign up now: Get ST's newsletters delivered to your inbox",
+    "Listen to the best of BBC Radio Merseyside on Sounds and follow BBC Merseyside on Facebook",
+    "Get in touch",
+    "Get the latest India News and Live updates. Download the TOI app.",
+    "Ich bin damit einverstanden, dass mir externe Inhalte angezeigt werden. Damit können personenbezogene Daten "
+    "an Drittplattformen übermittelt werden.",
+    "Empfohlener externer Inhalt", "Wir würden Ihnen hier gerne einen externen Inhalt zeigen. Sie entscheiden, ob "
+    "Sie dies auch wollen.",
+])
+def test_promo_and_label_paragraphs_are_dropped(para):
+    html, text = sanitize(f"<p>Vorher.</p><p>{para}</p><p>Nachher.</p>", BASE)
+    assert html == "<p>Vorher.</p><p>Nachher.</p>" and text == "Vorher. Nachher."
+
+
+@pytest.mark.parametrize("para", [
+    "Apple und Google folgen dem Beispiel des Konkurrenten.",
+    "Die EU wirft Google vor, eigene Angebote bevorzugt anzuzeigen.",
+    "Laut Gericht hat Google eigene Dienste bevorzugt.",
+    "Sie werfen Google vor, den Vorgaben nicht zu folgen.",
+    "Stand der Dinge: Die Verhandlungen dauern an.",
+    "Stand: 2:1 für Leverkusen nach 70 Minuten.",
+    "Lesezeit: eine Stunde, sagt der Verlag, sei ideal.",
+    "Der Konzern bevorzugt nach eigenen Angaben heimische Zulieferer.",
+    "Google " + "bevorzugt " * 40,   # lang: Artikeltext
+    "Sign up sheets were posted at the town hall on Monday.",
+])
+def test_promo_rules_keep_real_sentences(para):
+    html, _ = sanitize(f"<p>{para}</p>", BASE)
+    assert para.strip() in html
+
+
+def test_label_headings_are_dropped():
+    html, _ = sanitize('<h2><a href="/news/">NewsFeed</a></h2><h3>Lesen Sie auch</h3><p>Text.</p>'
+                       "<h2>Lesen Sie auch, was Experten sagen</h2>", BASE)
+    assert html == '<p>Text.</p><h2>Lesen Sie auch, was Experten sagen</h2>'
+
+
+@pytest.mark.parametrize("raw", ["Bundes­regierung", "Bundes​regierung", "Bundes‌regierung",
+                                 "Bundes⁠regierung", "﻿Bundesregierung", "Bundes&shy;regierung"])
+def test_invisible_characters_are_removed(raw):
+    html, text = sanitize(f"<p>Die {raw} tagt.</p>", BASE)
+    assert html == "<p>Die Bundesregierung tagt.</p>" and text == "Die Bundesregierung tagt."
+    assert html_to_text(f"<p>{raw}</p>") == "Bundesregierung"
+    assert strip_html(f"Die {raw}") == "Die Bundesregierung"
+
+
+def test_json_ld_article_body_replaces_page_chrome():
+    """Times of India: trafilatura fand nur Bedienelemente, der Text steht im JSON-LD."""
+    body = ("NEW DELHI: The Supreme Court on Monday recommended the elevation of three high court chief justices. "
+            "The collegium met in the afternoon and approved the names unanimously.\\n"
+            "The government is expected to notify the appointments within weeks. Officials said the process "
+            "would be completed before the end of the year.")
+    ld = f'<script type="application/ld+json">{{"@type":"NewsArticle","articleBody":"{body}"}}</script>'
+    chrome = _paras("Sign In", "Comments", "Share", "AaText Size", "Gujarat, Delhi, Telangana high court CJs "
+                    "recommended for SC elevation after a long wait", "End of Article", "Follow Us On Social Media")
+    result = extract(_page(f"<main>{chrome}</main>", ld), BASE)
+    assert result.body_html.startswith("<p>NEW DELHI: The Supreme Court") and "Sign In" not in result.body_text
+    assert "before the end of the year" in result.body_text
+    # Die Regel selbst: Absätze aus den Zeilenumbrüchen; nichts zu tun, wenn der Text schon da ist.
+    from app.extract import _ld_fallback
+    ld_objects = [{"@type": "NewsArticle", "articleBody": body.replace("\\n", "\n"), "url": BASE}]
+    urls = frozenset({"news.example/artikel/1"})
+    clean, text, _ = _ld_fallback(ld_objects, html_to_text(chrome), BASE, None, urls)
+    assert clean.count("<p>") == 2 and clean.startswith("<p>NEW DELHI:") and "Sign In" not in text
+    assert _ld_fallback(ld_objects, text, BASE, None, urls) == ("", "", False)
+    assert _ld_fallback([{"articleBody": "Zu kurz.", "url": BASE}], "", BASE, None, urls) == ("", "", False)
+
+
+def test_json_ld_body_must_belong_to_the_page():
+    """Nur das articleBody des eigenen Artikels (URL oder Überschrift), nicht das längste irgendwo."""
+    from app.extract import _ld_fallback, _ld_objects
+    from trafilatura.utils import load_html
+    own = "The court met on Monday and recommended three judges for elevation to the top court of the country."
+    other = "A completely different story about football results and transfer rumours in the league. " * 10
+    ld = ('<script type="application/ld+json">[{"@type":"NewsArticle","url":"https://news.example/artikel/1",'
+          f'"headline":"Judges recommended","articleBody":"{own * 3}"}},{{"@type":"NewsArticle",'
+          f'"url":"https://news.example/other","headline":"Football","articleBody":"{other}"}}]</script>')
+    objects = _ld_objects(load_html(_page("<p>Sign In</p>", ld)))
+    clean, text, _ = _ld_fallback(objects, "Sign In", BASE, "Judges recommended",
+                                  frozenset({"news.example/artikel/1"}))
+    assert "court met on Monday" in text and "football" not in text
+    clean, text, _ = _ld_fallback(objects, "Sign In", BASE, "Etwas anderes", frozenset({"news.example/x"}))
+    assert text == ""   # keines gehört zur Seite
+
+
+def test_json_ld_sentences_run_together_become_paragraphs():
+    """Times of India hängt Absätze ohne Leerzeichen aneinander: „… top court.The collegium …“."""
+    from app.extract import _ld_article_body
+    raw = ("NEW DELHI: The Supreme Court recommended three chief justices as judges of the top court.The collegium "
+           "met on Monday.The U.S.Army was not involved, officials said.")
+    body = _ld_article_body([{"articleBody": raw, "headline": "T"}], title="T")
+    assert body.split("\n") == ["NEW DELHI: The Supreme Court recommended three chief justices as judges of the "
+                                "top court.", "The collegium met on Monday.",
+                                "The U.S.Army was not involved, officials said."]
+
+
+def test_json_ld_body_is_ignored_when_the_text_already_has_it():
+    body = "Der Flugzeugbauer Boeing hat einen Fehler in der Software für die automatische Landenavigation gemeldet."
+    ld = f'<script type="application/ld+json">{{"@type":"NewsArticle","articleBody":"{body} {body}"}}</script>'
+    result = extract(_page(f"<article>{ARTICLE_PARAS}</article>", ld), BASE)
+    assert "Aufsichtsbehörde FAA" in result.body_text
+
+
+def test_long_json_ld_body_is_split_into_paragraphs():
+    from app.extract import _ld_paragraphs
+    sentence = "Das ist ein ziemlich langer Satz über die Lage, der sich immer wiederholt."
+    paras = _ld_paragraphs(" ".join([sentence] * 40))
+    assert len(paras) > 3 and all(p.endswith(".") for p in paras)
+    assert all(len(p) < 800 for p in paras) and " ".join(paras) == " ".join([sentence] * 40)
+
+
+def test_golem_consent_page_is_stored_without_text():
+    page = _page('<div id="screen"><h1>Willkommen auf Golem.de!</h1><section class="c2_left"><h2>Cookies zustimmen</h2>'
+                 '<p class="intro">Besuchen Sie Golem.de wie gewohnt mit Werbung und Tracking, indem Sie der Nutzung '
+                 "aller Cookies zustimmen. Details zum Tracking finden Sie im Privacy Center.</p>"
+                 + _paras(*[f"Für die Ihnen angezeigten Verarbeitungszwecke können Cookies verwendet werden ({n})."
+                            for n in range(12)]) + "</section></div>")
+    result = extract(page, "https://www.golem.de/news/x.html")
+    assert result.status == "empty" and result.body_html is None
+    # Ein langer Artikel, der den Satz zitiert, bleibt
+    quote = ("<p>Golem zeigt Besuchern ohne Einwilligung den Satz: „Besuchen Sie Golem.de wie gewohnt mit Werbung "
+             "und Tracking“, erklärte der Verlag.</p>")
+    article = _page(f"<article>{ARTICLE_PARAS * 8}{quote}</article>")
+    result = extract(article, "https://www.golem.de/news/y.html")
+    assert result.status == "full" and "erklärte der Verlag" in result.body_text
+
+
+def test_derstandard_consent_dialog_is_not_extracted():
+    dialog = ('<div class="js-tcf-notloaded tcf-notloaded" hidden><h1>Willkommen bei DER STANDARD</h1><p><strong>Sie '
+              "entscheiden darüber, wie Sie unsere Inhalte nutzen wollen. Ihr Gerät erlaubt uns derzeit leider nicht, "
+              "die entsprechenden Optionen anzuzeigen.</strong></p><p><strong>Bitte deaktivieren</strong> Sie sämtliche "
+              "Hard- und Software-Komponenten, die in der Lage sind Teile unserer Website zu blockieren.</p></div>")
+    result = extract(_page(f'<article><div class="article-text">{ARTICLE_PARAS}</div></article>{dialog}'), BASE)
+    assert "Landenavigation" in result.body_text and "entscheiden" not in result.body_text
+    html, _ = sanitize("<p>Text.</p><p>Sie entscheiden darüber, wie Sie unsere Inhalte nutzen wollen.</p>", BASE)
+    assert html == "<p>Text.</p>"
+
+
+def test_headline_echo_with_kicker_is_dropped():
+    from app.extract import drop_title_echo
+    res = drop_title_echo(_extraction("<h2>Enteignung per Dekret Putin stellt deutschen Großhändler Metro unter "
+                                      "Zwangsverwaltung</h2><img src=\"https://a.example/b.jpg\"><p>Text folgt.</p>"),
+                          "Russland stellt deutschen Großhändler Metro unter Zwangsverwaltung")
+    assert res.body_html == '<img src="https://a.example/b.jpg"><p>Text folgt.</p>'
+    img_first = drop_title_echo(_extraction('<img src="https://a.example/b.jpg"><h1>Fluggastrechte Verbraucherschützer '
+                                            'mahnen Airlines ab</h1><p>Text.</p>'),
+                                "Europäische Verbraucherschützer mahnen Airlines ab")
+    assert "<h1>" not in img_first.body_html
+
+
+def test_headline_with_long_kicker_is_dropped():
+    from app.extract import drop_title_echo
+    res = drop_title_echo(_extraction("<h2>Verhandlungen in der Chemiebranche Evonik schlägt BASF-Übernahmeangebot "
+                                      "aus</h2><p>Text folgt.</p>"), "Chemie: Evonik schlägt BASF-Übernahmeangebot aus")
+    assert res.body_html == "<p>Text folgt.</p>"
+    # Eine Zwischenüberschrift mit wenigen Titelwörtern bleibt
+    other = _extraction("<h2>Was die Übernahme für Beschäftigte bedeutet</h2><p>Text.</p>")
+    assert drop_title_echo(other, "Chemie: Evonik schlägt BASF-Übernahmeangebot aus") is other
+
+
+def test_headline_rule_keeps_headings_inside_the_article():
+    from app.extract import drop_title_echo
+    later = _extraction("<p>Einleitung mit Text.</p><h2>Putin stellt Metro unter Zwangsverwaltung</h2><p>Mehr.</p>")
+    assert drop_title_echo(later, "Putin stellt Metro unter Zwangsverwaltung") is later
+    other = _extraction("<h2>Was jetzt passiert</h2><p>Text.</p>")
+    assert drop_title_echo(other, "Putin stellt Metro unter Zwangsverwaltung") is other
+
+
+def test_h1_equal_to_title_is_dropped_anywhere():
+    from app.extract import drop_title_echo
+    body = ("<p>REUTLINGEN. Zwei Kindergärten wurden durchwühlt.</p><h1>Einbrecher durchwühlen zwei Kindergärten</h1>"
+            "<p>Die Polizei ermittelt.</p>")
+    res = drop_title_echo(_extraction(body), "Einbrecher durchwühlen zwei Kindergärten")
+    assert "<h1>" not in res.body_html and "Polizei ermittelt" in res.body_text
+    kicker = _extraction("<p>© dpa</p><h1>Fußball-Bundesliga BVB verlängert</h1><p>Text.</p>")
+    assert "<h1>" not in drop_title_echo(kicker, "Fußball-Bundesliga: BVB verlängert").body_html
+
+
+def test_author_contained_in_title_is_dropped():
+    from app.extract import Extraction, drop_title_echo
+    res = Extraction("full", "<p>Text.</p>", "Text.", 5, False, None, "Auffahrunfall")
+    assert drop_title_echo(res, "Auffahrunfall in Zwiefalten: Motorradfahrerin leicht verletzt").author is None
+    res = Extraction("full", "<p>Text.</p>", "Text.", 5, False, None, "Red")
+    assert drop_title_echo(res, "Gerede um den Haushalt").author == "Red"
+    res = Extraction("full", "<p>Text.</p>", "Text.", 5, False, None, "Einbrecher durchwühlen zwei Kindergärten")
+    assert drop_title_echo(res, "Einbrecher durchwühlen zwei Kindergärten in Gönningen").author is None
+    res = Extraction("full", "<p>Text.</p>", "Text.", 5, False, None, "Friedrich Merz")
+    assert drop_title_echo(res, "Gastbeitrag von Friedrich Merz: Europa muss handeln").author == "Friedrich Merz"
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("Tagesschau De", None), ("N-Tv Nachrichten", None), ("Deutschlandfunk De", None), ("Ndr De", None),
+    ("No author; Andreas Neuhaus", "Andreas Neuhaus"), ("Autor", None), ("Heise Online; Stefan Krempl", "Stefan Krempl"),
+    ("Autor Tobias Müller Redaktor", "Tobias Müller"), ("Autorin Livia Middendorp", "Livia Middendorp"),
+    ("Red; ORF at; Agenturen", "Red, Agenturen"), ("Anna Muster; Anna Muster", "Anna Muster"),
+    ("Julia Bergmann; Juri Auel", "Julia Bergmann, Juri Auel"), (None, None), ("null", None),
+    ("DER SPIEGEL", None), ("Alina Schadwinkel; DER SPIEGEL", "Alina Schadwinkel"), ("Maria De", "Maria De"),
+    ("Anna Online", "Anna Online"),
+    ("Ian Sample Science editor", "Ian Sample"), ("Ashifa Kassam European community affairs correspondent",
+                                                  "Ashifa Kassam"),
+    ("Ramon Antonio Vargas Global affairs reporter", "Ramon Antonio Vargas"), ("Jane Doe reporter", "Jane Doe"),
+    ("Andrew Sparrow", "Andrew Sparrow"), ("The Editor", None),
+    ("David Maddox; Home Affairs Correspondent", "David Maddox"), ("Moscow Times Reporter", None),
+    ("Martin Chulov Middle East correspondent", "Martin Chulov"),
+    ("Shaun Walker Central and eastern Europe correspondent", "Shaun Walker"),
+    ("Mary Ann Smith political editor", "Mary Ann Smith"), ("Mark Reporter", "Mark Reporter"),
+    ("Shrai Popat (now) and Tom Ambrose (earlier)", "Shrai Popat, Tom Ambrose"),
+    ("Angelique Chrisafis in Paris", "Angelique Chrisafis"), ("Julia Surkowa, Gaby Coldewey und Barbara Oertel",
+                                                             "Julia Surkowa, Gaby Coldewey, Barbara Oertel"),
+    ("Von der Leyen, Ursula", "Von der Leyen, Ursula"), ("CNA", None), ("The Straits Times", None),
+    ("Le Monde", None), ("Meduza", None), ("The Christian Science Monitor; Pan Pylas", "Pan Pylas"),
+    ("Jane Doe, Senior correspondent", "Jane Doe"), ("Ilanit Spinner, ARD Berlin", "Ilanit Spinner"),
+    ("Anna Muster, BR; Paul Schulz", "Anna Muster, Paul Schulz"), ("A" * 5000 + "; " + "B " * 5000, None), ("Chris Brown, political reporter", "Chris Brown"),
+    ("Smith, John, and Doe, Jane", "Smith, John, Doe, Jane"), ("Johnson & Johnson", "Johnson & Johnson"),
+    ("Anna Meier & Paul Schulz", "Anna Meier, Paul Schulz"), ("Anna" + " " * 50_000 + "(now)", "Anna"),
+    ("A Eins; B Zwei; C Drei; D Vier; E Fünf", "A Eins, B Zwei, C Drei u. a."),
+    ("; ".join(f"Vorname{n} Nachname{n}" for n in range(14)), "Vorname0 Nachname0, Vorname1 Nachname1, "
+     "Vorname2 Nachname2 u. a."),
+])
+def test_clean_author(raw, expected):
+    from app.extract import clean_author
+    assert clean_author(raw) == expected
+
+
+HEISE_FIGURE = (
+    '<figure><div class="article-image__gallery-container"><a-img width="8103" height="4553" layout="responsive" '
+    'src="/imgs/18/5/1/shutterstock_2705357347-12b280dba25485df.jpeg" alt="Beleuchtetes Nvidia-Logo" quality="85">'
+    '<img src="data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\'%3E%3C/svg%3E" alt="Beleuchtetes Nvidia-Logo">'
+    '</a-img><noscript><img src="https://heise.cloudimg.io/v7/_www-heise-de_/imgs/18/5/1/shutterstock_2705357347'
+    '-12b280dba25485df.jpeg?org_if_sml=1&amp;q=50&amp;width=696" alt="Beleuchtetes Nvidia-Logo"></noscript></div>'
+    '<figcaption><p class="source">(Bild: Robert Way/Shutterstock.com)</p></figcaption></figure>'
+    '<a-img src="${image}" alt="${title}"><img src="data:image/svg+xml,x"></a-img>')
+
+
+def test_heise_a_img_becomes_a_real_image():
+    page = _page(f"<article><p>Nvidia baut seine Sicherheitsarchitektur für KI-Agenten aus.</p>{HEISE_FIGURE}"
+                 f"{ARTICLE_PARAS}</article>")
+    result = extract(page, "https://www.heise.de/news/x.html")
+    assert "https://heise.cloudimg.io/v7/_www-heise-de_/imgs/18/5/1/shutterstock_2705357347" in result.body_html
+    assert "${" not in result.body_html and "data:image" not in result.body_html
+    assert "(Bild: Robert Way/Shutterstock.com)" in result.body_text   # Bildnachweis mit Bild bleibt
+
+
+def test_image_url_without_extension_is_kept():
+    """WELT: …/dpa-com-260928-935-1641004-jpg hat keine Dateiendung; trafilatura verwarf das Bild."""
+    src = "https://images.welt.de/6aba/eb01/ci23x11-w1200/dpa-com-260928-935-1641004-jpg"
+    page = _page(f'<article><figure><img src="{src}" alt="Metro-Logo"></figure>{ARTICLE_PARAS}</article>')
+    result = extract(page, BASE)
+    assert f'<img src="{src}"' in result.body_html and "#.jpg" not in result.body_html
+
+
+def test_orphan_image_credits_are_dropped():
+    html, _ = sanitize("<p>Vorspann des Artikels.</p><p>(Bild: Robert Way/Shutterstock.com)</p><p>Text.</p>", BASE)
+    assert html == "<p>Vorspann des Artikels.</p><p>Text.</p>"
+    html, _ = sanitize('<p>Text.</p><img src="https://a.example/b.jpg"><p>Foto: dpa</p>', BASE)
+    assert "Foto: dpa" in html
+    far = "<p>" + "Langer Absatz. " * 30 + "</p>"
+    html, _ = sanitize(f'<img src="https://a.example/b.jpg">{far}<p>(Quelle: Reuters)</p><p>Foto: dpa</p>', BASE)
+    assert "Quelle: Reuters" not in html and "Foto: dpa" not in html
+    # „Quelle:“ ohne Klammern bleibt (Statistik, Text), auch fern von jedem Bild; unter einer Tabelle ohnehin
+    html, _ = sanitize(f'<img src="https://a.example/b.jpg">{far}<p>Quelle: Reuters</p>', BASE)
+    assert "Quelle: Reuters" in html
+    html, _ = sanitize(f"{far}<table><tr><td>2025</td><td>3,1 %</td></tr></table><p>(Quelle: Statistisches "
+                       "Bundesamt)</p>", BASE)
+    assert "Statistisches Bundesamt" in html
+
+
+def test_orphan_caption_scan_is_linear():
+    """Viele Bildnachweise ohne Bild in einem langen Text: früher quadratisch (64 KB: 60 s)."""
+    body = ("<p>" + "Absatz mit Text. " * 20 + "</p><p>(Bild: dpa)</p>") * 2_000
+    t0 = time.monotonic()
+    html, _ = sanitize(body, BASE)
+    assert time.monotonic() - t0 < 5
+    assert "(Bild: dpa)" not in html
+    from app.extract import _drop_orphan_captions
+    raw = ('<p><img src="https://a.example/b.jpg"></p>' + "<p>(Bild: dpa)</p>" * 20_000)
+    t0 = time.monotonic()
+    _drop_orphan_captions(raw)
+    assert time.monotonic() - t0 < 5
+    html, _ = sanitize("<p>Text.</p><p>Quelle: Das Statistische Bundesamt hat die Zahlen (vorläufig) veröffentlicht, "
+                       "sie gelten als verlässlich.</p>", BASE)
+    assert "Statistische Bundesamt" in html
+
+
+def test_guardian_image_without_logo_overlay_is_preferred():
+    base = "https://i.guim.co.uk/img/media/7043ac/507_0_4762_3810/master/4762.jpg"
+    og = f"{base}?width=1200&height=630&quality=85&auto=format&fit=crop&overlay-align=bottom%2Cleft&overlay-base64=L2lt&s=1"
+    ld = ('<script type="application/ld+json">{"@type":"NewsArticle","image":["' + og + '","' + base
+          + '?width=1200&height=900&quality=85&auto=format&fit=crop&s=2","' + base
+          + '?width=1200&quality=85&auto=format&fit=max&s=3"]}</script>')
+    result = extract(_page(f"<article>{ARTICLE_PARAS}</article>", f'<meta property="og:image" content="{og}">' + ld),
+                     BASE)
+    assert result.image_url == f"{base}?width=1200&quality=85&auto=format&fit=max&s=3"
+
+
+def test_meduza_text_card_is_no_image():
+    card = "https://meduza.io/imgly/share/1790580532/en/news/2026/09/28/russian-strike"
+    result = extract(_page(f"<article>{ARTICLE_PARAS}</article>", f'<meta property="og:image" content="{card}">'), BASE)
+    assert result.image_url is None
+
+
+def test_tickaroo_timestamps_become_paragraphs_and_share_buttons_go(monkeypatch):
+    monkeypatch.delenv("KIOSK_TZ", raising=False)
+    import lxml.html
+    from app.extract import _precleaned
+    event = ('<div class="tik4-event"><div class="tik4-meta"><time datetime="2026-09-28T12:43:55.000Z" '
+             'class="tik4-meta__ts"><span class="tik4-meta__ts__date">Heute</span> <span class="tik4-meta__ts__time">'
+             '12:43 Uhr</span></time></div><div class="tik4-author__thumb"><img src="https://cdn.tickaroo.com/a.webp">'
+             '</div><div class="tik4-sharing"><a href="#">Teilen</a></div><div class="tik4-content-block"><h2>Eintrag'
+             "</h2><p>Meldung.</p></div></div>")
+    out = lxml.html.tostring(_precleaned(_page(event)), encoding="unicode")
+    # feste Zeit aus datetime (deutsche Sommerzeit: UTC+2), nicht das relative „Heute 12:43 Uhr“
+    assert "<p><strong>28.09. 14:43</strong></p>" in out and "Heute" not in out
+    assert "Teilen" not in out and "tickaroo.com/a.webp" not in out and "Meldung." in out
+    relative = event.replace(' datetime="2026-09-28T12:43:55.000Z"', "").replace("Heute", "Vor 44 Minuten")
+    out = lxml.html.tostring(_precleaned(_page(relative)), encoding="unicode")
+    assert "Minuten" not in out and "<strong>" not in out   # ohne feste Zeit: weg
+    named = event.replace('<div class="tik4-author__thumb">', '<div class="tik4-author"><span>Anna Schimpp</span>'
+                          '</div><div class="tik4-author__thumb">')
+    assert "Anna Schimpp" not in lxml.html.tostring(_precleaned(_page(named)), encoding="unicode")
+
+
+# ---- Nachbesserung nach den Reviews -------------------------------------------------------------
+
+def test_caption_regex_matches_bild_and_parentheses():
+    from app.extract import CAPTION_RE
+    for caption in ("Bild: dpa", "(Bild: Daimler Truck)", "Bilder: AP", "Foto: X", "Fotos: Y", "(Quelle: Z)",
+                    "Photo: Reuters", "Image: AFP"):
+        assert CAPTION_RE.match(caption), caption
+    assert not CAPTION_RE.match("Bildung: Die Schulen öffnen wieder")
+
+
+def test_duplicate_image_drops_its_parenthesised_credit():
+    img = "https://a.example/bild.jpg"
+    html, _ = sanitize(f'<p><img src="{img}"></p><p>Text.</p><p><img src="{img}?w=640"></p><p>(Bild: Daimler Truck)</p>',
+                       BASE)
+    assert html.count("<img") == 1 and "Daimler" not in html
+
+
+def test_lead_search_is_bounded_for_hostile_descriptions():
+    word = "x" * 100_000
+    body = "<div>" + f"<p>{word[:50]} Text</p>" * 5_000 + "</div>"
+    t0 = time.monotonic()
+    result = extract(_page(f"<article>{ARTICLE_PARAS}</article>{body}", _og(word)), BASE)
+    assert time.monotonic() - t0 < 10 and result.body_text
+    long_desc = ("Ein langer Satz der Beschreibung. " * 60).strip()
+    page = _page(f"<header><div>{long_desc}</div></header><article>{ARTICLE_PARAS}</article>", _og(long_desc))
+    assert "Ein langer Satz" not in extract(page, BASE).body_text   # über _LEAD_MAX: kein Vorspann
+
+
+def test_lead_is_not_the_headline():
+    """Beschreibung = Titel (oder fast): nicht als Absatz einfügen; Überschriften sind keine Kandidaten."""
+    title = "Boeing meldet Softwarefehler bei Hunderten Maschinen weltweit, die Aufsicht reagiert scharf"
+    page = _page(f"<article><h2>{title}</h2>{ARTICLE_PARAS}</article>",
+                 f"<title>{title}</title><meta property='og:title' content='{title}'>" + _og(title + "."))
+    result = extract(page, BASE)
+    assert f"<p>{title}" not in result.body_html
+    page = _page(f"<article><h2>{LEAD}</h2>{ARTICLE_PARAS}</article>", _og(LEAD))
+    assert f"<p>{LEAD}</p>" not in extract(page, BASE).body_html
+
+
+def test_lead_does_not_push_the_body_over_the_limit(monkeypatch):
+    from app.extract import _with_lead
+    from trafilatura.utils import load_html
+    tree = load_html(_page(f"<header><div>{LEAD}</div></header>", _og(LEAD)))
+    clean = "<p>" + "x" * 100 + "</p>"
+    monkeypatch.setattr(extract_mod, "MAX_BODY_HTML", len(clean) + 20)
+    assert _with_lead(clean, "x" * 100, tree) == (clean, "x" * 100)
+
+
+IMG = '<img src="https://a.example/b.jpg">'
+
+
+@pytest.mark.parametrize("body,expected", [
+    # heise: Vorspann, dann Titelbild samt Bildnachweis → Bild nach vorn, Nachweis in <figcaption>
+    (f"<p>Nvidia baut seine Sicherheitsarchitektur aus.</p>{IMG}<p>(Bild: Robert Way/Shutterstock.com)</p>"
+     "<p>Nvidia reagiert auf jüngste Vorfälle.</p>",
+     f"<figure>{IMG}<figcaption>(Bild: Robert Way/Shutterstock.com)</figcaption></figure><p>Nvidia baut seine "
+     "Sicherheitsarchitektur aus.</p><p>Nvidia reagiert auf jüngste Vorfälle.</p>"),
+    # heise: Bildunterschrift mit Punkt, weil direkt ein Bildnachweis folgt
+    (f"<p>Lead.</p>{IMG}<p>Bose Wired Earbuds.</p><p>(Bild: Bose)</p><p>Text.</p>",
+     f"<figure>{IMG}<figcaption>Bose Wired Earbuds.<br>(Bild: Bose)</figcaption></figure><p>Lead.</p><p>Text.</p>"),
+    # SPIEGEL: Bildnachweis als loser Text nach der Unterschrift …
+    ('<img src="https://a.example/b.jpg" alt="Metro-Schild in Deutschland im Jahr 2021"><p>Metro-Schild in '
+     "Deutschland im Jahr 2021</p>Foto: Beautiful Sports / IMAGO<p>Der russische Machthaber hat entschieden.</p>",
+     '<figure><img src="https://a.example/b.jpg" alt="Metro-Schild in Deutschland im Jahr 2021"><figcaption>'
+     "Metro-Schild in Deutschland im Jahr 2021<br>Foto: Beautiful Sports / IMAGO</figcaption></figure><p>Der "
+     "russische Machthaber hat entschieden.</p>"),
+    # … oder „Foto:“ lose und der Name als eigener Absatz (Unterschrift = Alt-Text, endet mit »…«)
+    ('<img src="https://a.example/b.jpg" alt="Horst Lichter (2024): »Einer der großartigsten Tage«">'
+     "<p>Horst Lichter (2024): »Einer der großartigsten Tage«</p>Foto:<p>Oliver Berg / dpa</p><p>Text.</p>",
+     '<figure><img src="https://a.example/b.jpg" alt="Horst Lichter (2024): »Einer der großartigsten Tage«">'
+     "<figcaption>Horst Lichter (2024): »Einer der großartigsten Tage«<br>Foto: Oliver Berg / dpa</figcaption>"
+     "</figure><p>Text.</p>"),
+    # schon als <figure>: Unterschrift kommt hinein
+    (f"<figure>{IMG}</figure><p>Metro-Schild in Deutschland im Jahr 2021</p><p>Der russische Machthaber.</p>",
+     f"<figure>{IMG}<figcaption>Metro-Schild in Deutschland im Jahr 2021</figcaption></figure>"
+     "<p>Der russische Machthaber.</p>"),
+    # <p><img></p>: das Bild kommt ohne Absatz in die <figure>
+    (f"<p>{IMG}</p><p>(Bild: dpa)</p><p>Text.</p>", f"<figure>{IMG}<figcaption>(Bild: dpa)</figcaption></figure>"
+     "<p>Text.</p>"),
+    # GEA: die Unterschrift (Anfang = Alt-Text) steht als zweiter Absatz, sie kommt ans Bild
+    ('<img src="https://a.example/b.jpg" alt="Zieldurchfahrt in Trochtelfingen: Der Münsinger Uwe Hardter gewinnt '
+     'die Langdist"><p>Bei der 30. Auflage setzt sich Uwe Hardter durch.</p><p>Zieldurchfahrt in Trochtelfingen: '
+     "Der Münsinger Uwe Hardter gewinnt die Langdistanz.</p><p>Rest.</p>",
+     '<figure><img src="https://a.example/b.jpg" alt="Zieldurchfahrt in Trochtelfingen: Der Münsinger Uwe Hardter '
+     'gewinnt die Langdist"><figcaption>Zieldurchfahrt in Trochtelfingen: Der Münsinger Uwe Hardter gewinnt die '
+     "Langdistanz.</figcaption></figure><p>Bei der 30. Auflage setzt sich Uwe Hardter durch.</p><p>Rest.</p>"),
+])
+def test_arrange_top_puts_image_first_with_one_figcaption(body, expected):
+    from app.extract import _arrange_top
+    assert _arrange_top(body) == expected
+
+
+@pytest.mark.parametrize("body", [
+    "<p>" + "Langer erster Absatz. " * 40 + f"</p>{IMG}<p>Text.</p>",       # langer Absatz: kein Vorspann
+    f"{IMG}<p><strong>17.31 CEST</strong></p><h2>Eintrag</h2><p>Text.</p>",  # Liveblog-Uhrzeit: keine Unterschrift
+    f"{IMG}<p>Kurzer erster Satz.</p><p>Text.</p>",                          # Satz mit Punkt: Text
+    f"{IMG}<p>Das sagte der Minister dazu:</p><p>Text.</p>",                 # Doppelpunkt am Ende
+])
+def test_arrange_top_leaves_text_paragraphs_alone(body):
+    from app.extract import _arrange_top
+    assert _arrange_top(body) == body
+
+
+def test_page_figcaption_marks_a_caption_with_full_stop():
+    """derStandard: Unterschrift mit Punkt, die auf der Seite in einer <figcaption> steht."""
+    from app.extract import _arrange_top, _squash
+    body = (f'<img src="https://a.example/b.jpg" alt="AFP/ANDREJ ISAKOVIC"><p>McLaren-Fahrer Lando Norris muss '
+            "zurückrudern.</p><p>Baku - Weltmeister Lando Norris hat seine Forderung zurückgenommen.</p>")
+    captions = frozenset({_squash("McLaren-Fahrer Lando Norris muss zurückrudern. Foto: AFP")})
+    assert "<figcaption>McLaren-Fahrer Lando Norris muss zurückrudern.</figcaption></figure><p>Baku" in \
+        _arrange_top(body, captions)
+    assert _arrange_top(body) == body
+
+
+def test_lead_position_is_after_image_and_figcaption():
+    from app.extract import _lead_position
+    body = f"<h2>T</h2>{IMG}<figcaption>Unterschrift</figcaption><p>Text.</p>"
+    assert body[_lead_position(body):] == "<p>Text.</p>"
+    live = f"{IMG}<p><strong>17.31 CEST</strong></p><h2>Eintrag</h2>"
+    assert live[_lead_position(live):].startswith("<p><strong>17.31")
+
+
+def test_lead_goes_after_the_leading_image_in_extract():
+    page = _page(f'<main><article><header><h2>Softwarefehler</h2><div data-area="intro"><div class="RichText">{LEAD}'
+                 '</div></div></header><figure><img src="https://a.example/hero.jpg" alt="Boeing 737"><figcaption>'
+                 f'Eine Boeing 737 in Seattle</figcaption></figure><div data-area="body">{ARTICLE_PARAS}</div>'
+                 "</article></main>", _og(LEAD))
+    result = extract(page, BASE)
+    # die Überschrift im <header> ist die der Seite (fällt weg, _page_headlines), das Bild steht vorn
+    assert re.match(r"\s*(?:<figure>\s*)?<img", result.body_html), result.body_html[:200]
+    assert result.body_html.index("hero.jpg") < result.body_html.index("Aufsicht reagiert")
+
+
+def test_preclean_xpath_stays_linear_on_big_pages():
+    from app.extract import _cleaned_tree
+    page = _page("<div>" + '<div class="a b c"><span class="x">t</span><a href="/y">l</a></div>' * 60_000 + "</div>")
+    t0 = time.monotonic()
+    tree, changed = _cleaned_tree(page)
+    assert tree is not None and not changed
+    assert time.monotonic() - t0 < 10
+
+
+def test_meta_line_regex_has_no_catastrophic_backtracking():
+    from app.extract import _META_LINE_RE
+    for n in (21, 30, 36):
+        t0 = time.monotonic()
+        assert not _META_LINE_RE.match("Stand: " + "12.12.12" * n + "x")
+        assert time.monotonic() - t0 < 0.5
+    t0 = time.monotonic()
+    html, _ = sanitize("<p>Stand: " + "12.12.12" * 30 + "x</p><p>Text.</p>", BASE)
+    assert time.monotonic() - t0 < 1 and "Text." in html
+    for line in ("Stand: 28.09.2026 18:07 Uhr", "Lesezeit: 3 Minuten", "Lesezeit: 3 Min.", "Stand: 28. September 2026"):
+        assert _META_LINE_RE.match(line), line
+
+
+def test_tickaroo_text_with_br_is_split_into_paragraphs_without_duplicates():
+    rich = ('<div class="tik4-rich-text tik4-rich-text--de"><h2>Putin stellt Metro unter Verwaltung</h2><div>Der '
+            "russische Präsident hat die Vermögenswerte unter Verwaltung gestellt.<br>Das Dekret nannte keine Gründe "
+            "für den Schritt, Metro hat noch 91 Märkte.<br><br>In diesem Monat hatte Putin bereits Nestlé und Auchan "
+            "unter externe Verwaltung gestellt.</div></div>")
+    event = f'<div class="tik4-event"><div class="tik4-content-block">{rich}</div></div>'
+    import lxml.html
+    from app.extract import _precleaned
+    out = lxml.html.tostring(_precleaned(_page(event)), encoding="unicode")
+    assert out.count("<p>") == 3 and "<br>" not in out
+    result = extract(_page(f'<main><div class="tik4-live">{event * 4}</div></main>'), BASE)
+    for sentence in ("Das Dekret nannte keine Gründe", "In diesem Monat hatte Putin"):
+        assert result.body_text.count(sentence) <= 4, sentence   # je Eintrag höchstens einmal
+
+
+def test_title_echo_behind_the_moved_image_is_dropped():
+    from app.extract import Extraction, drop_title_echo
+    title = "Putin stellt Metro unter Zwangsverwaltung"
+    body = f'{IMG}<figcaption>Metro-Schild</figcaption><p>{title}</p><p>Text folgt hier.</p>'
+    res = drop_title_echo(_extraction(body), title)
+    assert res.body_html == f"{IMG}<figcaption>Metro-Schild</figcaption><p>Text folgt hier.</p>"
+    # Seitenüberschrift mit Dachzeile passt nur zum Titel der Seite (og:title), nicht zum Feed-Titel
+    body = ("<h2>Partei von Marine Le Pen Antisemitismusvorwürfe bringen Bardella in Bedrängnis</h2>"
+            "<p>Text folgt hier.</p>")
+    res = Extraction("full", body, html_to_text(body), 10, False, None, None,
+                     "Antisemitismusvorwürfe bringen Bardella in Bedrängnis")
+    assert drop_title_echo(res, "Frankreich: Antisemitismusaffäre um Jordan Bardella").body_html == \
+        "<p>Text folgt hier.</p>"
+
+
+def test_extract_drops_page_title_paragraph_before_moving_the_image():
+    title = "Nvidia stellt Sicherheitsnetz für autonome KI-Agenten vor"
+    page = _page(f"<article><p>{title}</p><figure><img src=\"https://a.example/hero.jpg\" alt=\"Logo\"></figure>"
+                 f"{ARTICLE_PARAS}</article>", f'<meta property="og:title" content="{title}">')
+    result = extract(page, BASE)
+    assert title not in result.body_text and result.page_title == title
+
+
+@pytest.mark.parametrize("ld,expected", [
+    ('[{"@type":"WebPage","isAccessibleForFree":true},{"@type":"NewsArticle","isAccessibleForFree":false}]', True),
+    ('{"@graph":[{"@type":"WebPage","isAccessibleForFree":"True"},'
+     '{"@type":"NewsArticle","url":"https://news.example/artikel/1","isAccessibleForFree":"False"}]}', True),
+    # eigener Artikel frei, empfohlene Artikel (andere URL) mit Paywall: frei (heise)
+    ('[{"@type":"NewsArticle","url":"https://news.example/artikel/1","isAccessibleForFree":true},'
+     '{"@type":"NewsArticle","url":"https://news.example/plus","isAccessibleForFree":false}]', False),
+    # CSM: Wert als URL ist keine Angabe, das erste Vorkommen im Text auch nicht
+    ('{"@type":"NewsArticle","isAccessibleForFree":"http:\\\\/\\\\/schema.org\\\\/False"}', False),
+    # eigenes Objekt ohne Angabe: unentschieden, der Seitentext entscheidet (hier: die Paywall-Angabe des
+    # verwandten Artikels ist das erste Vorkommen)
+    ('[{"@type":"WebPage","url":"https://news.example/artikel/1"},'
+     '{"@type":"NewsArticle","url":"https://news.example/plus","isAccessibleForFree":false}]', True),
+    # eigener Artikel ohne Angabe, dazu eine WebPage ohne URL mit Paywall-Angabe: Paywall (Seitentext)
+    ('[{"@type":"NewsArticle","url":"https://news.example/artikel/1","headline":"H"},'
+     '{"@type":"WebPage","isAccessibleForFree":false}]', True),
+    # BreadcrumbList-Eintrag mit der Seite als @id ist kein eigenes Objekt; der Artikel (andere Überschrift)
+    # entscheidet
+    ('[{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","@id":"https://news.example/artikel/1",'
+     '"isAccessibleForFree":true}]},{"@type":"NewsArticle","headline":"Ganz anders","isAccessibleForFree":false}]',
+     True),
+    # eigener Artikel frei, aber ein Teil (hasPart) mit Paywall: Paywall
+    ('{"@type":"NewsArticle","url":"https://news.example/artikel/1","isAccessibleForFree":true,'
+     '"hasPart":[{"@type":"WebPageElement","isAccessibleForFree":true},'
+     '{"@type":"WebPageElement","isAccessibleForFree":false}]}', True),
+    # eigener Artikel ausdrücklich frei überstimmt eine Paywall-Angabe davor im Seitentext
+    ('[{"@type":"WebPage","isAccessibleForFree":false},'
+     '{"@type":"NewsArticle","url":"https://news.example/artikel/1","isAccessibleForFree":true}]', False),
+    # eigene WebPage mit Angabe, verwandter Artikel frei: die eigene entscheidet
+    ('[{"@type":"WebPage","url":"https://news.example/artikel/1","isAccessibleForFree":false},'
+     '{"@type":"NewsArticle","url":"https://news.example/frei","isAccessibleForFree":true}]', True),
+    # Bezahlteil als hasPart des eigenen Artikels (Google-Vorschlag)
+    ('{"@type":"NewsArticle","url":"https://news.example/artikel/1","hasPart":{"@type":"WebPageElement",'
+     '"isAccessibleForFree":false,"cssSelector":".paywall"}}', True),
+    # Zeilenumbruch in einer Zeichenkette (ungültiges JSON, aber verbreitet): trotzdem gelesen
+    ('{"@type":"NewsArticle","headline":"Zeile\neins","url":"https://news.example/artikel/1",'
+     '"isAccessibleForFree":"False"}' + "x" * 0, True),
+])
+def test_paywall_decided_by_the_page_article_object(ld, expected):
+    page = _page(f"<article>{ARTICLE_PARAS}</article>", f'<script type="application/ld+json">{ld}</script>')
+    assert extract(page, BASE).paywalled is expected
+
+
+def test_json_ld_relevance_check_stays_fast_with_many_blocks():
+    blocks = "".join(f'<script type="application/ld+json">{{"@type":"NewsArticle","url":"https://x.example/{n}",'
+                     f'"articleBody":"Ein anderer Artikel Nummer {n} mit genug Text für einen ganzen Satz hier."}}'
+                     "</script>" for n in range(5_000))
+    t0 = time.monotonic()
+    result = extract(_page(f"<article>{ARTICLE_PARAS * 20}</article>", blocks), BASE)
+    assert time.monotonic() - t0 < 10 and "Landenavigation" in result.body_text
+
+
+@pytest.mark.parametrize("credit,dropped", [
+    ("Sven Hoppe/dpa", True), ("Zwei Männer, ein Wagen. Sven Hoppe/dpa", True),
+    ("Beautiful Sports / KJPeters / IMAGO", True), ("Oliver Berg / dpa", True),
+    ("Das berichteten dpa/AFP", False), ("Die Polizei ermittelt weiter gegen Unbekannt.", False),
+])
+def test_agency_credits_of_lost_images_are_dropped(credit, dropped):
+    far = "<p>" + "Langer Absatz. " * 30 + "</p>"
+    html, _ = sanitize(f"{far}<p>{credit}</p><p>Weiter.</p>", BASE)
+    assert (credit not in html) is dropped
+    html, _ = sanitize(f'<img src="https://a.example/b.jpg"><p>{credit}</p><p>Weiter.</p>', BASE)
+    assert credit in html   # mit Bild davor: Bildnachweis bleibt
+
+
+def test_heise_editor_initials_at_the_end_are_dropped():
+    page = _page(f"<article>{ARTICLE_PARAS}<p>(<a href=\"mailto:x@heise.de\">fpi</a>)</p></article>")
+    assert "(fpi)" not in extract(page, "https://www.heise.de/news/x.html").body_text
+    assert "(fpi)" in extract(page, BASE).body_text   # nur bei heise
+    from app.extract import _drop_trailing_initials
+    assert _drop_trailing_initials("<p>Text.</p><p>(mki, tobe)</p>") == "<p>Text.</p>"
+    assert _drop_trailing_initials("<p>Text.</p><p>(dpa)</p><p>Schluss.</p>") == "<p>Text.</p><p>(dpa)</p><p>Schluss.</p>"
+
+
+def test_run_together_split_respects_newlines_abbreviations_and_domains():
+    from app.extract import _clean_ld_body
+    assert _clean_ld_body("A court.The collegium met.") == "A court.\nThe collegium met."
+    for keep in ("Laut Dr.Müller geht es voran.", "Aufstieg in die 3.Liga steht bevor.",
+                 "Mehr auf www.Example.com lesen.", "Die U.S.Army war nicht beteiligt.", "Erst Absatz.\nDann court.The"):
+        assert _clean_ld_body(keep) == keep, keep
+    t0 = time.monotonic()
+    _clean_ld_body("a" * 200_000 + " " + "Wort.Wort " * 50_000)
+    _clean_ld_body("ab.Cd" * 32_000)            # ohne Leerzeichen: früher 5,5 s
+    _clean_ld_body("x" + "Ab.Cd" * 400_000)     # 2 MB
+    assert time.monotonic() - t0 < 5
+
+
+@pytest.mark.parametrize("junk", [
+    '<button class="sr-only">Zum Inhalt</button>',
+    '<button class="show-comments">Kommentare</button>',
+    '<div class="c-article-page__preferred-sources"><a href="https://www.google.com/preferences/source?q=welt.de">'
+    "Google</a></div>",
+])
+def test_element_matched_twice_is_dropped_once_and_the_rest_still_works(junk, caplog):
+    from app.extract import _cleaned_tree
+    import lxml.html
+    page = _page(f"<article>{junk}{HEISE_FIGURE}{ARTICLE_PARAS}</article>")
+    tree, changed = _cleaned_tree(page)
+    assert tree is not None and changed
+    out = lxml.html.tostring(tree, encoding="unicode")
+    assert "Zum Inhalt" not in out and "Kommentare" not in out and "preferences/source" not in out
+    assert "<a-img" not in out and "heise.cloudimg.io" in out   # Umbauten laufen weiter
+    assert "gescheitert" not in caplog.text
+
+
+@pytest.mark.parametrize("body", [
+    # Alt-Text „Donald Trump“ macht einen Satz, der so beginnt, nicht zur Unterschrift
+    '<img src="https://a.example/b.jpg" alt="Donald Trump"><p>Donald Trump hat erneut mit Zöllen gedroht.</p>'
+    "<p>Text.</p>",
+    # … und zieht keinen späteren Absatz nach vorn
+    '<img src="https://a.example/b.jpg" alt="Olaf Scholz"><p>Erster Absatz mit einem ganzen Satz.</p>'
+    "<p>Olaf Scholz sagte am Montag in Berlin, er sehe keinen Grund für Neuwahlen.</p>",
+    # Zitat, Auslassung, Klammer, Ortsmarke, Gedicht: keine Bildunterschrift
+    f"{IMG}<p>„Wir schaffen das“</p><p>Text.</p>",
+    f"{IMG}<p>Und dann kam alles anders …</p><p>Text.</p>",
+    f"{IMG}<p>Die Lage in der Stadt (Archiv)</p><p>Text.</p>",
+    f"{IMG}<p>Berlin (dpa) – Die Bundesregierung</p><p>Text.</p>",
+    f"{IMG}<p>Der Mond ist aufgegangen</p><p>Die goldnen Sternlein prangen</p><p>Am Himmel hell und klar</p>",
+])
+def test_arrange_top_does_not_take_text_as_caption(body):
+    from app.extract import _arrange_top
+    assert _arrange_top(body) == body
+
+
+def test_caption_ends_after_the_credit():
+    from app.extract import _arrange_top
+    body = f"{IMG}<p>Merz im Bundestag</p><p>Foto: dpa</p><p>Eine kurze Einleitung ohne Punkt</p><p>Text.</p>"
+    assert _arrange_top(body) == (f"<figure>{IMG}<figcaption>Merz im Bundestag<br>Foto: dpa</figcaption></figure>"
+                                  "<p>Eine kurze Einleitung ohne Punkt</p><p>Text.</p>")
+
+
+def test_intro_stays_before_the_body_when_the_image_follows_it():
+    """GEA: kurzer Vorspann, Bild, langer Text, Unterschrift: der Vorspann bleibt vor dem Text."""
+    from app.extract import _arrange_top
+    alt = "Zieldurchfahrt in Trochtelfingen: Der Münsinger Uwe Hardter gewinnt die Langdist"
+    body = (f'<p>Kurzer Vorspann.</p><img src="https://a.example/b.jpg" alt="{alt}"><p>{"Langer Text. " * 30}</p>'
+            "<p>Zieldurchfahrt in Trochtelfingen: Der Münsinger Uwe Hardter gewinnt die Langdistanz.</p>")
+    out = _arrange_top(body)
+    assert out.startswith('<img src="https://a.example/b.jpg"') or out.startswith("<figure>")
+    assert out.index("Kurzer Vorspann.") < out.index("Langer Text.")
+
+
+def test_split_at_br_is_linear_and_keeps_the_tail():
+    from app.extract import _split_at_br
+    import lxml.html
+    root = lxml.html.fromstring("<div><section>" + "<div>a<br>b</div>" * 20_000 + "</section></div>")
+    divs = root.findall(".//section/div")
+    t0 = time.monotonic()
+    for div in divs:
+        _split_at_br(div)
+    assert time.monotonic() - t0 < 5 and len(root.findall(".//p")) == 40_000
+    root = lxml.html.fromstring("<div><p>vorher</p><div><br><br></div>danach</div>")
+    _split_at_br(root.find("div"))
+    assert lxml.html.tostring(root, encoding="unicode") == "<div><p>vorher</p>danach</div>"
+    root = lxml.html.fromstring("<div><div><br></div>danach</div>")
+    _split_at_br(root.find("div"))
+    assert lxml.html.tostring(root, encoding="unicode") == "<div>danach</div>"
+
+
+def test_json_ld_with_raw_newline_is_parsed():
+    """Ungültiges JSON mit Zeilenumbruch in einer Zeichenkette wird trotzdem gelesen (strict=False): Hier
+    entscheidet nur das JSON-LD, das erste Vorkommen im Seitentext wäre „true“."""
+    ld = ('<script type="application/ld+json">{"@type":"NewsArticle","headline":"Zeile\neins",'
+          '"url":"https://news.example/artikel/1","isAccessibleForFree":false}</script>')
+    page = _page(f"<article>{ARTICLE_PARAS}</article>", '<meta name="x" content=\'"isAccessibleForFree":true\'>' + ld)
+    assert extract(page, BASE).paywalled is True
+
+
+def test_screen_reader_separator_stays_as_text():
+    """FAZ: <span class="sr-only">: </span> zwischen Dachzeile und Titel bleibt als „: “ stehen."""
+    import lxml.html
+    from app.extract import _precleaned
+    page = _page('<article><h2><span>Liveblog Ukrainekrieg <span class="sr-only">: </span></span><span>Selenskyj '
+                 'spricht</span></h2><span class="sr-only">Zum Inhalt springen</span></article>')
+    out = lxml.html.fromstring(lxml.html.tostring(_precleaned(page))).text_content()
+    assert "Liveblog Ukrainekrieg : Selenskyj" in out and "Zum Inhalt" not in out
+
+
+def test_trailing_credit_in_parentheses_makes_a_caption():
+    from app.extract import _arrange_top
+    body = (f"{IMG}<p>Soldiers train near Kyiv on Sept. 27, 2026. (Nikoletta Stoyanova/Getty Images)</p>"
+            "<p>Text.</p>")
+    assert _arrange_top(body) == (f"<figure>{IMG}<figcaption>Soldiers train near Kyiv on Sept. 27, 2026. "
+                                  "(Nikoletta Stoyanova/Getty Images)</figcaption></figure><p>Text.</p>")
+
+
+@pytest.mark.parametrize("line", [
+    "Bild: Die Bundesregierung muss jetzt endlich handeln, statt weiter zu zögern.",
+    "Bild: Merz hat die Wahl gewonnen, und zwar deutlich, meint das Boulevardblatt heute in seinem Kommentar",
+])
+def test_press_review_line_quoting_bild_is_kept(line):
+    far = "<p>" + "Langer Absatz. " * 30 + "</p>"
+    html, _ = sanitize(f"{far}<p>{line}</p><p>Weiter.</p>", BASE)
+    assert line in html
+
+
+@pytest.mark.parametrize("para", [
+    "Klicken Sie hier, um mehr über Google und seine Suchmaschine zu erfahren.",
+    "Please contact us at the front desk if you have questions.",
+])
+def test_promo_phrases_need_their_context(para):
+    html, _ = sanitize(f"<p>{para}</p>", BASE)
+    assert para in html
+
+
+def test_faz_header_caption_is_kept_and_teaser_is_not_the_caption():
+    head = _og("Seoul: Kiew hat gegen vertrauliche Vereinbarung verstoßen +++ alle Neuigkeiten im Liveblog")
+    alt = ("Werbung für den Armeedienst in Tambov: Umgerechnet 56.000 Euro pro Jahr bietet die Russische Armee "
+           "für Drohnenoperatoren.")
+    page = _page(f'<main><article><header><div data-external-selector="header-teaser-image"><picture><img alt="{alt}" '
+                 'src="https://media0.faz.net/image/w1240/x/werbung.webp"></picture></div><div class="meta2 block">'
+                 f'<span class="meta2">{alt}</span><small class="meta2-italic">AFP</small></div><p '
+                 'data-external-selector="header-teaser">Seoul: Kiew hat gegen vertrauliche Vereinbarung verstoßen '
+                 f"+++ alle Neuigkeiten im Liveblog</p></header>{ARTICLE_PARAS}</article></main>", head)
+    result = extract(page, "https://www.faz.net/aktuell/politik/liveblog.html")
+    caption = re.search(r"<figcaption>(.*?)</figcaption>", result.body_html, re.S)
+    assert caption and "Tambov" in caption.group(1) and "AFP" in caption.group(1) and "+++" not in caption.group(1)
+    from app.extract import _arrange_top
+    teaser = f"{IMG}<p>Kiew meldet Angriffe +++ Kreml reagiert +++ alle Neuigkeiten im Liveblog</p><p>Text.</p>"
+    assert _arrange_top(teaser) == teaser
+
+
+def test_taz_placeholder_image_is_replaced_by_the_noscript_image():
+    figure = ('<figure><a href="https://taz.de/picture/1/1200/b.webp"><picture><noscript><img '
+              'src=" https://taz.de/picture/8766912/835/42191297.webp" alt="Wüst und Erdoğan"></noscript>'
+              '<img src="https://taz.de/picture/8766912/14/42191297.webp" alt="Wüst und Erdoğan"></picture></a>'
+              '<figcaption>Alles glänzt: Wüst bei Erdoğan <p class="credit-name">Foto: Marcel Kusch/dpa</p>'
+              "</figcaption></figure>")
+    import lxml.html
+    from app.extract import _precleaned
+    out = lxml.html.tostring(_precleaned(_page(f"<article>{figure}{ARTICLE_PARAS}</article>")), encoding="unicode")
+    assert "/14/" not in out.split("</noscript>", 1)[1] and "/835/42191297.webp" in out.split("</noscript>", 1)[1]
+    no_noscript = figure.replace("<noscript>", "<!--").replace("</noscript>", "-->")
+    out = lxml.html.tostring(_precleaned(_page(f"<article>{no_noscript}{ARTICLE_PARAS}</article>")), encoding="unicode")
+    assert '/14/42191297.webp"' not in out.replace("<!--", "").split("-->")[-1]
+
+
+def test_only_a_credit_arrived_takes_the_full_page_caption():
+    """taz: trafilatura verwarf den Text der <figcaption>, nur der Nachweis kam an."""
+    from app.extract import _arrange_top, _squash
+    full = "Glaubt, dass Regeln nicht für ihn gelten: Jens Spahn im Münsterland Foto: Lars Berg/dpa"
+    body = f"{IMG}<p>Foto: Lars Berg/dpa</p><p>Text.</p>"
+    out = _arrange_top(body, {_squash(full): full})
+    assert out == (f"<figure>{IMG}<figcaption>Glaubt, dass Regeln nicht für ihn gelten: Jens Spahn im Münsterland"
+                   "<br>Foto: Lars Berg/dpa</figcaption></figure><p>Text.</p>")
+
+
+def test_heading_equal_to_the_visible_page_headline_is_dropped():
+    """SPIEGEL: og:title ist ein Suchmaschinen-Titel; die gezeigte Überschrift (Dachzeile + Titel) steht als
+    <h2> im Kopf und kam als erste Überschrift in den Text."""
+    headline = ("<h2><span>Sendungsaus nach sechs Jahren</span> <span>Aus für »ZDF Magazin Royale« meine eigene "
+                "Entscheidung, sagt Böhmermann</span></h2>")
+    page = _page(f"<main><article><header>{headline}</header><div>{ARTICLE_PARAS}</div></article></main>",
+                 '<meta property="og:title" content="Jan Böhmermann: Ende von »ZDF Magazin Royale« sei seine eigene '
+                 'Entscheidung gewesen">')
+    result = extract(page, "https://www.spiegel.de/kultur/tv/x")
+    assert "Sendungsaus" not in result.body_text and "Landenavigation" in result.body_text

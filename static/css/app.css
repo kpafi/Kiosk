@@ -45,12 +45,12 @@ h1, h2, h3, p { margin: 0; }
   .only-desktop { display: none !important; }
 }
 
-/* ---- Desktop ab 900px: Liste links (520px), Leseansicht rechts ---------- */
+/* ---- Desktop ab 900px: Liste links (--list-w, Standard 520px, ziehbar), Leseansicht rechts ---- */
 @media (min-width: 900px) {
   .only-mobile { display: none !important; }
   #shell[data-layout="list"], #shell[data-layout="article"] {
     display: grid;
-    grid-template-columns: 520px minmax(0, 1fr);
+    grid-template-columns: var(--list-w, 520px) minmax(0, 1fr);
     height: 100dvh;
     overflow: hidden;
   }
@@ -67,6 +67,9 @@ h1, h2, h3, p { margin: 0; }
   }
   #shell[data-layout="list"] #reader, #shell[data-layout="article"] #reader {
     display: block;
+    /* Lage der Kontextspalte und der „Nächster“-Pille richten sich nach der Breite der Leseansicht
+       (die Liste ist ziehbar), nicht nach dem Fenster. */
+    container: reader / inline-size;
     scrollbar-width: thin;
     scrollbar-color: var(--rule) transparent;
     height: 100dvh;
@@ -349,8 +352,8 @@ mark {
   gap: var(--space-2);
 }
 @media (min-width: 900px) {
-  /* Nach der Grundregel, sonst gewinnt diese: 24px seitlich in der 520px-Spalte, 20px unten (Mockup). */
-  #bar { left: 24px; right: auto; width: calc(520px - 48px); bottom: 20px; }
+  /* Nach der Grundregel, sonst gewinnt diese: 24px seitlich in der Listenspalte, 20px unten (Mockup). */
+  #bar { left: 24px; right: auto; width: calc(var(--list-w, 520px) - 48px); bottom: 20px; }
 }
 /* Harte Kante statt Blende (Markenbuch: keine Verläufe/Transparenz); Einrasten, damit kein Chip
    mitten im Buchstaben liegen bleibt. */
@@ -642,8 +645,12 @@ mark {
 .article-body hr { border: 0; border-top: 1px solid var(--hairline); }
 
 @media (min-width: 900px) {
+  /* Artikel und seine Knöpfe stehen mittig in der Spalte (gleich viel Rand links und rechts); die
+     Knöpfe enden bündig mit dem Text. --art-max: Breite samt 40px Rand (Kontextspalte: 740px). */
+  .art-view { --art-max: var(--measure); }
   .art-hdr { padding: 20px 40px 10px; }
-  .art { --art-gap: 18px; padding: 12px 40px 64px; margin: 0; }
+  html:not([data-focus="on"]) .art-hdr { max-width: var(--art-max); margin: 0 auto; }
+  .art { --art-gap: 18px; padding: 12px 40px 64px; max-width: var(--art-max); margin: 0 auto; }
   .art-title { font-size: calc(32px * var(--scale)); line-height: calc(38px * var(--scale)); }
 }
 
@@ -760,9 +767,9 @@ mark {
   .art-progress-pct { color: var(--muted); white-space: nowrap; }
   .hdr-sep { width: 1px; height: 24px; margin: 0 4px; flex-shrink: 0; background: var(--hairline); }
 
-  /* Kontextspalte (E3DesktopKontext): unter dem Artikel (900–1399px oder Fokusmodus) … */
+  /* Kontextspalte (E3DesktopKontext): unter dem Artikel (Leseansicht schmaler als 880px oder Fokusmodus) … */
   .art-view.has-rail .art { padding-bottom: 32px; }
-  .art-rail { max-width: var(--measure); padding: 0 40px 64px; }
+  .art-rail { max-width: var(--art-max); margin: 0 auto; padding: 0 40px 64px; }
   .art-rail-inner { display: flex; flex-direction: column; gap: 32px; padding-top: 24px; border-top: 1px solid var(--hairline); }
   .rail-head, .home-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; padding-bottom: 12px; }
   /* Kontextspalte: Titel darf zweizeilig werden, die Zahl bleibt oben rechts. */
@@ -1020,21 +1027,24 @@ mark {
   .set-label { padding: 4px 0 8px; }
 }
 
-/* … ab 1400px ohne Fokusmodus als eigene Spalte rechts, die beim Scrollen stehen bleibt. */
-@media (min-width: 1400px) {
+/* … ab 880px Breite der Leseansicht (bei 520px Liste: 1400px Fenster) ohne Fokusmodus als eigene
+   Spalte rechts, die beim Scrollen stehen bleibt. */
+@container reader (min-width: 880px) {
   html:not([data-focus="on"]) .art-view.has-rail {
+    --art-max: 740px;
     display: grid;
     grid-template-columns: minmax(0, 1fr) 340px;
     align-items: start;
     min-height: 100%;
   }
-  /* Text bis zur rechten Kante der Knöpfe im Kopf (Board Kontext: Spalte 740px). */
-  html:not([data-focus="on"]) .art-view.has-rail .art { max-width: 740px; padding-bottom: 64px; }
+  /* Text bis zur rechten Kante der Knöpfe im Kopf (Board Kontext: Spalte 740px, --art-max). */
+  html:not([data-focus="on"]) .art-view.has-rail .art { padding-bottom: 64px; }
   html:not([data-focus="on"]) .art-rail {
     position: sticky;
     top: 0;
     height: 100dvh;
     max-width: none;
+    margin: 0;
     padding: 24px 28px;
     overflow-y: auto;
     overscroll-behavior: contain;
@@ -1053,7 +1063,7 @@ mark {
     position: fixed;
     top: 0;
     left: 0;
-    width: 520px;
+    width: var(--list-w, 520px);
     visibility: hidden;
     pointer-events: none;
   }
@@ -1109,16 +1119,17 @@ mark {
   html[data-focus="on"] .art-rail { max-width: 840px; margin: 0 auto; padding: 0 40px 120px; }
 
   /* Schwebende Pille „Nächster“ unten rechts, nur im freien Rand neben der Textspalte. Der Text
-     endet bei 76px + (100vw - 76px) / 2 + 380px; bis 40px vor den rechten Rand bleiben
-     (100vw - 76px) / 2 - 420px, abzüglich 16px Luft. Reicht das nicht für Pille mit lesbarem
-     Titel (unter 1600px), bleibt nur der runde Pfeil (rechts bündig mit den Knöpfen im Kopf); wo
-     auch der die letzte Textzeile berühren würde (unter 1036px), macht der Text rechts Platz. */
+     endet eine halbe Leseansicht (50cqw) plus 380px nach deren linkem Rand; bis 40px vor den rechten
+     Rand bleiben 50cqw - 420px, abzüglich 16px Luft. Reicht das nicht für Pille mit lesbarem
+     Titel (Leseansicht unter 1524px, also Fenster unter 1600px neben der 76px-Leiste), bleibt nur
+     der runde Pfeil (rechts bündig mit den Knöpfen im Kopf); wo auch der die letzte Textzeile
+     berühren würde (Leseansicht unter 960px), macht der Text rechts Platz. */
   html[data-focus="on"] .focus-next {
     position: fixed;
     right: 40px;
     bottom: 24px;
     z-index: 10;
-    max-width: calc((100vw - 76px) / 2 - 436px);
+    max-width: calc(50cqw - 436px);
     display: flex;
     align-items: center;
     gap: 12px;
@@ -1152,7 +1163,7 @@ mark {
   }
 }
 
-@media (min-width: 900px) and (max-width: 1599.98px) {
+@container reader (max-width: 1523.98px) {
   html[data-focus="on"] .focus-next { max-width: none; padding: 0; gap: 0; border: 0; background: transparent; }
   html[data-focus="on"] .focus-next-label, html[data-focus="on"] .focus-next-title {
     position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
@@ -1161,8 +1172,40 @@ mark {
   html[data-focus="on"] .focus-next:focus-visible { outline: none; }
   html[data-focus="on"] .focus-next:focus-visible .focus-next-arrow { outline: 2px solid var(--ink); outline-offset: 2px; }
 }
-@media (min-width: 900px) and (max-width: 1035.98px) {
-  /* Rechter Textrand mindestens 100px vor dem Fensterrand (Pfeil 44px + 40px Rand + 16px Luft):
-     Spalte 840px mittig in 100vw - 76px, also 558px - 50vw; nie weniger als die üblichen 40px. */
-  html[data-focus="on"] .art, html[data-focus="on"] .art-rail { padding-right: max(40px, 558px - 50vw); }
+@container reader (max-width: 959.98px) {
+  /* Rechter Textrand mindestens 100px vor dem Rand (Pfeil 44px + 40px Rand + 16px Luft): Spalte
+     840px mittig in der Leseansicht, also 520px - 50cqw; nie weniger als die üblichen 40px. */
+  html[data-focus="on"] .art, html[data-focus="on"] .art-rail { padding-right: max(40px, 520px - 50cqw); }
+}
+
+/* ---- Ziehbare Trennlinie Liste | Leseansicht (nur Desktop, nicht im Fokusmodus) ------------ */
+.list-resize { display: none; }
+@media (min-width: 900px) {
+  #shell[data-layout="list"] .list-resize, #shell[data-layout="article"] .list-resize {
+    display: block;
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    /* Nur über der Haarlinie (letztes Pixel von #view) und auf der Seite der Leseansicht, damit die
+       Scrollleiste der Liste frei bleibt. */
+    left: calc(var(--list-w, 520px) - 1px);
+    width: 12px;
+    z-index: 15;
+    cursor: col-resize;
+    touch-action: none;
+  }
+  html[data-focus="on"] #shell[data-layout="article"] .list-resize { display: none; }
+  /* Die Haarlinie von #view liegt am linken Rand; beim Zeigen, Ziehen und mit Tastaturfokus wird sie ink. */
+  .list-resize::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 2px;
+    background: transparent;
+  }
+  .list-resize:hover::after, #shell.is-resizing .list-resize::after, .list-resize:focus-visible::after { background: var(--ink); }
+  .list-resize:focus-visible { outline: none; }
+  #shell.is-resizing, #shell.is-resizing * { cursor: col-resize; user-select: none; -webkit-user-select: none; }
 }

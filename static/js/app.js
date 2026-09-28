@@ -8,6 +8,7 @@ import {
 } from './store.js';
 import { isDesktop } from './ui/dom.js';
 import { showBar } from './ui/bar.js';
+import { installListResizer } from './ui/splitter.js';
 import { closeSheet, isSheetOpen } from './ui/sheet.js';
 import { markOpenRow } from './ui/row.js';
 import { listView } from './views/list.js';
@@ -301,6 +302,7 @@ async function boot() {
   });
   installKeyboard();
   installFocusRail();
+  installListResizer();
   window.addEventListener('hashchange', () => { tagHistory(); route(); });
   document.addEventListener('click', sameHashLinks);
   // Zurück auf einen Eintrag mit derselben Adresse: kein hashchange, trotzdem neu routen.

@@ -33,7 +33,8 @@ export function settleFocus() {
   const rail = byId('focus-rail');
   const lost = !active || active === document.body || !active.isConnected;
   if (focusActive()) {
-    if (lost || view.contains(active)) reader.focus({ preventScroll: true });
+    // Liste und ihre Trennlinie sind im Fokusmodus ausgeblendet.
+    if (lost || view.contains(active) || active.id === 'list-resize') reader.focus({ preventScroll: true });
   } else if (active && rail && rail.contains(active)) {
     (view.querySelector('.row.is-open') || reader).focus({ preventScroll: true });
   } else if (lost) {

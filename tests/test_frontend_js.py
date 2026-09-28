@@ -654,3 +654,98 @@ console.log(JSON.stringify({
     assert got["histCols"] == 24 and got["histOn"] == 0
     assert got["front24"].endswith("/ Letzte 24 Std") and "Profilen" not in got["front24"]
     assert got["frontDay"].endswith("/ aus deinen Profilen")
+
+
+def test_list_width_clamp_and_stored_values():
+    """Ziehbare Artikelliste (listwidth.js): Grenzen je Fensterbreite, kaputte gespeicherte Werte,
+    Tastatur, Zurücksetzen."""
+    script = """
+const lw = await import(process.argv[1] + '/listwidth.js');
+console.log(JSON.stringify({
+  max: [lw.listMax(900), lw.listMax(1280), lw.listMax(1600), lw.listMax(1894), lw.listMax(3000), lw.listMax(undefined)],
+  clamp: [lw.clampListWidth(100, 1600), lw.clampListWidth(600.4, 1600), lw.clampListWidth(900, 1600),
+          lw.clampListWidth(700, 1280), lw.clampListWidth(700, 1600), lw.clampListWidth(null, 1600),
+          lw.clampListWidth(NaN, 1600), lw.clampListWidth('600', 1600), lw.clampListWidth(Infinity, 1894)],
+  parse: [lw.parseStoredWidth('600'), lw.parseStoredWidth(null), lw.parseStoredWidth(''), lw.parseStoredWidth('abc'),
+          lw.parseStoredWidth('"600"'), lw.parseStoredWidth('1e999'), lw.parseStoredWidth('{}'), lw.parseStoredWidth('412.5')],
+  keys: [lw.keyWidth('ArrowLeft', 520, 1600), lw.keyWidth('ArrowRight', 520, 1600), lw.keyWidth('ArrowLeft', 330, 1600),
+         lw.keyWidth('ArrowRight', 795, 1600), lw.keyWidth('Home', 600, 1600), lw.keyWidth('End', 400, 1280),
+         lw.keyWidth('j', 520, 1600)],
+  // Fenster wird schmaler und wieder breiter: angewendet begrenzt, gewählt bleibt gespeichert
+  shrink: [lw.clampListWidth(740, 1200), lw.clampListWidth(740, 1600)],
+  reset: lw.clampListWidth(lw.parseStoredWidth(null) ?? lw.LIST_DEFAULT, 1600),
+}));
+"""
+    got = _run_fake_dom(script)
+    assert got["max"] == [520, 640, 760, 760, 760, 520]   # Hälfte des Fensters, 520..760
+    assert got["clamp"] == [320, 600, 760, 640, 700, 520, 520, 520, 520]   # Unbrauchbares: Standard
+    assert got["parse"] == [600, None, None, None, None, None, None, 412.5]
+    assert got["keys"] == [504, 536, 320, 760, 320, 640, None]
+    assert got["shrink"] == [600, 740]
+    assert got["reset"] == 520
+
+
+def test_list_resizer_drag_click_keys_and_focus_mode():
+    """Ziehbare Trennlinie (ui/splitter.js) mit Schein-DOM: Ziehen speichert, ein Klick nicht,
+    Doppelklick setzt zurück, Fenstergröße begrenzt ohne die Wahl zu vergessen, lostpointercapture
+    beendet das Ziehen, Fokusmodus mitten im Ziehen bricht ab, Tasten mit preventDefault."""
+    script = """
+const store = new Map();
+globalThis.localStorage = { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)),
+  removeItem: (k) => store.delete(k) };
+const winListeners = {};
+Object.assign(globalThis.window, { innerWidth: 1600, addEventListener: (t, fn) => { (winListeners[t] ||= []).push(fn); } });
+globalThis.requestAnimationFrame = (fn) => setTimeout(fn, 0);
+globalThis.cancelAnimationFrame = (id) => clearTimeout(id);
+let hidden = false;
+FakeEl.prototype.getClientRects = function () { return hidden ? [] : [{}]; };
+FakeEl.prototype.setPointerCapture = function (id) { this.cap = id; };
+FakeEl.prototype.hasPointerCapture = function (id) { return this.cap === id; };
+FakeEl.prototype.releasePointerCapture = function () { this.cap = null; };
+ids.shell.style.setProperty = (k, v) => { ids.shell.style[k] = v; };
+ids.shell.append(ids.reader);
+Object.assign(ids.reader, { scrollHeight: 3000, clientHeight: 1000, scrollTop: 0 });
+const storeMod = await import(process.argv[1] + '/store.js');
+const { installListResizer } = await import(process.argv[1] + '/ui/splitter.js');
+const hd = installListResizer();
+const fire = (type, ev = {}) => hd.listeners[type].forEach((fn) => fn({ button: 0, pointerId: 1, preventDefault() {}, stopPropagation() {}, ...ev }));
+const st = () => [ids.shell.style['--list-w'], hd.getAttribute('aria-valuenow'), store.get('kiosk.listWidth') ?? null];
+const out = {};
+out.start = [...st(), hd.getAttribute('aria-valuetext'), hd.getAttribute('aria-valuemax'), hd.getAttribute('role')];
+fire('pointerdown', { clientX: 520 }); fire('pointerup', { clientX: 520 }); await tick();
+out.click = st();
+fire('pointerdown', { clientX: 520 }); fire('pointermove', { clientX: 600 }); await tick(); fire('pointerup', { clientX: 600 }); await tick();
+out.drag = st();
+fire('pointerdown', { clientX: 600 }); fire('pointermove', { clientX: 601 }); await tick(); fire('pointerup', { clientX: 601 }); await tick();
+out.clickAfter = st();
+window.innerWidth = 1000; winListeners.resize.forEach((fn) => fn()); await tick();
+out.narrow = [...st(), hd.getAttribute('aria-valuemax')];
+window.innerWidth = 1600; winListeners.resize.forEach((fn) => fn()); await tick();
+out.wide = st();
+fire('pointerdown', { clientX: 600 }); fire('pointermove', { clientX: 700 }); await tick(); fire('lostpointercapture', { clientX: 700 });
+fire('pointermove', { clientX: 400 }); await tick();
+out.lost = st();
+fire('pointerdown', { clientX: 700 }); fire('pointermove', { clientX: 650 }); await tick();
+const mid = st();
+storeMod.emit('settings', { focus_mode: true }); hidden = true;
+fire('pointermove', { clientX: 500 }); await tick(); fire('pointerup', { clientX: 500 }); await tick();
+out.focus = [mid, st()];
+hidden = false;
+let prevented = 0; const key = (k) => hd.listeners.keydown.forEach((fn) => fn({ key: k, preventDefault() { prevented += 1; }, stopPropagation() {} }));
+key('ArrowLeft'); const left = st(); key('End'); const end = st(); key('Home'); const home = st(); key('j');
+out.keys = [left, end, home, prevented];
+hd.listeners.dblclick.forEach((fn) => fn({})); out.reset = st();
+console.log(JSON.stringify(out));
+process.exit(0);
+"""
+    got = _run_fake_dom(script)
+    assert got["start"] == ["520px", "520", None, "520 Pixel", "760", "separator"]
+    assert got["click"] == ["520px", "520", None]          # Klick speichert nichts
+    assert got["drag"] == ["600px", "600", "600"]
+    assert got["clickAfter"] == ["600px", "600", "600"]    # 1 px ist kein Ziehen
+    assert got["narrow"] == ["520px", "520", "600", "520"]  # begrenzt, Wahl bleibt gespeichert
+    assert got["wide"] == ["600px", "600", "600"]
+    assert got["lost"] == ["700px", "700", "700"]           # Ende per lostpointercapture, danach nichts mehr
+    assert got["focus"] == [["650px", "650", "700"], ["700px", "700", "700"]]   # abgebrochen, nicht gespeichert
+    assert got["keys"] == [["684px", "684", "684"], ["760px", "760", "760"], ["320px", "320", "320"], 3]
+    assert got["reset"] == ["520px", "520", None]

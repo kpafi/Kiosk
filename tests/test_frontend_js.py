@@ -956,6 +956,45 @@ console.log(JSON.stringify({ r, seen, first, seen2, remind, seen3,
     assert got["changed"] == [True, False, False, False, False, False]
 
 
+def test_page_from_worker_cache_announces_new_build_at_start():
+    """Die Seite kam aus dem Cache des Service Workers (nach seiner Frist von 6 s), /api/build antwortet
+    danach normal mit dem neuen Stand: Die Seite trägt ihren eigenen (data-build), also meldet der Start
+    die neue Version sofort, statt den neuen Stand als bekannt zu merken."""
+    script = """
+const { buildWatcher, pageBuild, startBuild } = await import(process.argv[1] + '/version.js');
+const run = async ({ own, server, fail, cached = null }) => {
+  const seen = [];
+  const w = buildWatcher({ fetchBuild: async () => server, onNew: (b) => seen.push(b), minGapMs: 0, now: () => 0 });
+  const got = await startBuild(w, { own, cachedBuild: () => cached,
+    fetchBuild: async () => { if (fail) throw Object.assign(new Error('x'), { status: 503 }); return server; } });
+  const atStart = [...seen];
+  const later = await w.check({ force: true });   // nächste Abfrage: nichts Neues mehr bzw. jetzt erst
+  return [got, atStart, later];
+};
+console.log(JSON.stringify({
+  cachedPage: await run({ own: 'alt', server: 'neu' }),
+  freshPage: await run({ own: 'neu', server: 'neu' }),
+  offline: await run({ own: 'alt', server: 'neu', fail: true }),
+  oldCopy: await run({ own: null, server: 'neu' }),               // Kopie ohne data-build: wie bisher
+  oldCopyOffline: await run({ own: null, server: 'neu', fail: true, cached: 'alt' }),
+  local: await run({ own: pageBuild({ dataset: { build: '' } }), server: '' }),
+  pageBuild: [pageBuild({ dataset: { build: '20260930-1200' } }), pageBuild({ dataset: { build: '' } }),
+              pageBuild({ dataset: { build: 'dev' } }), pageBuild({ dataset: {} }), pageBuild(null)],
+}));
+"""
+    res = subprocess.run([NODE, "--input-type=module", "-e", script, str(JS.as_uri())],
+                         capture_output=True, text=True, timeout=30, env={"PATH": ""})
+    assert res.returncode == 0, res.stderr
+    got = json.loads(res.stdout)
+    assert got["cachedPage"] == ["neu", ["neu"], False]
+    assert got["freshPage"] == ["neu", [], False]
+    assert got["offline"] == [None, [], True]            # Stand der Seite bleibt bekannt, später gemeldet
+    assert got["oldCopy"] == ["neu", [], False]
+    assert got["oldCopyOffline"] == [None, [], True]
+    assert got["local"] == ["", [], False]
+    assert got["pageBuild"] == ["20260930-1200", None, None, None, None]
+
+
 def test_feed_does_not_load_ahead_while_hidden():
     """Handy mit offenem Artikel: #view ist ausgeblendet, der Sentinel hat keine Box. Dann nach der
     ersten Seite nicht weiterladen (vorher lud jede fertige Seite die nächste, bis alles da war)."""

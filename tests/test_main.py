@@ -73,6 +73,29 @@ def test_build_is_open(client, monkeypatch):
     assert client.get("/api/build").json() == {"build": "20260926-1200"}
 
 
+def test_index_carries_its_build(client, monkeypatch):
+    """index.html trägt die Build-Kennung der ausliefernden App (data-build): Kommt die Seite später aus
+    dem Cache des Service Workers, erkennt die Oberfläche daran einen Deploy. ETag hängt am Build."""
+    import re
+    monkeypatch.setenv("KIOSK_BUILD", "20260930-1200")
+    r = client.get("/")
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/html")
+    assert re.search(r'<html [^>]*data-build="20260930-1200"', r.text)
+    assert r.headers["cache-control"] == "no-cache" and r.headers["etag"]
+    assert "content-security-policy" in r.headers
+    assert client.get("/index.html").content == r.content
+    assert client.head("/").status_code == 200
+    etag = r.headers["etag"]
+    assert client.get("/", headers={"If-None-Match": etag}).status_code == 304
+    assert client.get("/", headers={"If-None-Match": f'"x", W/{etag}'}).status_code == 304
+    monkeypatch.setenv("KIOSK_BUILD", '20260930-1300"<x>')
+    r2 = client.get("/", headers={"If-None-Match": etag})
+    assert r2.status_code == 200 and r2.headers["etag"] != etag
+    assert 'data-build="20260930-1300&quot;&lt;x&gt;"' in r2.text
+    monkeypatch.delenv("KIOSK_BUILD")
+    assert 'data-build=""' in client.get("/").text        # lokal leer: Oberfläche nimmt /api/build
+
+
 def test_login_sets_host_prefixed_secure_cookie(client):
     r = login(client)
     assert r.status_code == 204
@@ -900,7 +923,16 @@ def test_refresh_without_fetcher_is_503(authed):
 def test_only_fts_syntax_errors_are_bad_search_requests(authed, monkeypatch):
     import sqlite3
     _seed(1)
-    for message, expected in (("fts5: syntax error near \"x\"", 400), ("database is locked", 500)):
+    # FTS5-Syntax in der Eingabe (_fts_query setzt jedes Wort in Anführungszeichen): kein Fehler.
+    for q in ('"abc', "foo:bar", "AND", "*", "NEAR(a b", "-a", "a OR", "{x}: y", "'"):
+        assert authed.get("/api/articles", params={"q": q}).status_code == 200, q
+    for message, expected in (
+        ('fts5: syntax error near "x"', 400), ('fts5: syntax error near ""', 400), ("unterminated string", 400),
+        ("unknown special query: ", 400), ('expected integer, got "b"', 400),
+        # Betriebsfehler und Fehler im SQL des Servers, auch wenn ein Wort der Anfrage darin vorkommt
+        ("database is locked", 500), ('near "Wahl": syntax error', 500), ("no such column: Wahl", 500),
+        ("no such column: a.body_text", 500), ("interrupted", 500),
+    ):
         def broken(*a, message=message, **kw):
             raise sqlite3.OperationalError(message)
 
@@ -1057,6 +1089,33 @@ def test_login_duration_does_not_depend_on_hash_parameters(client, monkeypatch):
     t0 = time.monotonic()
     assert login(client).status_code == 204
     assert time.monotonic() - t0 >= 0.4
+
+
+@pytest.mark.login_timing
+def test_unexpected_login_errors_also_take_the_minimum_time(client, monkeypatch):
+    """Auch ein unerwarteter Fehler vor, in oder nach der Passwortprüfung (gesperrte Datenbank o. Ä.)
+    kommt erst nach LOGIN_MIN_SECONDS, und zwar unverändert (500, kein 401)."""
+    import sqlite3
+    monkeypatch.setattr(main_mod, "LOGIN_MIN_SECONDS", 0.4)
+
+    def locked(*a, **kw):
+        raise sqlite3.OperationalError("database is locked")
+
+    async def broken_check(user, password):
+        raise RuntimeError("scrypt kaputt")
+
+    for target, name, replacement, exc in (
+        (state.db, "get_user_by_name", locked, sqlite3.OperationalError),     # vor der Prüfung
+        (main_mod, "_check_login", broken_check, RuntimeError),               # in der Prüfung
+        (state.db, "update_user", locked, sqlite3.OperationalError),          # nach der Prüfung
+    ):
+        with monkeypatch.context() as m:
+            m.setattr(target, name, replacement)
+            t0 = time.monotonic()
+            with pytest.raises(exc):
+                login(client)
+            assert time.monotonic() - t0 >= 0.4, name
+    assert login(client).status_code == 204
 
 
 def test_rehash_does_not_revert_a_concurrent_password_reset(client, monkeypatch):

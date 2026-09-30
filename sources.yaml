@@ -18,8 +18,15 @@ sources:
   # ---------------- Deutschland ----------------
   - {id: spiegel,      name: Der Spiegel,             short: "SPIEGEL",       country: DE, lang: de, feed: "https://www.spiegel.de/schlagzeilen/index.rss",        homepage: "https://www.spiegel.de",       note: "SPIEGEL+ Artikel werden als Paywall markiert"}
   - {id: zeit,         name: Die Zeit,                short: "ZEIT",          country: DE, lang: de, feed: "https://newsfeed.zeit.de/index",                        homepage: "https://www.zeit.de",          note: "Z+ Artikel werden als Paywall markiert"}
-  - {id: welt,         name: Die Welt,                short: "WELT",          country: DE, lang: de, feed: "https://www.welt.de/feeds/latest.rss",                  homepage: "https://www.welt.de",          note: "Viele WELTplus-Artikel, dann nur Anfang"}
-  - {id: tagesschau,   name: tagesschau,              short: "TAGESSCHAU",    country: DE, lang: de, feed: "https://www.tagesschau.de/index~rss2.xml",              homepage: "https://www.tagesschau.de"}
+  # WELT: ohne Videos (/…/video6abc…/, nur eine kurze Beschreibung zum Video, rund ein Viertel des Feeds).
+  - {id: welt,         name: Die Welt,                short: "WELT",          country: DE, lang: de, feed: "https://www.welt.de/feeds/latest.rss",                  homepage: "https://www.welt.de",          note: "Viele WELTplus-Artikel, dann nur Anfang",
+     include_paths: ['^/(?!(?:[^/]+/)*video[0-9a-f]{8,}/)']}
+  # tagesschau: ohne Videos, Sendungen (/tagesthemen/video-1657796.html, /tagesschau_20_uhr/ts-81274.html,
+  # tt-, tse-, tsg-), /multimedia/ (Livestream, Bildergalerien, Podcasts) und Podcast-Folgen (/podcast-…, leiten
+  # zur ARD Audiothek weiter): kein Artikeltext. Ohne /wetter/: das Regenradar ist nur eine Erklärung der
+  # Karte, die Vorhersage steht immer unter derselben Adresse und wäre gespeichert bald veraltet.
+  - {id: tagesschau,   name: tagesschau,              short: "TAGESSCHAU",    country: DE, lang: de, feed: "https://www.tagesschau.de/index~rss2.xml",              homepage: "https://www.tagesschau.de",
+     include_paths: ['^/(?!multimedia/|podcast-|wetter/|(?:[^/]+/)*(?:video|tt|ts|tse|tsg)-\d+\.html$)']}
   - {id: faz,          name: Frankfurter Allgemeine,  short: "FAZ",           country: DE, lang: de, feed: "https://www.faz.net/rss/aktuell/",                      homepage: "https://www.faz.net",          note: "F+ Artikel werden als Paywall markiert"}
   - {id: sz,           name: Süddeutsche Zeitung,     short: "SZ",            country: DE, lang: de, feed: "https://rss.sueddeutsche.de/rss/Topthemen",             homepage: "https://www.sueddeutsche.de",  note: "SZ Plus Artikel werden als Paywall markiert"}
   - {id: taz,          name: taz,                     short: "TAZ",           country: DE, lang: de, feed: "https://taz.de/!p4608;rss/",                            homepage: "https://taz.de"}
@@ -64,9 +71,10 @@ sources:
   - {id: thelocalch,   name: The Local Switzerland,   short: "LOCAL CH",      country: CH, lang: en, feed: "https://feeds.thelocal.com/rss/ch",                     homepage: "https://www.thelocal.ch",      default_enabled: false}
 
   # ---------------- Großbritannien / Irland ----------------
-  # BBC: ohne BBC Sounds (/sounds/, Radio-Livestreams ohne Text)
+  # BBC: ohne BBC Sounds (/sounds/, Radio-Livestreams ohne Text) und Videos (/news/videos/, nur eine kurze
+  # Beschreibung zum Video)
   - {id: bbc,          name: BBC News,                short: "BBC",           country: GB, lang: en, feed: "https://feeds.bbci.co.uk/news/rss.xml",                 homepage: "https://www.bbc.com/news",
-     include_paths: ['^/(?!sounds/)']}
+     include_paths: ['^/(?!sounds/|news/videos/)']}
   - {id: guardian,     name: The Guardian,            short: "GUARDIAN",      country: GB, lang: en, feed: "https://www.theguardian.com/world/rss",                 homepage: "https://www.theguardian.com"}
   - {id: independent,  name: The Independent,         short: "INDEPENDENT",   country: GB, lang: en, feed: "https://www.independent.co.uk/rss",                    homepage: "https://www.independent.co.uk", default_enabled: false}
   - {id: newstatesman, name: New Statesman,           short: "STATESMAN",  country: GB, lang: en, feed: "https://www.newstatesman.com/feed",                     homepage: "https://www.newstatesman.com", default_enabled: false, note: "Politisches Magazin, Teile hinter Paywall"}

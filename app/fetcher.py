@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import calendar
+import codecs
 import concurrent.futures
 import contextvars
 import multiprocessing
@@ -38,6 +39,8 @@ from .sources import Catalog, Source
 from . import stories
 
 log = logging.getLogger("kiosk.fetcher")
+# Format der Protokollzeilen, in der App (app.main) und in den Worker-Prozessen (_job_logging).
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 READER_UA = "Mozilla/5.0 (compatible; KioskReader/0.1; private RSS reader)"
 FEED_CONCURRENCY = 8
@@ -61,6 +64,9 @@ OVERALL_TIMEOUT = 60        # Sekunden für _get insgesamt, inkl. zweitem Versuc
 PRIORITY_CONCURRENCY = 2    # gleichzeitige Extraktionen auf Anforderung (API)
 PRIORITY_QUEUE_MAX = 20     # höchstens so viele Extraktionen auf Anforderung laufen oder warten
 RETRY_MIN_INTERVAL = 120    # Sekunden: ?retry=true startet frühestens so lange nach dem letzten Versuch neu
+# Sekunden: Ließ sich für einen Artikel kein Worker-Prozess starten (JobStartFailed), startet die Leseansicht
+# (fragt alle 3 s nach) so lange keine neue Extraktion auf Anforderung, die die Seite erneut holte.
+START_FAILED_BACKOFF = 60
 DOMAIN_STATE_TTL = 3600     # Sekunden, nach denen ungenutzte Domain-Einträge verworfen werden
 MAX_REDIRECTS = 5
 REDIRECT_CODES = (301, 302, 303, 307, 308)
@@ -90,15 +96,17 @@ SOURCE_TROUBLE_TTL = 3600
 # 20 000 xmlns-Deklarationen im Feed: 13 s). Eine Ablehnung ist endgültig, die Grenzen liegen deshalb
 # weit über echten Seiten: bis ca. 36 000 Tags (heise-Bestenliste, 2 MB), Live-Blogs von Guardian und
 # FAZ (1,4 MB) ca. 4 600. Die ungünstigste bekannte Form (lauter unbeendete <p>) kostet trafilatura
-# bei 100 000 Tags ca. 50 s (unter EXTRACT_TIMEOUT), bei 150 000 schon über 140 s; was knapp unter der
+# bei 100 000 Tags ca. 25 s (seit extract_metadata ohne ausführliche Datumssuche läuft; vorher mit
+# Zahlen in den Absätzen über 10 min), bei 150 000 deutlich mehr; was knapp unter der
 # Grenze langsam ist, fängt das Zeitlimit im eigenen Prozess ab.
 MAX_PAGE_TAGS = 100_000     # Tags außerhalb von script/style
 # "<" insgesamt, auch in Skripten und Kommentaren: begrenzt, was dort (ob zu Recht oder nicht)
 # übersprungen wird, und die Arbeit der Prüfung selbst. Echte Seiten bis ca. 36 000.
 MAX_PAGE_LT = 250_000
-# Größe der Seite nach dem Dekodieren (UTF-8): Einbyte-Kodierungen mit vielen Umlauten wachsen bis auf das
-# Doppelte, mehr kann aus ARTICLE_MAX_BYTES nicht werden (komprimierte Bytes werden abgelehnt).
-DECODED_MAX_BYTES = 2 * 5 * 1024 * 1024
+# Größe der Seite nach dem Dekodieren (UTF-8): Einbyte-Kodierungen mit vielen Umlauten wachsen auf das
+# Doppelte (so viel ist erlaubt); windows-1252 mit lauter „“ oder € wüchse bis auf das Dreifache und wird
+# abgelehnt. Komprimierte Bytes ohne Content-Encoding werden vorher abgelehnt.
+DECODED_MAX_BYTES = 2 * ARTICLE_MAX_BYTES
 MAX_TAG_ATTRS = 256         # Attribute (Stücke außerhalb von Attributwerten in Anführungszeichen) in einem Tag
 MAX_FEED_TAGS = 100_000
 MAX_FEED_LT = 250_000       # "<" insgesamt im Feed (echte Feeds: bis ca. 15 500, FOCUS)
@@ -396,11 +404,11 @@ def _num(n: int) -> str:
     return f"{n:,}".replace(",", " ")
 
 
-def _extract_job(extract_fn, page: bytes, url: str):
-    """Läuft im Worker-Prozess: Seite dekodieren (page_as_utf8), Vorprüfung, dann extract_fn
-    (app.extract.extract, in Tests austauschbar; wird als Referenz mitgeschickt) mit genau den UTF-8-
-    Bytes, die die Vorprüfung gesehen hat."""
-    utf8 = page_as_utf8(page)
+def _extract_job(extract_fn, page: bytes, url: str, charset: str | None = None):
+    """Läuft im Worker-Prozess: Seite dekodieren (page_as_utf8, `charset` aus der Content-Type-
+    Kopfzeile), Vorprüfung, dann extract_fn (app.extract.extract, in Tests austauschbar; wird als
+    Referenz mitgeschickt) mit genau den UTF-8-Bytes, die die Vorprüfung gesehen hat."""
+    utf8 = page_as_utf8(page, charset)
     problem = markup_problem(utf8, max_tags=MAX_PAGE_TAGS, max_attrs=MAX_TAG_ATTRS, max_lt=MAX_PAGE_LT)
     if problem:
         raise MarkupRejected(f"Seite abgelehnt: {problem}")
@@ -428,15 +436,114 @@ def _looks_compressed(data: bytes) -> bool:
     return False
 
 
-def page_as_utf8(page: bytes) -> bytes:
-    """Die Seite als UTF-8, so wie trafilatura sie liest (utils.decode_file: Kodierung erkennen, sonst
-    UTF-8 mit Ersatzzeichen). Die Vorprüfung sieht so dieselben Zeichen wie der Parser, auch bei
-    UTF-16/32 oder EBCDIC. Komprimierte Bytes ohne Content-Encoding (die trafilatura ohne jede
-    Grenze entpacken würde: 4,7 KB gzip ergaben 400 000 Absätze) werden abgelehnt, ebenso eine
-    Seite, die dekodiert größer als DECODED_MAX_BYTES ist."""
+# Kodierung einer Seite (page_encoding), wie Browser sie bestimmen (WHATWG Encoding): Byte-Order-Mark,
+# Content-Type-Kopfzeile, <meta charset> bzw. http-equiv. Browser suchen das <meta> in den ersten
+# 1024 Bytes; manche Seiten nennen es erst nach längeren Kommentaren oder Skripten.
+META_SCAN_BYTES = 8192
+_BOMS = ((b"\x00\x00\xfe\xff", "utf-32"), (b"\xff\xfe\x00\x00", "utf-32"), (b"\xef\xbb\xbf", "utf-8"),
+         (b"\xfe\xff", "utf-16"), (b"\xff\xfe", "utf-16"))
+_HEADER_CHARSET_RE = re.compile(r"charset\s*=\s*[\"']?\s*([A-Za-z0-9_.:+-]{1,40})", re.I)
+_META_CHARSET_RE = re.compile(rb"<meta\b[^>]*?charset\s*=\s*[\"']?\s*([a-z0-9_.:+-]{1,40})", re.I)
+_XML_ENCODING_RE = re.compile(rb"\A(?:\xef\xbb\xbf)?\s*<\?xml\b[^>]*?\bencoding\s*=\s*[\"']([a-z0-9_.:+-]{1,40})",
+                              re.I)
+# Wie die Browser: Latin-1 und ASCII sind in Wahrheit windows-1252 (typografische Anführungszeichen,
+# Gedankenstrich und € liegen in 0x80–0x9F), ebenso ISO-8859-9 (windows-1254) und TIS-620 (windows-874).
+_WHATWG_SUPERSETS = {"iso8859-1": "cp1252", "ascii": "cp1252", "iso8859-9": "cp1254", "tis-620": "cp874"}
+# Python kennt Kodierungen, die keine Webseite ernsthaft nennt und die Escape-Folgen auswerten.
+_UNSAFE_CODECS = {"unicode-escape", "raw-unicode-escape", "idna", "punycode", "utf-7", "undefined"}
+
+
+def _undefined_as_c1(e: UnicodeDecodeError):
+    """Fehlerbehandlung für windows-125x: In der Tabelle freie Bytes (0x81, 0x8D …) werden wie im
+    Browser zum gleichnamigen C1-Steuerzeichen, statt die ganze Seite scheitern zu lassen."""
+    return e.object[e.start:e.end].decode("latin-1"), e.end
+
+
+codecs.register_error("kiosk-c1", _undefined_as_c1)
+
+
+def header_charset(content_type: str | None) -> str | None:
+    """charset-Parameter der Content-Type-Kopfzeile (roh, geprüft wird er erst in page_encoding)."""
+    m = _HEADER_CHARSET_RE.search(content_type or "")
+    return m.group(1) if m else None
+
+
+def _codec(label: str | bytes | None, *, meta: bool = False) -> str | None:
+    """Python-Name der Kodierung zu einer Angabe der Seite oder None (unbekannt bzw. unzulässig).
+    Latin-1/ASCII gelten als windows-1252 (_WHATWG_SUPERSETS); ein <meta>, das UTF-16/32 nennt,
+    als UTF-8 (so auch der Browser: wer das <meta> lesen kann, liest keine UTF-16-Seite)."""
+    if isinstance(label, bytes):
+        label = label.decode("ascii", errors="replace")
+    if not label:
+        return None
+    try:
+        info = codecs.lookup(label.strip().lower())
+    except LookupError:
+        return None
+    if not getattr(info, "_is_text_encoding", True) or info.name in _UNSAFE_CODECS:
+        return None
+    if meta and info.name.startswith(("utf-16", "utf-32")):
+        return "utf-8"
+    return _WHATWG_SUPERSETS.get(info.name, info.name)
+
+
+def _is_utf8(page: bytes) -> bool:
+    try:
+        page.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def page_encoding(page: bytes, declared: str | None = None) -> str | None:
+    """Kodierung der Seite oder None (nichts Brauchbares angegeben: trafilatura rät, siehe
+    page_as_utf8). Reihenfolge: Byte-Order-Mark; UTF-16/32 aus der Kopfzeile `declared`; gültiges
+    UTF-8 bleibt UTF-8 (auch wenn Server oder Seite Latin-1 behaupten, ein häufiger Fehler); sonst die
+    Kopfzeile, dann <meta charset> bzw. http-equiv in den ersten META_SCAN_BYTES, dann die
+    XML-Deklaration am Anfang."""
+    for bom, name in _BOMS:
+        if page.startswith(bom):
+            return name
+    header = _codec(declared)
+    if header is not None and header.startswith(("utf-16", "utf-32")):
+        return header
+    if _is_utf8(page):
+        return "utf-8"
+    if header is not None:
+        return header
+    head = page[:META_SCAN_BYTES]
+    for m in _META_CHARSET_RE.finditer(head):
+        meta = _codec(m.group(1), meta=True)
+        if meta is not None:
+            return meta
+    m = _XML_ENCODING_RE.match(head)
+    return _codec(m.group(1), meta=True) if m else None
+
+
+def _decode_page(page: bytes, declared: str | None) -> str:
+    codec = page_encoding(page, declared)
+    if codec is not None:
+        errors = "kiosk-c1" if codec.startswith("cp125") or codec == "cp874" else "replace"
+        try:
+            return page.decode(codec, errors=errors)
+        except (LookupError, UnicodeError, ValueError):
+            pass
+    # Nichts (Brauchbares) angegeben: raten wie trafilatura (utils.decode_file), sonst UTF-8 mit
+    # Ersatzzeichen.
+    return trafilatura_utils.decode_file(page)
+
+
+def page_as_utf8(page: bytes, declared: str | None = None) -> bytes:
+    """Die Seite als UTF-8 in der Kodierung, die ein Browser nähme (page_encoding: Byte-Order-Mark,
+    Content-Type-Kopfzeile `declared`, <meta charset>); nur ohne jede Angabe geraten wie in
+    trafilatura (utils.decode_file). Die Vorprüfung sieht so dieselben Zeichen wie der Parser, auch
+    bei UTF-16/32 oder EBCDIC, und trafilatura liest danach gültiges UTF-8 (rät also nicht noch
+    einmal). Komprimierte Bytes ohne Content-Encoding (die trafilatura ohne jede Grenze entpacken
+    würde: 4,7 KB gzip ergaben 400 000 Absätze) werden abgelehnt, ebenso eine Seite, die dekodiert
+    größer als DECODED_MAX_BYTES ist."""
     if _looks_compressed(page):
         raise MarkupRejected("Seite abgelehnt: komprimierter Inhalt ohne Content-Encoding")
-    utf8 = trafilatura_utils.decode_file(page).encode("utf-8", errors="replace")
+    utf8 = _decode_page(page, declared).encode("utf-8", errors="replace")
     if len(utf8) > DECODED_MAX_BYTES:
         raise MarkupRejected(f"Seite abgelehnt: dekodiert zu groß (über {_mb(DECODED_MAX_BYTES)})")
     if utf8 != page and _looks_compressed(utf8):
@@ -476,12 +583,41 @@ def _portable(exc: BaseException) -> BaseException:
         return RuntimeError(f"{type(exc).__name__}: {str(exc)[:500]}")
 
 
-def _job_main(conn, fn, args: tuple, memory_limit: int, cpu_seconds: int) -> None:
-    """Einstieg des Worker-Prozesses für genau einen Auftrag (vom Forkserver geforkt): Grenzen
-    setzen, fn(*args) ausführen, (True, Ergebnis) bzw. (False, Exception) schicken und sofort enden
-    (os._exit: kein Aufräumen großer Bäume, keine Finalizer)."""
+class _JobContext(logging.Filter):
+    """Hängt an jede Protokollzeile eines Worker-Prozesses, worum es geht (Artikel-URL bzw. Quelle):
+    Die Meldungen von app.extract und trafilatura nennen die Seite selbst nicht."""
+
+    def __init__(self, context: str):
+        super().__init__()
+        self.context = context
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.job = self.context
+        return True
+
+
+def _job_logging(context: str | None, stream=None) -> None:
+    """Protokoll des Worker-Prozesses im Format der App (LOG_FORMAT) auf stderr, mit `context` am Ende
+    jeder Zeile. Der Forkserver richtet keines ein; ohne das landeten Warnungen über den Notbehelf
+    von logging ohne Zeit, Logger und Seite im Protokoll. Ab WARNING wie bisher (logging.lastResort):
+    Einzelheiten von trafilatura und htmldate auf INFO/DEBUG bleiben draußen."""
+    handler = logging.StreamHandler(stream if stream is not None else sys.stderr)
+    fmt = LOG_FORMAT
+    if context:
+        fmt += " [%(job)s]"
+        handler.addFilter(_JobContext(context[:300]))
+    handler.setFormatter(logging.Formatter(fmt))
+    logging.basicConfig(level=logging.WARNING, handlers=[handler], force=True)
+
+
+def _job_main(conn, fn, args: tuple, memory_limit: int, cpu_seconds: int, context: str | None = None) -> None:
+    """Einstieg des Worker-Prozesses für genau einen Auftrag (vom Forkserver geforkt): Protokoll
+    einrichten (_job_logging, `context` benennt den Auftrag), Grenzen setzen, fn(*args) ausführen,
+    (True, Ergebnis) bzw. (False, Exception) schicken und sofort enden (os._exit: kein Aufräumen
+    großer Bäume, keine Finalizer)."""
     try:
         try:
+            _job_logging(context)
             resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
             resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 5))
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))    # SIGXCPU ohne Core-Datei
@@ -724,6 +860,9 @@ class Fetcher:
         # wann die letzte je Artikel endete (monotone Zeit, für RETRY_MIN_INTERVAL).
         self._ondemand_count = 0
         self._ondemand_done: dict[int, float] = {}
+        # Artikel-ID -> monotone Zeit, zu der sich zuletzt kein Worker-Prozess starten ließ
+        # (START_FAILED_BACKOFF).
+        self._start_failed: dict[int, float] = {}
         self._client: httpx.AsyncClient | None = None
         self._wake = asyncio.Event()
         # Extraktion (trafilatura/lxml) und Feed-Parsing in eigenen Prozessen, einer je Auftrag (siehe
@@ -800,15 +939,16 @@ class Fetcher:
         ctx.set_forkserver_preload(["app.fetcher"])
         return ctx
 
-    async def _run_extract(self, page: bytes, url: str, skip=None):
+    async def _run_extract(self, page: bytes, url: str, skip=None, charset: str | None = None):
         """Vorprüfung und extract() in einem eigenen Worker-Prozess, höchstens EXTRACT_TIMEOUT
-        Sekunden reine Laufzeit."""
+        Sekunden reine Laufzeit. `charset`: aus der Content-Type-Kopfzeile (header_charset)."""
         # extract wird zur Laufzeit aus dem Modul gelesen (in Tests austauschbar); an den Worker
         # geht nur eine Referenz auf die Modulfunktion plus bytes und str (picklebar).
-        return await self._run_job(_extract_job, extract, page, url, timeout=EXTRACT_TIMEOUT,
-                                   what="Extraktion", slots=self._job_sem, skip=skip)
+        return await self._run_job(_extract_job, extract, page, url, charset, timeout=EXTRACT_TIMEOUT,
+                                   what="Extraktion", slots=self._job_sem, skip=skip, context=url)
 
-    async def _run_job(self, fn, *args, timeout: float, what: str, slots: asyncio.Semaphore, skip=None):
+    async def _run_job(self, fn, *args, timeout: float, what: str, slots: asyncio.Semaphore, skip=None,
+                       context: str | None = None):
         """Führt fn(*args) in einem eigenen, frisch geforkten Worker-Prozess aus (ein Prozess je
         Auftrag), höchstens `timeout` Sekunden ab dem freien Platz in `slots`.
 
@@ -817,6 +957,7 @@ class Fetcher:
         Exceptions des Auftrags kommen unverändert an. Wird die aufrufende Aufgabe abgebrochen,
         endet auch der Prozess. `what` benennt den Auftrag in den Fehlermeldungen. `skip`: wird mit
         dem freien Platz noch einmal gefragt (Leistungsschalter); True: JobSkipped, kein Prozess.
+        `context` (Artikel-URL, Quelle) steht an jeder Protokollzeile des Worker-Prozesses.
         """
         async with slots:
             if skip is not None and skip():
@@ -824,7 +965,8 @@ class Fetcher:
             ctx = self._mp_context()
             recv, send = ctx.Pipe(duplex=False)
             proc = ctx.Process(target=_job_main, daemon=True,
-                               args=(send, fn, args, JOB_MEMORY_LIMIT, math.ceil(timeout) + JOB_CPU_GRACE))
+                               args=(send, fn, args, JOB_MEMORY_LIMIT, math.ceil(timeout) + JOB_CPU_GRACE,
+                                     context))
             loop = asyncio.get_running_loop()
             # Start und Einsammeln in eigenen Threads (_job_threads), nicht im Standard-Executor, den
             # getaddrinfo, scrypt und die Gruppierung brauchen: _collect wartet bis zum Zeitlimit.
@@ -856,7 +998,12 @@ class Fetcher:
             except asyncio.TimeoutError:
                 _kill(pid, waiter)
                 await asyncio.gather(waiter, return_exceptions=True)
-                raise ExtractTimeout(f"{what}: Zeitüberschreitung") from None
+                # Genau an der Frist fertig geworden (Ergebnis schon geschickt, bevor SIGKILL kam bzw.
+                # _kill den eingesammelten Prozess ausließ): Das Ergebnis gilt.
+                late = None if waiter.cancelled() or waiter.exception() is not None else waiter.result()
+                if late is None or late[0] is None:
+                    raise ExtractTimeout(f"{what}: Zeitüberschreitung") from None
+                msg, code = late
             except asyncio.CancelledError:
                 _kill(pid, waiter)
                 raise
@@ -1073,7 +1220,7 @@ class Fetcher:
             return await self._fetch_sitemap(src, r, kind)
         # Im Worker-Prozess mit Vorprüfung und Zeitlimit: Ein feindlicher Feed kostet dort Speicher und
         # Zeit, nicht in der App (deren Speicher bliebe fragmentiert). Fehler landen in _fetch_all_feeds.
-        rows = await self._parse_job(parse_feed, src, r.content, what="Feed-Parsing")
+        rows = await self._parse_job(parse_feed, src, r.content, what="Feed-Parsing", context=src.id)
         # Hat nur include_paths alles verworfen, ist der Feed in Ordnung, nur ohne Gewolltes.
         return self._store_rows(src, rows, (http_token(r.headers.get("etag")),
                                             http_token(r.headers.get("last-modified"))),
@@ -1093,7 +1240,7 @@ class Fetcher:
         """
         if kind == "sitemapindex":
             hosts = frozenset(h for h in (url_host(src.feed), url_host(r.url)) if h)
-            child = await self._parse_job(pick_child, r.content, hosts, what="Sitemap-Parsing")
+            child = await self._parse_job(pick_child, r.content, hosts, what="Sitemap-Parsing", context=src.id)
             if child is None:
                 self.db.record_fetch(src.id, ok=False, error="Sitemap-Index nennt keine zulässige Sitemap")
                 return 0
@@ -1107,17 +1254,19 @@ class Fetcher:
             if sitemap_kind(r.content) != "urlset":
                 self.db.record_fetch(src.id, ok=False, error="Sitemap-Index verweist nicht auf eine URL-Liste")
                 return 0
-        rows = await self._parse_job(parse_sitemap, src, r.content, FEED_MAX_ENTRIES, what="Sitemap-Parsing")
+        rows = await self._parse_job(parse_sitemap, src, r.content, FEED_MAX_ENTRIES, what="Sitemap-Parsing",
+                                     context=src.id)
         # Leer ist nur dann kein Fehler, wenn die URL-Liste gar keine Einträge hat (neue Quartals-
         # Sitemap kurz nach dem Wechsel) oder include_paths welche verworfen hat. Blieb aus anderen
         # Gründen nichts übrig (z. B. lauter unbrauchbare URLs), ist es ein Fehler wie beim Feed.
         return self._store_rows(src, rows, (None, None),
                                 empty_ok=getattr(rows, "total", 1) == 0 or getattr(rows, "filtered_out", 0) > 0)
 
-    async def _parse_job(self, fn, *args, what: str):
-        """Feed bzw. Sitemap im Worker-Prozess parsen (mit Vorprüfung, _feed_job), eigener Platz."""
+    async def _parse_job(self, fn, *args, what: str, context: str | None = None):
+        """Feed bzw. Sitemap im Worker-Prozess parsen (mit Vorprüfung, _feed_job), eigener Platz.
+        `context`: Quelle, für das Protokoll des Worker-Prozesses."""
         return await self._run_job(_feed_job, fn, *args, timeout=FEED_PARSE_TIMEOUT, what=what,
-                                   slots=self._feed_sem)
+                                   slots=self._feed_sem, context=context)
 
     def _store_rows(self, src: Source, rows: list[dict[str, Any]],
                     validators: tuple[str | None, str | None], *, empty_ok: bool = False) -> int:
@@ -1150,8 +1299,11 @@ class Fetcher:
         # Neuer Lauf: Der Leistungsschalter beginnt für alle Quellen von vorn.
         self._trouble.clear()
         self._cycle_started = time.monotonic()
+        # Nur Quellen, die es im Katalog noch gibt (entfernte bleiben mit ihren Artikeln in der Datenbank).
+        catalog_ids = [s.id for s in self.catalog.all()]
         while done < EXTRACT_MAX_PER_CYCLE:
-            batch = self.db.pending_articles(min(EXTRACT_BATCH, EXTRACT_MAX_PER_CYCLE - done), before=after)
+            batch = self.db.pending_articles(min(EXTRACT_BATCH, EXTRACT_MAX_PER_CYCLE - done), before=after,
+                                             source_ids=catalog_ids)
             if not batch:
                 break
             after = (batch[-1]["published_at"], batch[-1]["id"])
@@ -1159,9 +1311,12 @@ class Fetcher:
                 *(self.extract_article(r["id"], r["url"], r["source_id"]) for r in batch), return_exceptions=True,
             )
             # Gezählt (Budget je Lauf, last_extracted) wird nur, was wirklich versucht wurde: nicht,
-            # was der Leistungsschalter übersprang oder was schon lief bzw. nicht mehr fällig war.
+            # was der Leistungsschalter übersprang, was schon lief bzw. nicht mehr fällig war, und
+            # nicht, was abgebrochen wurde (CancelledError, z. B. beim Herunterfahren).
             for row, res in zip(batch, results):
-                if isinstance(res, Exception):
+                if isinstance(res, asyncio.CancelledError):
+                    continue
+                if isinstance(res, BaseException):
                     log.error("Extraktion %s (%s) unerwartet gescheitert: %r", row["id"], row["url"], res)
                     done += 1
                 elif res is not False:
@@ -1215,13 +1370,17 @@ class Fetcher:
         (Leseansicht fragt per Polling nach). Gibt zurück, ob jetzt eine läuft.
 
         Läuft schon eine, passiert nichts (True). Keine neue (False), wenn schon PRIORITY_QUEUE_MAX
-        Abrufe auf Anforderung laufen oder warten, oder bei `retry` (erneuter Versuch für einen
+        Abrufe auf Anforderung laufen oder warten, bei `retry` (erneuter Versuch für einen
         abgeschlossenen Artikel), wenn der letzte Abruf auf Anforderung keine RETRY_MIN_INTERVAL
-        Sekunden zurückliegt: Wiederholtes Abfragen soll keine Abrufe stapeln."""
+        Sekunden zurückliegt, und wenn sich für den Artikel vor weniger als START_FAILED_BACKOFF
+        Sekunden kein Worker-Prozess starten ließ: Wiederholtes Abfragen soll keine Abrufe stapeln
+        und die Seite nicht alle paar Sekunden neu holen."""
         if article_id in self._inflight:
             return True
         now = time.monotonic()
         if retry and now - self._ondemand_done.get(article_id, -math.inf) < RETRY_MIN_INTERVAL:
+            return False
+        if now - self._start_failed.get(article_id, -math.inf) < START_FAILED_BACKOFF:
             return False
         if self._ondemand_count >= PRIORITY_QUEUE_MAX:
             return False
@@ -1238,6 +1397,13 @@ class Fetcher:
 
         task.add_done_callback(_finished)
         return True
+
+    def _note_start_failed(self, article_id: int) -> None:
+        now = time.monotonic()
+        if len(self._start_failed) >= 1000:  # nur die jüngsten Einträge zählen noch
+            for aid in [a for a, t in self._start_failed.items() if now - t >= START_FAILED_BACKOFF]:
+                del self._start_failed[aid]
+        self._start_failed[article_id] = now
 
     async def _extract_priority(self, article_id: int, url: str, source: str | None) -> None:
         async with self._priority_sem:
@@ -1332,7 +1498,7 @@ class Fetcher:
         if tripped():
             return False
         try:
-            result = await self._run_extract(r.content, r.url, skip=tripped)
+            result = await self._run_extract(r.content, r.url, skip=tripped, charset=header_charset(ctype))
         except JobSkipped:
             return False
         except JobStartFailed as e:
@@ -1340,6 +1506,7 @@ class Fetcher:
             # gezählten Versuch des Artikels. Für das Budget des Laufs zählt er aber (die Seite wurde
             # geholt): So holt ein Lauf, in dem keine Prozesse starten, nicht endlos weiter Seiten.
             self.db.requeue(article_id, str(e))
+            self._note_start_failed(article_id)
             log.warning("Extraktion %s (%s): %s", article_id, url, e)
             return True
         except JobInfraError as e:

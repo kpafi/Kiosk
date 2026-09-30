@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, time, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Collection, Iterator
 from zoneinfo import ZoneInfo
 
 from .config import DEFAULT_TZ
@@ -636,15 +636,21 @@ class Database:
                 new += cur.rowcount
         return new
 
-    def pending_articles(self, limit: int, before: tuple[str, int] | None = None) -> list[sqlite3.Row]:
+    def pending_articles(self, limit: int, before: tuple[str, int] | None = None,
+                         source_ids: Collection[str] | None = None) -> list[sqlite3.Row]:
         """Fällige Artikel ohne Volltext, nur von aktuell eingeschalteten Quellen, neueste zuerst.
 
         `before` = (published_at, id) des letzten Artikels der vorigen Seite (Keyset-Blättern):
-        Artikel, die nach einem Versuch noch 'pending' sind, kommen so nicht erneut.
+        Artikel, die nach einem Versuch noch 'pending' sind, kommen so nicht erneut. `source_ids`:
+        nur diese Quellen (der Katalog; aus sources.yaml entfernte Quellen können in source_state
+        noch eingeschaltet sein).
         """
         where, params = "", [utcnow()]
+        if source_ids is not None:
+            where += "AND a.source_id IN (SELECT value FROM json_each(?)) "
+            params.append(json.dumps(list(source_ids)))
         if before is not None:
-            where = "AND (a.published_at, a.id) < (?, ?) "
+            where += "AND (a.published_at, a.id) < (?, ?) "
             params += [before[0], before[1]]
         return self.q(
             "SELECT a.id, a.source_id, a.url, a.published_at FROM articles a "

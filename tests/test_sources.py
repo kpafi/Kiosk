@@ -243,6 +243,60 @@ def test_catalog_changes_of_2026_09_28():
     assert hb.wants_url("https://www.handelsblatt.com/technik/ki/ki-mistral-steht-kurz-vor-dem-start/100257905.html")
 
 
+@pytest.mark.parametrize("url, wanted", [
+    # Videos (aus dem Feed vom 30.09.2026): nur eine kurze Beschreibung, „Nur Anfang verfügbar“
+    ("https://www.welt.de/politik/deutschland/video6abcdab553ba19e8dfe57287/linnemanns-gesetzentwurf.html", False),
+    ("https://www.welt.de/videos/video6abcc8c80f65d43326f6998c/moegliches-linksbuendnis.html", False),
+    ("https://www.welt.de/vermischtes/video6abcbc3b7d42e93b4b11ecbc/nahost-vorfall-im-cockpit.html", False),
+    ("https://www.welt.de/politik/ausland/video253112345/aeltere-video-id.html", False),
+    ("https://www.welt.de/vermischtes/article6abcae7f0f65d43326f69752/block-prozess-wegen-entfuehrung.html", True),
+    ("https://www.welt.de/wirtschaft/plus6abcc0e31181c77c293b7679/gesetzentwurf-exklusiv.html", True),
+    ("https://www.welt.de/politik/article6abcc0bb1181c77c293b7675/videoueberwachung-am-bahnhof.html", True),
+    ("https://www.welt.de/videos/", True),   # keine Video-ID
+])
+def test_welt_videos_are_excluded(url, wanted):
+    assert Catalog.load(ROOT / "sources.yaml").get("welt").wants_url(url) is wanted
+
+
+@pytest.mark.parametrize("path, wanted", [
+    # aus dem Feed vom 30.09.2026: Videos, Sendungen und /multimedia/ ohne Artikeltext
+    ("/video/video-1657984.html", False),
+    ("/tagesthemen/video-1657796.html", False),
+    ("/tagesschau_in_100_sekunden/video-1658006.html", False),
+    ("/tagesthemen/tt-12898.html", False),
+    ("/tagesschau_20_uhr/ts-81274.html", False),
+    ("/tagesschau/ts-81232.html", False),
+    ("/tagesschau_in_einfacher_sprache/tse-1452.html", False),
+    ("/tagesschau_mit_gebaerdensprache/tsg-12280.html", False),
+    ("/multimedia/livestreams/livestream-ts24-104.html", False),
+    ("/multimedia/bilder/blickpunkte-10476.html", False),
+    ("/multimedia/podcast/15-minuten/15minuten-handys-bau-flugzeuge-einkaufen-100.html", False),
+    ("/eilmeldung/pflegereform-kabinett-100.html", True),
+    ("/inland/reformen-bundesregierung-100.html", True),
+    ("/wirtschaft/technologie/ki-ausbrueche-haftung-faq-100.html", True),
+    ("/investigativ/br-recherche/oktoberfest-muenchen-teufelsrad-videos-100.html", True),
+    ("/inland/tagesschau-video-archiv-100.html", True),
+    ("/podcast-11km-wetterphaenomen-el-nino-100.html", False),   # leitet zur ARD Audiothek weiter
+    ("/wetter/regenradar-deutschland", False),
+    ("/wetter/deutschland/wettervorhersage-deutschland-100.html", False),
+    ("/wissen/klima/podcast-folge-zum-wetter-100.html", True),   # nur Podcasts auf oberster Ebene
+])
+def test_tagesschau_videos_and_multimedia_are_excluded(path, wanted):
+    ts = Catalog.load(ROOT / "sources.yaml").get("tagesschau")
+    assert ts.wants_url("https://www.tagesschau.de" + path) is wanted
+    assert ts.wants_url("https://www.sportschau.de/fussball/premier-league/city,statement-100.html")
+
+
+@pytest.mark.parametrize("url, wanted", [
+    ("https://www.bbc.co.uk/news/videos/c8n5d0e0n6wdo?at_medium=RSS&at_campaign=rss", False),
+    ("https://www.bbc.co.uk/sounds/play/p0pd0z9v", False),
+    ("https://www.bbc.co.uk/news/articles/cmlyewr0lnj3o?at_medium=RSS&at_campaign=rss", True),
+    ("https://www.bbc.co.uk/sport/football/articles/c9lyk46gekkeo?at_medium=RSS&at_campaign=rss", True),
+])
+def test_bbc_videos_are_excluded(url, wanted):
+    assert Catalog.load(ROOT / "sources.yaml").get("bbc").wants_url(url) is wanted
+
+
 def test_source_removed_from_catalog_does_not_break_the_app(app_env):
     """Artikel, Einstellung, Favorit und Stern einer Quelle, die aus sources.yaml verschwunden ist (CNN, PBS),
     bleiben in der Datenbank; die App zeigt sie nicht mehr und stolpert nicht darüber."""

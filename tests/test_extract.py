@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import time
 
+import lxml.html as lxml_html
 import pytest
 
 import app.extract as extract_mod
@@ -1793,3 +1794,279 @@ def test_heading_equal_to_the_visible_page_headline_is_dropped():
                  'Entscheidung gewesen">')
     result = extract(page, "https://www.spiegel.de/kultur/tv/x")
     assert "Sendungsaus" not in result.body_text and "Landenavigation" in result.body_text
+
+
+# ---- Nacharbeit: Werbung, Boilerplate, Bildunterschriften, Laufzeit ------------------------------
+
+GUARDIAN_NEWSLETTER = (
+    # gekürzt aus einem echten Guardian-Artikel (30.09.2026)
+    '<figure data-spacefinder-role="inline" data-spacefinder-type="model.dotcomrendering.pageElements.'
+    'NewsletterSignupBlockElement" class="dcr-d9bay7"><gu-island name="EmailSignUpWrapper" priority="feature" '
+    'deferUntil="visible" props="{}"><a data-ignore="global-link-styling" href="#EmailSignup-skip-link-18" '
+    'class="dcr-76akua">skip past newsletter promotion</a><div class="dcr-1tr4stg"><div class="dcr-12qa5gp">'
+    '<hr class="dcr-1cjdlyj"/><aside aria-label="newsletter promotion" class="dcr-12f8e11"><div class="dcr-ey8bdt">'
+    '<span>Headlines Europe</span><p>A digest of the morning\'s main headlines from the Europe edition emailed '
+    'direct to you every week day</p></div><form id="newsletter-signup-headlines-europe"><label>Enter your email'
+    '</label><input type="email" name="email"/><button type="submit">Sign up</button></form></aside></div></div>'
+    '<p id="EmailSignup-skip-link-18" tabindex="0" aria-label="after newsletter promotion" role="note" '
+    'class="dcr-76akua">after newsletter promotion</p></gu-island></figure>')
+
+
+def test_guardian_newsletter_promotion_is_dropped():
+    paras = ARTICLE_PARAS.split("</p>", 1)
+    page = _page(f"<main><article><div>{paras[0]}</p>{GUARDIAN_NEWSLETTER}{paras[1]}</div></article></main>")
+    result = extract(page, "https://www.theguardian.com/world/2026/sep/30/x")
+    assert "Landenavigation" in result.body_text and "Aufsichtsbehörde FAA" in result.body_text
+    assert "newsletter" not in result.body_text.lower() and "Headlines Europe" not in result.body_text
+    # zweite Sicherung: die Sprungmarken als eigene Absätze
+    html, _ = sanitize('<p>Text.</p><p><a href="https://www.theguardian.com#EmailSignup-skip-link-9">skip past '
+                       "newsletter promotion</a></p><p>after newsletter promotion</p><p>Weiter.</p>", BASE)
+    assert html == "<p>Text.</p><p>Weiter.</p>"
+
+
+def _bbc_image(src: str, alt: str, width: str, height: str) -> str:
+    # Aufbau wie auf bbc.co.uk (gekürzt: ohne <source> und srcSet)
+    return ('<div data-block="image" class="ssrcss-l7emlr-ComponentWrapper e1aon0op1"><div class="ssrcss-126h8e-'
+            'Spacer e1aon0op0"><div data-testid="image" class="ssrcss-1uy5kw5-FullWidthWrapper ep2nwvo1"><figure '
+            'class="ssrcss-hc6arm-StyledFigure e34k3c22"><div class="ssrcss-ab5fd8-StyledFigureContainer e34k3c21">'
+            f'<span class="ssrcss-xm7t37-Placeholder etlorgc0"><picture><img alt="{alt}" loading="lazy" src="{src}" '
+            f'width="{width}" height="{height}" class="ssrcss-egie1y-Image edrdn950"/></picture></span></div>'
+            "</figure></div></div></div>")
+
+
+def _bbc_text(inner: str) -> str:
+    return ('<div data-block="text" class="ssrcss-vxwoax-ComponentWrapper e1aon0op1"><div data-testid="rich-text">'
+            f'<p class="ssrcss-1q0x1qg-Paragraph e1jhz7w10">{inner}</p></div></div>')
+
+
+BBC = "https://ichef.bbci.co.uk/ace/standard/1920/cpsprodpb/"
+
+
+@pytest.mark.parametrize("banner", [
+    _bbc_image(BBC + "1288/live/05d56230-bc97-11f1-bd21-bdf910f2cec6.png", "A thin, grey banner promoting the News "
+               "Daily newsletter. The banner reads: “The latest news in your inbox first thing.”", "1920", "316"),
+    _bbc_image(BBC + "936b/live/838cd6f0-bb4c-11f1-bd21-bdf910f2cec6.png", "Your Voice banner", "", ""),
+    _bbc_image(BBC + "6fad/live/133a6af0-dc98-11ef-bc01-8f2c83dad217.png", "BBC News Africa", "1600", "263"),
+])
+def test_bbc_promo_banners_and_newsletter_line_are_dropped(banner):
+    photo = _bbc_image(BBC + "7e10/live/2ac04aa0-bc1b-11f1-b84f-b5367b64d530.jpg", "Aaron Richards stands outside "
+                       "a shop.", "1536", "864")
+    chart = _bbc_image(BBC + "e974/live/b5992fd0-bc10-11f1-bd21-bdf910f2cec6.png", "A bar chart showing the energy "
+                       "price cap", "1600", "1600")
+    paras = "".join(_bbc_text(p[3:]) for p in ARTICLE_PARAS.split("</p>") if p)
+    newsletter = _bbc_text('Get our flagship newsletter with all the headlines you need to start the day. <a href='
+                           '"/newsletters/zhp28xs" class="ssrcss-1e0jzsh-InlineLink e1kn3p7n0">Sign up here.</a>')
+    page = _page(f"<main><article>{photo}{paras}{chart}{banner}{newsletter}</article></main>")
+    result = extract(page, "https://www.bbc.co.uk/news/articles/cqn8m342rgk9o")
+    assert "2ac04aa0" in result.body_html and "b5992fd0" in result.body_html   # Foto und Grafik bleiben
+    assert "Landenavigation" in result.body_text and "Aufsichtsbehörde FAA" in result.body_text
+    assert "banner" not in result.body_html.lower() and "133a6af0" not in result.body_html
+    assert "flagship newsletter" not in result.body_text and "Sign up" not in result.body_text
+
+
+def test_bbc_banner_check_stays_linear_with_nested_blocks():
+    nested = '<div data-block="image">' * 200 + f'<img src="{BBC}x/a.png" alt="Your Voice banner">' + "</div>" * 200
+    imgs = "".join(f'<div data-block="image"><img src="{BBC}{n}/a.png" width="1920" height="316"></div>'
+                   for n in range(3000))
+    t0 = time.monotonic()
+    tree, _ = extract_mod._cleaned_tree(_page(f"<article>{nested}{imgs}{ARTICLE_PARAS}</article>"))
+    assert time.monotonic() - t0 < 5 and ".png" not in lxml_html.tostring(tree, encoding="unicode")
+
+
+@pytest.mark.parametrize("line", [
+    "© Axel Springer Deutschland GmbH. Alle Rechte vorbehalten.",
+    "© Axel Springer SE. Alle Rechte vorbehalten",
+])
+def test_welt_rights_line_is_dropped(line):
+    html, _ = sanitize(f"<p>Text zum Video.</p><p>{line}</p>", BASE)
+    assert html == "<p>Text zum Video.</p>"
+
+
+def test_welt_rights_line_inside_text_stays():
+    para = "Der Verlag © Axel Springer Deutschland GmbH. Alle Rechte vorbehalten, sagt der Sprecher, gelte weiter."
+    html, _ = sanitize(f"<p>{para}</p>", BASE)
+    assert para in html
+
+
+ZEIT_SUMMARY = (
+    # gekürzt aus dem ZEIT-Liveblog zum Krieg gegen die Ukraine (30.09.2026)
+    '<div class="liveblog-subheader"><div class="article__item"><div class="summary">Um die Verteidigung im '
+    "kommenden Jahr zu finanzieren, fehlen der Ukraine nach Angaben aus Kyjiw knapp 24 Milliarden Euro. Mehrere "
+    "Tote nach Raketenangriffen. Das Liveblog</div></div></div>")
+ZEIT_OVERVIEW = (
+    '<section class="z-accordion liveblog-preceding-content article__item js-accordion js-accordion__wrapper '
+    'is-active restore-state"><h2 class="z-accordion__title liveblog-preceding-content__title"><button class='
+    '"z-accordion__button" aria-expanded="true">Überblick</button></h2><div role="region" class="z-accordion__'
+    'content liveblog-preceding-content__content js-accordion__panel"><ul class="list article__item"><li> Alle '
+    'Artikel zum Thema finden Sie auf unserer <a href="https://www.zeit.de/thema/krieg-in-ukraine" target="_blank">'
+    "Themenseite zum Krieg gegen die Ukraine</a>. Eine Übersichtskarte mit den aktuellen Entwicklungen "
+    'aktualisieren wir täglich <a href="https://www.zeit.de/politik/ausland/karte">hier</a>.<br></li><li>Russische '
+    "oder ukrainische Angaben zu Details einzelner Angriffe und zur Zahl Verletzter und Getöteter lassen sich "
+    "derzeit nicht unabhängig verifizieren.</li><li>Neben eigenen Recherchen verwenden wir Material der "
+    "Nachrichtenagenturen AFP, AP, dpa, epd, KNA und Reuters.</li><li>Wie wir bei der ZEIT Nachrichten zum "
+    'Ukrainekrieg machen, finden Sie <a href="https://www.zeit.de/administratives/x">hier</a>.<br></li>{extra}'
+    "</ul></div></section>")
+
+
+def test_zeit_liveblog_notes_and_label_are_dropped():
+    desc = ("Um die Verteidigung im kommenden Jahr zu finanzieren, fehlen der Ukraine nach Angaben aus Kyjiw knapp "
+            "24 Milliarden Euro. Mehrere Tote nach Raketenangriffen. Das Liveblog")
+    drones = ("Russland hat nach eigenen Angaben in der Nacht 120 ukrainische Drohnen abgeschossen. Die Angaben "
+              "lassen sich nicht unabhängig überprüfen.")
+    extra = (f"<li>Selenskyj trifft am Mittwoch Macron in Paris, es geht um weitere Luftabwehrsysteme.</li>"
+             f"<li>{drones}</li><li>Israelische Angaben zu Opferzahlen lassen sich nicht unabhängig überprüfen, "
+             "sagt die UN.</li>")
+    page = _page(f'<main><article><header>{ZEIT_SUMMARY}</header><div class="article-body"><div class="article-'
+                 f'page">{ZEIT_OVERVIEW.format(extra=extra)}{ARTICLE_PARAS}</div></div></article></main>', _og(desc))
+    result = extract(page, "https://www.zeit.de/politik/ausland/ukraine-krieg-news-liveblog")
+    text = result.body_text
+    assert "Landenavigation" in text and "Selenskyj trifft am Mittwoch Macron" in text   # andere Punkte bleiben
+    assert drones in text and "sagt die UN." in text   # Agenturformel in einer Meldung ist kein Hinweis
+    for note in ("Alle Artikel zum Thema", "Neben eigenen Recherchen", "Wie wir bei der ZEIT",
+                 "Details einzelner Angriffe", "Das Liveblog"):
+        assert note not in text, note
+    assert "Mehrere Tote nach Raketenangriffen." in text   # der Vorspann bleibt, nur ohne Etikett
+
+
+@pytest.mark.parametrize("body", [
+    "<p>Hier berichten wir fortlaufend. Das Liveblog wird laufend aktualisiert.</p><p>Text.</p>",
+    "<p>Erster Absatz.</p><p>Mehr dazu. Das Liveblog</p>",          # nur im ersten Absatz
+    "<p>Alles zum Thema im Das Liveblog</p>",                        # ohne Satzende davor
+])
+def test_liveblog_label_rule_is_narrow(body):
+    assert extract_mod._drop_liveblog_label(body) == body
+
+
+def test_faz_header_caption_joins_caption_and_credit_with_br():
+    alt = "Hendrik Wüst mit dem türkischen Präsidenten Recep Tayyip Erdogan am Montag in Ankara"
+    page = _page('<main><article><header><div data-external-selector="header-teaser-image"><picture><img alt='
+                 f'"{alt}" src="https://media0.faz.net/image/w1240/x/wuest.webp"></picture></div><div class="meta2 '
+                 f'block"><span class="meta2 pr-[10px]">{alt}</span><small class="meta2-italic">dpa</small></div>'
+                 f"</header>{ARTICLE_PARAS}</article></main>")
+    result = extract(page, "https://www.faz.net/aktuell/politik/inland/x-201269563.html")
+    assert f"<figcaption>{alt}<br>dpa</figcaption>" in result.body_html
+    tree, _ = extract_mod._cleaned_tree(page)
+    assert extract_mod._page_captions(tree) == {extract_mod._squash(alt + " dpa"): f"{alt}\ndpa"}
+
+
+def test_many_pinned_posts_do_not_make_the_live_blog_quadratic():
+    """Nur der erste angeheftete Eintrag zählt; die Eintragsliste wird einmal gelesen (vorher 500 × 2,9 MB)."""
+    pinned = "".join('<div data-component="pinned-post"><article><p>Angeheftet {0} mit etwas Text, der lang genug '
+                     "ist.</p></article></div>".format(n) for n in range(500))
+    words = "Wort " * 580
+    blocks = "".join(f'<article id="block-{n}"><header><h2>Eintrag {n}</h2></header><p>{words}</p></article>'
+                     for n in range(1000))
+    page = _page(f'<main><div id="liveblog-body">{pinned}{blocks}</div></main>')
+    assert len(page) > 2_900_000
+    t0 = time.monotonic()
+    tree, _ = extract_mod._cleaned_tree(page)
+    assert time.monotonic() - t0 < 5
+    out = lxml_html.tostring(tree, encoding="unicode")
+    assert "Angeheftet 0 mit" in out and "Angeheftet 1 mit" not in out and "Eintrag 999" in out
+
+
+def test_metadata_skips_the_extensive_date_search():
+    """htmldate durchsuchte jeden kurzen Text mit einer Zahl nach einem Datum (12 000 Absätze: 29 s)."""
+    paras = "".join(f"<p>Tag {n} am {n % 28 + 1}.{n % 12 + 1}. um {n % 24}:{n % 60:02d}</p>" for n in range(12_000))
+    page = _page(f"<article>{paras}</article>", '<meta property="og:title" content="Titel der Seite">'
+                 '<meta name="author" content="Anna Muster">'
+                 '<meta property="og:image" content="https://news.example/bild.jpg">')
+    t0 = time.monotonic()
+    result = extract(page, BASE)
+    assert time.monotonic() - t0 < 10 and result.body_text
+    assert (result.page_title, result.author, result.image_url) == (
+        "Titel der Seite", "Anna Muster", "https://news.example/bild.jpg")
+
+
+def test_taz_placeholder_rule_only_applies_to_taz_images():
+    figure = ('<figure><picture><noscript><img src="https://img.example/picture/1/835/b.webp"></noscript>'
+              '<img src="https://img.example/picture/8766912/14/42191297.webp" alt="Echtes Bild"></picture>'
+              "</figure>")
+    tree, _ = extract_mod._cleaned_tree(_page(f"<article>{figure}{ARTICLE_PARAS}</article>"))
+    out = lxml_html.tostring(tree, encoding="unicode")
+    assert 'src="https://img.example/picture/8766912/14/42191297.webp"' in out.split("</noscript>", 1)[1]
+    taz = figure.replace("img.example", "taz.de")
+    tree, _ = extract_mod._cleaned_tree(_page(f"<article>{taz}{ARTICLE_PARAS}</article>"))
+    out = lxml_html.tostring(tree, encoding="unicode")
+    assert "/14/" not in out.split("</noscript>", 1)[1] and "/835/b.webp" in out.split("</noscript>", 1)[1]
+
+
+def test_zeit_note_check_stays_linear_with_nested_list_items():
+    """Vorher las jeder der 100 verschachtelten Listenpunkte alle 100 000 Tags darunter (ca. 6 s)."""
+    nested = "<li><ul>" * 100 + "<li>" + "<i></i>" * 100_000 + "</li>" + "</ul></li>" * 100
+    page = _page(f'<main><article><section class="liveblog-preceding-content"><ul>{nested}<li>Neben eigenen '
+                 f"Recherchen verwenden wir Material der Nachrichtenagenturen.</li></ul></section>{ARTICLE_PARAS}"
+                 "</article></main>")
+    tree = extract_mod.load_html(page)
+    assert len(tree.xpath("//li")) == 102
+    t0 = time.monotonic()
+    found = extract_mod._chrome_elements(tree)
+    assert time.monotonic() - t0 < 2
+    assert [el.text for el in found if el.tag == "li"] == ["Neben eigenen Recherchen verwenden wir Material der "
+                                                           "Nachrichtenagenturen."]
+
+
+@pytest.mark.parametrize("alt, width, height", [
+    ("The Daily Mirror front page carries the banner headline: Deal done", "1600", "1600"),
+    ("Protesters hold a banner reading: Stop the war", "", ""),
+    ("A screenshot of the website", "inf", "316"),
+    ("A screenshot of the website", "nan", "316"),
+])
+def test_bbc_png_article_images_with_banner_words_stay(alt, width, height):
+    image = _bbc_image(BBC + "8935/live/2ce03770-bcaa-11f1-a3e9-bbda6f9b9e25.png", alt, width, height)
+    tree, _ = extract_mod._cleaned_tree(_page(f"<main><article>{image}{ARTICLE_PARAS}</article></main>"))
+    assert "2ce03770" in lxml_html.tostring(tree, encoding="unicode")
+
+
+GUARDIAN_NEWSLETTER_BUTTON = (
+    # aus theguardian.com/australia-news/2026/sep/30/hunter-valley-coal-project-…
+    '<figure id="78e982bc-490f-4947-959a-90267ca0a097" data-spacefinder-role="inline" data-spacefinder-type="model.'
+    'dotcomrendering.pageElements.LinkBlockElement" class="dcr-d9bay7"><a data-link-name="standard link button '
+    'Primary" data-spacefinder-role="inline" data-ignore="global-link-styling" href="https://www.theguardian.com/'
+    'email-newsletters?CMP=copyembed&amp;CMP=emailbutton" class="dcr-rh233e"><span class="dcr-1vp4tz8">Sign up for '
+    "the Breaking News Australia email</span></a></figure>")
+
+
+def test_guardian_newsletter_button_is_dropped_but_other_link_buttons_stay():
+    other = GUARDIAN_NEWSLETTER_BUTTON.replace("/email-newsletters?CMP=copyembed&amp;CMP=emailbutton",
+                                               "/world/series/the-long-read").replace(
+        "Sign up for the Breaking News Australia email", "Read the whole series on the housing crisis")
+    head, rest = ARTICLE_PARAS.split("</p>", 1)
+    page = _page(f"<main><article><div>{head}</p>{GUARDIAN_NEWSLETTER_BUTTON}{rest}{other}</div></article></main>")
+    tree, _ = extract_mod._cleaned_tree(page)
+    out = lxml_html.tostring(tree, encoding="unicode")
+    assert "Breaking News Australia" not in out and "the-long-read" in out
+    # zweite Sicherung: der Knopf als eigener Absatz
+    html, _ = sanitize("<p>Text.</p><p><a href=\"/email-newsletters\">Sign up for the Breaking News Australia email"
+                       "</a></p><p>Sign up for a gym, the doctor said, and then write me an email about it every "
+                       "week so I know how it goes.</p>", BASE)
+    assert "Breaking News" not in html and "Sign up for a gym" in html
+
+
+def test_guardian_comments_note_in_live_blogs_is_dropped():
+    note = ('I’m afraid we are <a href="https://www.theguardian.com/politics/live/2026/jul/17/x">no longer able to '
+            "have comments open below the line every day on this blog</a>. If you want to contact me, please email "
+            "politics.live@theguardian.com. You can use this email to flag up corrections, comments for publication, "
+            "questions or complaints.")
+    html, _ = sanitize(f"<p>Good morning. Andy Burnham speaks in Liverpool today.</p><p>{note}</p>", BASE)
+    assert html == "<p>Good morning. Andy Burnham speaks in Liverpool today.</p>"
+    kept = "<p>The minister said: I’m afraid we are no longer able to have comments open below the line.</p>"
+    assert sanitize(kept, BASE)[0] == kept
+
+
+def test_zeit_liveblog_back_to_top_and_dangling_read_more_are_dropped():
+    entry = ("<p><strong>30.09. 09:29</strong></p><h2>Ukrainische Soldaten befreien offenbar Dorf</h2><p>Der Ort "
+             "Hrafske nördlich von Charkiw-Stadt ist offenbar wieder unter ukrainischer Kontrolle.</p>"
+             "<p><i>Lesen Sie hier mehr zum Frontverlauf:</i></p>")
+    body = (f"{entry}{entry.replace('09:29', '08:31')}"
+            '<p><a href="https://www.zeit.de#lhe-trigger">Nach oben</a></p>')
+    html, text = sanitize(body, BASE)
+    assert "Lesen Sie hier mehr" not in text and "Nach oben" not in text
+    assert text.count("Hrafske") == 2 and text.count("Ukrainische Soldaten") == 2
+    for kept in ("<p>Lesen Sie hier mehr zum Frontverlauf:</p><p><a href=\"https://www.zeit.de/karte\">Karte</a></p>",
+                 "<p>Lesen Sie hier mehr zum Frontverlauf: Die Lage bleibt angespannt.</p>"):
+        assert "Lesen Sie hier mehr" in sanitize(kept, BASE)[1]
+    page = _page('<main><article><div>' + ARTICLE_PARAS + '</div><a class="z-text-button liveblog__chapter-button--'
+                 'back-to-top" href="#lhe-trigger">Nach oben</a></article></main>')
+    tree, _ = extract_mod._cleaned_tree(page)
+    assert "Nach oben" not in lxml_html.tostring(tree, encoding="unicode")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import mimetypes
 import os
@@ -10,6 +11,7 @@ import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from html import escape as html_escape
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -26,7 +28,7 @@ from .auth import (COOKIE_NAMES, DEVICE_MAX_AGE, INVALID_NAME_KEY, LOGIN_ERROR, 
 from .config import docs_enabled, load_settings
 from .db import Database, QueryTimeout, _iso, utcnow
 from .extract import strip_reading_times
-from .fetcher import Fetcher
+from .fetcher import LOG_FORMAT, Fetcher
 from .sources import Catalog
 from .state import State, state  # noqa: F401  (State für Importe von außen)
 from . import api_ui, stories
@@ -35,7 +37,7 @@ from .api_ui import (admin_user, article_scope, current_user, effective_sources,
                      invalidate_unread, public_user)
 from .users import seed_builtin_profiles
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 log = logging.getLogger("kiosk")
 
 OPEN_PATHS = {"/healthz", "/api/login", "/api/session", "/api/build", "/", "/index.html", "/favicon.ico"}
@@ -302,11 +304,25 @@ class LoginBody(BaseModel):
 
 @app.post("/api/login", status_code=204)
 async def login(body: LoginBody, request: Request):
-    """Anmelden. Antworten mit 204 oder 401 dauern mindestens LOGIN_MIN_SECONDS (per sleep, nicht
-    per CPU): Die Dauer hängt sonst an den scrypt-Parametern des gespeicherten Hashes (ältere mit
-    p=1 sind schneller geprüft als der Blindhash für unbekannte Namen) und verriete, welche
-    Benutzernamen es gibt. 429 kommt sofort (hängt nicht an der Existenz des Namens)."""
+    """Anmelden. Antworten dauern mindestens LOGIN_MIN_SECONDS (per sleep, nicht per CPU), auch jeder
+    Fehler (401, aber auch ein unerwarteter wie eine gesperrte Datenbank, der danach unverändert
+    weitergeht): Die Dauer hängt sonst an den scrypt-Parametern des gespeicherten Hashes (ältere mit
+    p=1 sind schneller geprüft als der Blindhash für unbekannte Namen) oder daran, ob der Fehler vor
+    oder nach der Prüfung kam, und verriete, welche Benutzernamen es gibt. 429 kommt sofort (hängt
+    nicht an der Existenz des Namens)."""
     started = time.monotonic()
+    try:
+        response = await _login(body, request)
+    except Exception as e:
+        if not (isinstance(e, HTTPException) and e.status_code == 429):
+            await _login_pause(started)
+        raise
+    await _login_pause(started)
+    return response
+
+
+async def _login(body: LoginBody, request: Request) -> Response:
+    """Ablauf von login ohne die Mindestdauer."""
     ip = _client_ip(request)
     username = normalize_username(body.username)
     # Ungültige Namen teilen sich einen Zähler (sie können kein Konto treffen); so verdrängen
@@ -321,11 +337,7 @@ async def login(body: LoginBody, request: Request):
     # ein erfolgreicher Login gibt nur diese Reservierung zurück (die Zähler des Namens verfallen).
     if not state.auth.reserve(ip, limit_key, device):
         raise HTTPException(429, "Zu viele Versuche, bitte später erneut")
-    try:
-        user = await _check_login(user, body.password)
-    except HTTPException:
-        await _login_pause(started)
-        raise
+    user = await _check_login(user, body.password)
     state.auth.clear(ip, limit_key, device)
     state.db.update_user(user["id"], last_login_at=utcnow())
     response = Response(status_code=204)
@@ -340,7 +352,6 @@ async def login(body: LoginBody, request: Request):
         state.auth.device_cookie_name, state.auth.issue_device(user["username"], user["password_hash"]),
         max_age=DEVICE_MAX_AGE, httponly=True, samesite="lax", secure=state.auth.cookie_secure, path="/",
     )
-    await _login_pause(started)
     return response
 
 
@@ -645,13 +656,17 @@ async def list_articles(
             "max_id": max_id}
 
 
-# Meldungen von SQLite zu einer ungültigen FTS5-Abfrage (MATCH), im Unterschied zu Betriebsfehlern.
-_FTS_ERROR_RE = re.compile(r"fts5|syntax error|unterminated string|unknown special query|no such column",
-                           re.IGNORECASE)
+# Meldungen, die nur FTS5 beim Lesen einer MATCH-Abfrage gibt, im Unterschied zu Betriebsfehlern und
+# Fehlern im SQL des Servers (dort heißt es 'near "x": syntax error', "no such column: a.x"). Ein
+# "no such column" gibt FTS5 zwar auch (Spaltenfilter "spalte:wort"), aber _fts_query setzt jedes Wort
+# in Anführungszeichen: Aus der Suchanfrage kann es nicht kommen, nur aus einem Fehler des Servers.
+_FTS_ERROR_RE = re.compile(r'fts5: syntax error near "|unterminated string\Z|unknown special query: '
+                           r'|expected integer, got "')
 
 
 def _fts_syntax_error(e: sqlite3.OperationalError) -> bool:
-    return bool(_FTS_ERROR_RE.search(str(e)))
+    """True, wenn SQLite die FTS5-Abfrage (MATCH mit der Suchanfrage) nicht lesen konnte: 400 statt 500."""
+    return bool(_FTS_ERROR_RE.match(str(e)))
 
 
 @app.get("/api/articles/{article_id}/next")
@@ -1166,6 +1181,23 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 @app.api_route("/favicon.ico", methods=["GET", "HEAD"], include_in_schema=False)
 async def favicon():
     return FileResponse(STATIC_DIR / "icons" / "favicon.ico", media_type="image/x-icon")
+
+
+@app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
+@app.api_route("/index.html", methods=["GET", "HEAD"], include_in_schema=False)
+async def index(request: Request):
+    """index.html mit der Build-Kennung der ausliefernden App als data-build an <html> (sonst ist die
+    Seite statisch). Die Oberfläche vergleicht damit /api/build: Kam die Seite aus dem Cache des
+    Service Workers (der sie mit der Kennung von damals gespeichert hat), fällt ein Deploy auf,
+    auch wenn /api/build danach wieder normal antwortet. ETag für bedingte Abrufe (Cache-Control
+    no-cache setzt die Middleware)."""
+    page = (STATIC_DIR / "index.html").read_bytes().replace(
+        b'data-build=""', f'data-build="{html_escape(_build(), quote=True)}"'.encode(), 1)
+    etag = f'"{hashlib.sha256(page).hexdigest()[:32]}"'
+    match = request.headers.get("if-none-match", "")
+    if match.strip() == "*" or etag in (t.strip().removeprefix("W/") for t in match.split(",")):
+        return Response(status_code=304, headers={"ETag": etag})
+    return Response(page, media_type="text/html; charset=utf-8", headers={"ETag": etag})
 
 # Das schlanke Docker-Image hat keine /etc/mime.types; Schriften und Manifest sonst als text/plain.
 for _ext, _type in ((".woff2", "font/woff2"), (".woff", "font/woff"), (".webmanifest", "application/manifest+json"),

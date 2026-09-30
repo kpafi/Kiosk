@@ -29,8 +29,10 @@ function subLine(s, admin) {
   // Nicht-Admins sehen AUS schon rechts in der Zeile, hier nicht noch einmal.
   if (!s.enabled) return h('span', { class: 't-caption', text: admin ? `${cc} · Aus` : cc });
   if (s.last_error) {
+    // Inline hinter dem Land (umbricht mit dem Text, siehe .err-inline); Punkt und „Fehler:“ bleiben zusammen.
     return h('span', { class: 't-caption' }, `${cc} · `,
-      h('span', { class: 'err-inline', text: `Fehler: ${s.last_error}` }));
+      h('span', { class: 'err-inline' },
+        h('span', { class: 'err-inline-label', text: 'Fehler:' }), ` ${s.last_error}`));
   }
   const parts = [cc, `${formatCount(s.total)} Artikel`];
   if (s.last_ok_at) parts.push(ago(s.last_ok_at));

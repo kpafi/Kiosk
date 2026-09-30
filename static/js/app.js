@@ -27,7 +27,7 @@ import { loginView } from './views/login.js';
 import { offlineView } from './views/offline.js';
 import { installKeyboard } from './views/desktop.js';
 import { parseHash } from './route.js';
-import { buildWatcher } from './version.js';
+import { buildWatcher, pageBuild, startBuild } from './version.js';
 import { setUpdatePillAllowed, showUpdatePill } from './ui/update.js';
 
 const shell = document.getElementById('shell');
@@ -268,8 +268,8 @@ function scheduleMidnightRefresh() {
 const fetchBuild = async () => ((await api('build')) || {}).build || '';
 const versions = buildWatcher({ fetchBuild, onNew: () => showUpdatePill() });
 
-/** Version, mit der der aktive Service Worker registriert wurde (?v=…): Beim Start ohne Netz kommt
- *  die Seite aus seinem Cache. Eine eigene Build-Kennung hat die Seite nicht (index.html ist statisch). */
+/** Version, mit der der aktive Service Worker registriert wurde (?v=…): Rückfall für eine Seite ohne
+ *  eigene Build-Kennung (Kopie im Cache von vor data-build), die beim Start ohne Netz aus seinem Cache kam. */
 function workerBuild() {
   try {
     const url = navigator.serviceWorker && navigator.serviceWorker.controller
@@ -281,25 +281,21 @@ function workerBuild() {
   }
 }
 
-/** Service Worker einmal beim Start registrieren, auch ohne Anmeldung (Version aus /api/build). */
+/** Stand des Service Workers, falls die Seite (ohne eigene Kennung) nach dem Fehler `err` von
+ *  /api/build aus seinem Cache kam: offline oder Serverfehler (5xx; sw.js fällt bei Netzfehler und 5xx
+ *  darauf zurück). Nur bei abgelaufener Frist kam die Seite frisch vom Netz: dann null (die erste
+ *  spätere Antwort gilt), sonst meldete das ältere ?v= fälschlich eine neue Version. */
+function cachedBuild(err) {
+  const fromCache = navigator.onLine === false || (err && err.status >= 500)
+    || (err && err.status === 0 && !err.timedOut);
+  return fromCache ? workerBuild() : null;
+}
+
+/** Service Worker einmal beim Start registrieren, auch ohne Anmeldung (Version aus /api/build).
+ *  Bekannt ist der Stand der Seite selbst (data-build, siehe startBuild). */
 async function registerServiceWorker() {
-  let build = '';
-  try {
-    build = await fetchBuild();
-  } catch (err) {
-    // Offline oder Serverfehler (5xx): Dann lieferte der Service Worker die Seite aus seinem Cache
-    // (sw.js fällt bei Netzfehler und 5xx darauf zurück), also dessen Stand merken, damit ein Deploy
-    // in der Zwischenzeit auffällt. Nur bei abgelaufener Frist kam die Seite frisch vom Netz: dann
-    // nichts merken (die erste spätere Antwort gilt), sonst meldete das ältere ?v= fälschlich eine
-    // neue Version.
-    const fromCache = navigator.onLine === false || (err && err.status >= 500)
-      || (err && err.status === 0 && !err.timedOut);
-    const own = fromCache ? workerBuild() : null;
-    if (own) versions.setKnown(own);
-    return;
-  }
-  versions.setKnown(build);
-  if (!('serviceWorker' in navigator)) return;
+  const build = await startBuild(versions, { own: pageBuild(document.documentElement), fetchBuild, cachedBuild });
+  if (build === null || !('serviceWorker' in navigator)) return;
   navigator.serviceWorker.register(`/sw.js?v=${encodeURIComponent(build || 'dev')}`).catch(() => {});
 }
 

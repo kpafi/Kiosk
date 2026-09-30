@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket
+import time
 from urllib.parse import urlparse
 
 import httpcore
@@ -13,6 +14,9 @@ METADATA_IP = ipaddress.ip_address("169.254.169.254")
 # Nur die Standard-Ports: Feeds und Artikel liegen dort; andere Ports öffentlicher Hosts (Admin-
 # Oberflächen, Datenbanken) sind kein Ziel für einen Leser.
 DEFAULT_PORTS = {"http": 80, "https": 443}
+# GuardedBackend: Mindestzeit für den Verbindungsaufbau zu einer einzelnen Adresse eines Namens mit
+# mehreren Adressen (die Frist des Clients wird auf die Adressen verteilt).
+CONNECT_MIN_SLICE = 2.0
 
 # Zusätzlich gesperrte Netze (KIOSK_FETCH_DENY_IPS, siehe config.fetch_deny_networks), gesetzt vom
 # Fetcher; gelten für die Namensprüfung und die tatsächliche Gegenstelle.
@@ -115,13 +119,25 @@ class GuardedBackend(httpcore.AsyncNetworkBackend):
 
     async def connect_tcp(self, host: str, port: int, timeout: float | None = None,
                           local_address: str | None = None, socket_options=None):
+        """Versucht die geprüften Adressen der Reihe nach (z. B. IPv4 nach IPv6). Die Frist `timeout`
+        gilt für alle zusammen: Jede Adresse bekommt den Rest geteilt durch die Zahl der noch offenen,
+        mindestens CONNECT_MIN_SLICE Sekunden (nie mehr als den Rest). Sonst kostete eine tote
+        IPv6-Adresse die ganze Frist, bevor IPv4 dran war."""
+        ips = await _allowed_addresses(host, port)
+        deadline = None if timeout is None else time.monotonic() + timeout
         last: Exception | None = None
-        for ip in await _allowed_addresses(host, port):
+        for i, ip in enumerate(ips):
+            slice_ = None
+            if deadline is not None:
+                left = deadline - time.monotonic()
+                if left <= 0 and last is not None:
+                    break
+                slice_ = min(max(CONNECT_MIN_SLICE, left / (len(ips) - i)), max(left, 0.0))
             try:
-                return await self._inner.connect_tcp(ip, port, timeout=timeout, local_address=local_address,
+                return await self._inner.connect_tcp(ip, port, timeout=slice_, local_address=local_address,
                                                      socket_options=socket_options)
             except (httpcore.ConnectError, httpcore.ConnectTimeout) as e:
-                last = e      # nächste geprüfte Adresse (z. B. IPv4 nach IPv6)
+                last = e      # nächste geprüfte Adresse
         assert last is not None
         raise last
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import socket
 
+import httpcore
 import httpx
 import pytest
 
@@ -61,6 +62,92 @@ async def test_check_url_resolves_hostnames(monkeypatch):
     with pytest.raises(ResolveError):  # DNS-Fehler ist vorübergehend, keine Sperre
         await check_url("http://unknown.example/")
 
+
+
+class _Clock:
+    """Ersatz für das Modul time in app.netguard: Der Verbindungsaufbau „dauert“ genau so lange, wie
+    das Backend es der Frist nach darf, ohne echt zu warten (time.monotonic der Event-Loop bleibt)."""
+
+    def __init__(self):
+        self.t = 100.0
+
+    def monotonic(self):
+        return self.t
+
+
+class _Inner:
+    """Netzwerk-Backend: `dead` Adressen laufen in ihre Frist (ConnectTimeout), `refused` scheitern
+    sofort, alle anderen verbinden."""
+
+    def __init__(self, clock, dead=(), refused=()):
+        self.clock, self.dead, self.refused, self.calls = clock, set(dead), set(refused), []
+
+    async def connect_tcp(self, host, port, timeout=None, **kw):
+        self.calls.append((host, None if timeout is None else round(timeout, 3)))
+        if host in self.refused:
+            raise httpcore.ConnectError("refused")
+        if host in self.dead:
+            self.clock.t += timeout if timeout is not None else 1000
+            raise httpcore.ConnectTimeout("timed out")
+        return f"stream:{host}"
+
+    async def sleep(self, s):
+        pass
+
+
+async def test_guarded_backend_splits_connect_timeout_over_addresses(monkeypatch):
+    """Tote IPv6-Adresse vor IPv4: Jede Adresse bekommt ihren Anteil an der Frist (mindestens
+    CONNECT_MIN_SLICE), statt dass die erste die ganzen 10 s verbraucht; insgesamt nie mehr als die
+    Frist. Gesperrte Adressen verhindern weiterhin jede Verbindung."""
+    import asyncio
+    import app.netguard as netguard_mod
+    from app.netguard import CONNECT_MIN_SLICE, GuardedBackend
+    clock = _Clock()
+    monkeypatch.setattr(netguard_mod, "time", clock)
+    monkeypatch.setattr(type(asyncio.get_running_loop()), "getaddrinfo", _fake_getaddrinfo({
+        "two.example": ["2606:4700::1", "93.184.216.34"],
+        "three.example": ["2606:4700::1", "2606:4700::2", "93.184.216.34"],
+        "many.example": [f"93.184.216.{i}" for i in range(1, 7)],
+        "mixed.example": ["2606:4700::1", "10.0.0.5"],
+    }))
+    assert CONNECT_MIN_SLICE == 2.0
+
+    inner = _Inner(clock, dead={"2606:4700::1", "2606:4700::2"})
+    backend = GuardedBackend(inner)
+    assert await backend.connect_tcp("two.example", 443, timeout=10) == "stream:93.184.216.34"
+    assert inner.calls == [("2606:4700::1", 5.0), ("93.184.216.34", 5.0)]
+
+    inner.calls.clear()
+    assert await backend.connect_tcp("three.example", 443, timeout=10) == "stream:93.184.216.34"
+    assert inner.calls == [("2606:4700::1", 3.333), ("2606:4700::2", 3.333), ("93.184.216.34", 3.333)]
+
+    # Abgelehnte Verbindung kostet keine Zeit: Die nächste Adresse bekommt den Rest.
+    inner = _Inner(clock, refused={"2606:4700::1"})
+    backend = GuardedBackend(inner)
+    assert await backend.connect_tcp("two.example", 443, timeout=10) == "stream:93.184.216.34"
+    assert inner.calls == [("2606:4700::1", 5.0), ("93.184.216.34", 10.0)]
+
+    # Sechs tote Adressen: je mindestens 2 s, nach 10 s ist Schluss (die sechste kommt nicht mehr dran).
+    inner = _Inner(clock, dead={f"93.184.216.{i}" for i in range(1, 7)})
+    backend = GuardedBackend(inner)
+    start = clock.t
+    with pytest.raises(httpcore.ConnectTimeout):
+        await backend.connect_tcp("many.example", 443, timeout=10)
+    assert [t for _ip, t in inner.calls] == [2.0] * 5 and clock.t - start == 10
+
+    # Ohne Frist des Clients (timeout=None) bekommt auch jede Adresse keine.
+    inner = _Inner(clock, dead={"2606:4700::1"})
+    backend = GuardedBackend(inner)
+    assert await backend.connect_tcp("two.example", 443) == "stream:93.184.216.34"
+    assert inner.calls == [("2606:4700::1", None), ("93.184.216.34", None)]
+
+    # Gesperrte Adresse unter den Adressen: keine Verbindung, auch nicht zur erlaubten.
+    inner = _Inner(clock)
+    with pytest.raises(BlockedURL):
+        await GuardedBackend(inner).connect_tcp("mixed.example", 443, timeout=10)
+    with pytest.raises(BlockedURL):
+        await GuardedBackend(inner).connect_tcp("10.0.0.5", 443, timeout=10)
+    assert inner.calls == []
 
 # ---- Fetcher mit MockTransport -----------------------------------------------
 

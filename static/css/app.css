@@ -498,8 +498,21 @@ mark {
 .set-value--on { color: var(--ink); }
 .set-value--off { color: var(--muted); }
 .set-row.is-off .t-ui { color: var(--muted); }
-.err-inline { display: inline-flex; align-items: center; gap: 6px; color: var(--signal-text); }
-.err-inline::before { content: ""; width: 6px; height: 6px; border-radius: var(--radius-pill); background: var(--signal); flex-shrink: 0; }
+/* Fehler in der Unterzeile (Zeitungen: „DE · • Fehler: …“): inline, damit ein langer Text direkt nach
+   dem Land weiterläuft und umbricht (inline-flex rutschte als Block in die nächste Zeile, „DE ·“ blieb
+   allein stehen). Punkt und „Fehler:“ trennt kein Umbruch. */
+.err-inline { color: var(--signal-text); }
+.err-inline-label { white-space: nowrap; }
+.err-inline-label::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--signal);
+  vertical-align: middle;
+}
 
 .switch {
   width: 44px;
@@ -644,7 +657,8 @@ mark {
 .article-body figcaption { font-family: var(--font-mono); font-size: 12px; line-height: 16px; letter-spacing: 0.02em; color: var(--muted); margin-top: var(--space-2); text-transform: uppercase; }
 /* Bildzeile unter dem Titelbild: 8px Abstand statt der Spalten-Lücke (gap) von .art. */
 .art > .art-caption { margin: calc(var(--space-2) - var(--art-gap)) 0 0; }
-.article-body figure + *, .article-body figcaption + * { margin-top: 8px; }
+/* Nach einem Bild samt Bildzeile im Text 16px wie nach dem Titelbild (Spalten-Lücke von .art). */
+.article-body figure + *, .article-body figcaption + * { margin-top: var(--space-4); }
 /* Liveblog-Uhrzeit (<p><strong>28.09. 14:43</strong></p>, Klasse aus buildBody): Mono wie andere
    Zeitangaben, mehr Luft darüber, dicht an der Überschrift des eigenen Eintrags. */
 .article-body .art-time {

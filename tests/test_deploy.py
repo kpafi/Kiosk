@@ -1,4 +1,5 @@
-"""Prüft das Python-Stück aus deploy/deploy.sh, das den Kiosk-Block in der Caddyfile ersetzt."""
+"""Prüft das Python-Stück aus deploy/deploy.sh, das den Kiosk-Block in der Caddyfile ersetzt, und
+die gepinnten Abhängigkeiten des Images."""
 from __future__ import annotations
 
 import re
@@ -922,3 +923,44 @@ def test_worker_memory_limits_fit_the_container():
     limit_mb = int(re.search(r"mem_limit: (\d+)m", compose).group(1))
     workers = (f.EXTRACT_WORKERS + f.FEED_PARSE_WORKERS) * f.JOB_MEMORY_LIMIT // 2**20
     assert workers + 320 <= limit_mb     # Reserve für die App selbst
+
+
+# ---- Abhängigkeiten ------------------------------------------------------------------------------
+
+EXTRACTION_STACK = {"trafilatura", "lxml", "htmldate", "charset-normalizer", "justext"}
+
+
+def _pins() -> dict[str, str]:
+    """Genau gepinnte Pakete aus requirements.txt (normalisierter Name -> Version)."""
+    pins = {}
+    for line in (ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines():
+        m = re.fullmatch(r"([A-Za-z0-9_.-]+)==([^\s;#]+)\s*(?:#.*)?", line.strip())
+        if m:
+            pins[re.sub(r"[-_.]+", "-", m.group(1)).lower()] = m.group(2)
+    return pins
+
+
+def test_extraction_stack_is_pinned_exactly():
+    """Extraktion (trafilatura und was Kodierung, Parsen, Bereinigung und Datum bestimmt) mit genau
+    den Versionen, gegen die tests/test_extract.py läuft: Das Image installiert requirements.txt."""
+    pins = _pins()
+    assert EXTRACTION_STACK <= pins.keys(), EXTRACTION_STACK - pins.keys()
+    assert pins["trafilatura"] == "2.2.0" and pins["lxml"] == "6.1.3"
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "COPY requirements.txt ." in dockerfile and "pip install -r requirements.txt" in dockerfile
+    assert "-r requirements.txt" in (ROOT / "requirements-dev.txt").read_text(encoding="utf-8")
+
+
+def test_test_environment_matches_the_pins():
+    """Die Tests laufen mit genau den gepinnten Versionen (sonst prüften sie etwas anderes, als das
+    Image installiert)."""
+    from importlib.metadata import PackageNotFoundError, version
+    wrong = {}
+    for name, pinned in _pins().items():
+        try:
+            installed = version(name)
+        except PackageNotFoundError:
+            installed = None
+        if installed != pinned:
+            wrong[name] = (pinned, installed)
+    assert not wrong, wrong

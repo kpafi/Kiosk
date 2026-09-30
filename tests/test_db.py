@@ -384,6 +384,19 @@ def test_pending_articles_keyset(db):
     assert len(ids) == 5 and len(set(ids)) == 5
 
 
+
+def test_pending_articles_only_from_catalog_sources(db):
+    """Aus sources.yaml entfernte Quellen bleiben in source_state eingeschaltet; ihre Artikel holt der
+    Extraktor nicht mehr (source_ids = Katalog). Mit Keyset kombinierbar."""
+    db.ensure_sources([("weg", True)])
+    db.upsert_articles([make_row(sid, i, ago(hours=i + 1)) for sid in ("alpha", "beta", "weg") for i in range(3)])
+    assert {r["source_id"] for r in db.pending_articles(20)} == {"alpha", "beta", "weg"}
+    assert {r["source_id"] for r in db.pending_articles(20, source_ids=["alpha", "beta"])} == {"alpha", "beta"}
+    assert db.pending_articles(20, source_ids=[]) == []
+    first = db.pending_articles(2, source_ids=("alpha",))
+    rest = db.pending_articles(20, before=(first[-1]["published_at"], first[-1]["id"]), source_ids=("alpha",))
+    assert [r["source_id"] for r in first + rest] == ["alpha"] * 3
+
 # ---- v4: Profile, Lieblingszeitungen, Einstellungen, "Später lesen" ------------
 
 V4_TABLES = {"profiles", "favorite_sources", "settings"}

@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import socket
 import threading
 import time
 import zlib
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import httpx
 import pytest
@@ -202,7 +204,7 @@ async def test_small_feed_image_is_replaced_by_page_image(db, settings, monkeypa
     aid = db.one("SELECT id FROM articles")["id"]
     f = make_fetcher(db, settings, lambda r: httpx.Response(200, headers={"content-type": "text/html"}, content=b"<p>x</p>"))
 
-    async def fake_extract(page, url, skip=None):
+    async def fake_extract(page, url, skip=None, charset=None):
         return extract_mod.Extraction("full", "<p>Text</p>", "Text", 4, False, page_image, None)
 
     monkeypatch.setattr(f, "_run_extract", fake_extract)
@@ -217,7 +219,7 @@ async def test_page_image_does_not_replace_image_of_already_extracted_article(db
     db.store_extraction(aid, status="full", body_html="<p>alt</p>", body_text="alt", body_len=3, paywalled=False)
     f = make_fetcher(db, settings, lambda r: httpx.Response(200, headers={"content-type": "text/html"}, content=b"<p>x</p>"))
 
-    async def fake_extract(page, url, skip=None):
+    async def fake_extract(page, url, skip=None, charset=None):
         return extract_mod.Extraction("full", "<p>Text</p>", "Text", 4, False, "https://i.example/gross.jpg", None)
 
     monkeypatch.setattr(f, "_run_extract", fake_extract)
@@ -761,6 +763,8 @@ async def test_source_breaker_skips_rest_of_source_after_two_timeouts(db, settin
     db.upsert_articles(rows)
     f = make_fetcher(db, settings, lambda r: httpx.Response(
         200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode()))
+    f.catalog = Catalog([SRC, Source(id="beta", name="Beta", country="DE", lang="de", feed=f"{PUBLIC}/beta",
+                                        homepage=PUBLIC)])
     try:
         await asyncio.wait_for(f._extract_pending(), timeout=30)
         alpha = db.q("SELECT attempts, text_status, text_error FROM articles WHERE source_id='alpha'")
@@ -779,6 +783,98 @@ async def test_source_breaker_skips_rest_of_source_after_two_timeouts(db, settin
         alpha = db.q("SELECT attempts, text_status FROM articles WHERE source_id='alpha'")
         done = [r["text_status"] for r in alpha if r["attempts"] == 0]
         assert len(done) == 6 - tried and all(st in ("full", "partial") for st in done)
+    finally:
+        await f.close()
+
+
+async def test_extractor_skips_sources_no_longer_in_catalog(db, settings):
+    """Eine aus sources.yaml entfernte Quelle ist in source_state noch eingeschaltet: Ihre Artikel werden
+    nicht mehr geholt (zählen auch nicht zum Budget des Laufs)."""
+    db.ensure_sources([("weg", True)])
+    db.upsert_articles([make_row("alpha", 1, ago(minutes=5), url=f"{PUBLIC}/alpha/1"),
+                        make_row("weg", 1, ago(minutes=1), url=f"{PUBLIC}/weg/1")])
+    urls = []
+
+    def handler(request):
+        urls.append(str(request.url))
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode())
+
+    f = make_fetcher(db, settings, handler)
+    try:
+        assert await asyncio.wait_for(f._extract_pending(), timeout=30) == 1
+    finally:
+        await f.close()
+    assert urls == [f"{PUBLIC}/alpha/1"]
+    assert db.one("SELECT text_status FROM articles WHERE source_id='weg'")["text_status"] == "pending"
+
+
+async def test_result_sent_just_at_the_deadline_counts(db, settings, monkeypatch):
+    """Grenzfall: wait_for meldet die Zeitüberschreitung, der Worker hatte sein Ergebnis aber schon
+    geschickt (SIGKILL kam zu spät oder gar nicht mehr): Das Ergebnis gilt, kein ExtractTimeout."""
+    f = make_fetcher(db, settings, lambda r: httpx.Response(404))
+
+    async def finished_but_late(aw, timeout):
+        await aw                        # Worker fertig werden lassen ...
+        raise asyncio.TimeoutError      # ... und trotzdem die Frist melden
+
+    try:
+        with monkeypatch.context() as m:
+            m.setattr(fetcher_mod.asyncio, "wait_for", finished_but_late)
+            assert await f._run_job(str.upper, "fertig", timeout=5, what="Test", slots=f._job_sem) == "FERTIG"
+            # Endete der Worker ohne Ergebnis, bleibt es eine Zeitüberschreitung.
+            with pytest.raises(fetcher_mod.ExtractTimeout):
+                await f._run_job(fetcher_mod.os._exit, 3, timeout=5, what="Test", slots=f._job_sem)
+    finally:
+        await f.close()
+
+
+async def test_cancelled_extractions_are_not_counted(db, settings, monkeypatch):
+    """Abgebrochene Extraktionen (CancelledError, keine Exception) zählen weder zum Budget des Laufs
+    noch als extrahiert."""
+    db.upsert_articles([make_row("alpha", i, ago(minutes=i + 1), url=f"{PUBLIC}/a/{i}") for i in range(4)])
+    f = make_fetcher(db, settings, lambda r: httpx.Response(404))
+
+    async def extract_article(article_id, url, source=None):
+        if url.endswith(("/1", "/3")):
+            raise asyncio.CancelledError()
+        return True
+
+    monkeypatch.setattr(f, "extract_article", extract_article)
+    try:
+        assert await f._extract_pending() == 2
+    finally:
+        await f.close()
+    urls = {r["id"]: r["url"] for r in db.q("SELECT id, url FROM articles")}
+    assert sorted(urls[i] for i in f._extracted_ids) == [f"{PUBLIC}/a/0", f"{PUBLIC}/a/2"]
+
+
+async def test_start_failure_pauses_on_demand_extraction(db, settings, monkeypatch):
+    """Ließ sich kein Worker-Prozess starten (JobStartFailed), startet die Leseansicht (fragt alle 3 s
+    nach) START_FAILED_BACKOFF Sekunden lang keine neue Extraktion, die die Seite erneut holte."""
+    aid = _article(db)
+    fetched = []
+
+    def handler(request):
+        fetched.append(str(request.url))
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=ARTICLE_HTML.encode())
+
+    async def no_process(page, url, skip=None, charset=None):
+        raise fetcher_mod.JobStartFailed("Extraktion: Worker-Prozess ließ sich nicht starten")
+
+    f = make_fetcher(db, settings, handler)
+    monkeypatch.setattr(f, "_run_extract", no_process)
+    try:
+        await on_demand(f, aid, f"{PUBLIC}/artikel")
+        art = db.get_article(aid)
+        assert len(fetched) == 1 and art["text_status"] == "pending" and art["attempts"] == 0
+        for _ in range(3):
+            assert f.start_extraction(aid, f"{PUBLIC}/artikel") is False
+        assert len(fetched) == 1 and not f.is_extracting(aid)
+        # Nach Ablauf der Pause startet wieder eine Extraktion.
+        assert 60 >= fetcher_mod.START_FAILED_BACKOFF >= 30
+        f._start_failed[aid] -= fetcher_mod.START_FAILED_BACKOFF
+        await on_demand(f, aid, f"{PUBLIC}/artikel")
+        assert len(fetched) == 2
     finally:
         await f.close()
 
@@ -1041,7 +1137,7 @@ async def test_title_echo_is_removed_off_the_event_loop(db, settings, monkeypatc
         threads.append(threading.current_thread() is threading.main_thread())
         return real(result, title)
 
-    async def fake_extract(page, url, skip=None):
+    async def fake_extract(page, url, skip=None, charset=None):
         return extract_mod.Extraction("full", "<p>Titel 1</p><p>Text</p>", "Titel 1 Text", 12, False, None, None)
 
     monkeypatch.setattr(fetcher_mod, "drop_title_echo", spy)
@@ -1517,6 +1613,149 @@ def test_extract_gets_exactly_the_checked_utf8():
     assert "Grüße aus Köln".encode() in fetcher_mod.page_as_utf8(page.encode("utf-16"))
     utf8 = page.encode("utf-8")
     assert fetcher_mod.page_as_utf8(utf8) == utf8          # UTF-8 bleibt Byte für Byte gleich
+
+
+def test_worker_logs_with_app_format_and_article_url():
+    """Der Worker-Prozess richtet sein Protokoll selbst ein (der Forkserver tut es nicht): Format der
+    App, ab WARNING, mit der Artikel-URL am Ende jeder Zeile. Eigener Interpreter, weil _job_main
+    das Protokoll des Prozesses umstellt und mit os._exit endet."""
+    import subprocess
+    import sys
+    code = (
+        "import logging, multiprocessing as mp, app.fetcher as f\n"
+        "recv, send = mp.Pipe(duplex=False)\n"
+        "log = logging.getLogger('kiosk.extract')\n"
+        "def job():\n"
+        "    log.info('unwichtig')\n"
+        "    log.warning('Umbau der Seite gescheitert: %s', 'x')\n"
+        "    return 'ok'\n"
+        "import threading\n"
+        "t = threading.Thread(target=lambda: print(repr(recv.recv()), flush=True)); t.start()\n"
+        "f._job_main(send, job, (), 2 * 1024 ** 3, 30, 'https://news.example/a/1')\n"
+    )
+    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60,
+                         cwd=str(Path(fetcher_mod.__file__).resolve().parent.parent))
+    assert res.returncode == 0, res.stderr
+    lines = res.stderr.strip().splitlines()
+    assert len(lines) == 1, res.stderr
+    assert re.fullmatch(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} WARNING kiosk\.extract: "
+                        r"Umbau der Seite gescheitert: x \[https://news\.example/a/1\]", lines[0]), lines[0]
+    assert fetcher_mod.LOG_FORMAT == "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+
+async def test_worker_jobs_name_their_article_or_source(db, settings, monkeypatch):
+    """_run_extract und die Feed-Jobs geben dem Worker-Prozess die Artikel-URL bzw. Quelle mit."""
+    seen = []
+
+    async def fake_run_job(fn, *args, context=None, **kw):
+        seen.append((fn.__name__, args[-1] if fn is fetcher_mod._extract_job else None, context))
+        return []
+
+    f = make_fetcher(db, settings, lambda r: httpx.Response(404))
+    monkeypatch.setattr(f, "_run_job", fake_run_job)
+    try:
+        await f._run_extract(b"<p>x</p>", f"{PUBLIC}/artikel", charset="utf-8")
+        await f._parse_job(parse_feed, SRC, b"<rss/>", what="Feed-Parsing", context=SRC.id)
+    finally:
+        await f.close()
+    assert seen == [("_extract_job", "utf-8", f"{PUBLIC}/artikel"), ("_feed_job", None, "alpha")]
+
+
+# Kodierung (page_encoding): Kopfzeile vor <meta>, Latin-1/ASCII als windows-1252 (WHATWG), gültiges
+# UTF-8 bleibt UTF-8, nur ohne jede Angabe rät trafilatura (utils.decode_file).
+QUOTES = "Er sagte: „Nein“ – und ging. Schöne Grüße aus Köln, Crème brûlée à 5 €."
+
+
+def _cp1252_page(head: str = "") -> bytes:
+    return f"<html><head>{head}<title>T</title></head><body><p>{QUOTES}</p></body></html>".encode("cp1252")
+
+
+@pytest.mark.parametrize("head, header", [
+    ('<meta charset="iso-8859-1">', None),                      # trafilatura riet hier mac_iceland
+    ('<meta http-equiv="Content-Type" content="text/html; charset=ISO-8859-1">', None),
+    ('<meta charset="windows-1252">', None),
+    ("", "iso-8859-1"),                                          # nur die Kopfzeile, keine Angabe in der Seite
+    ("", "us-ascii"),
+    ('<meta charset="iso-8859-7">', "windows-1252"),             # Kopfzeile geht vor
+    ('<meta charset="utf-16">', "latin1"),                       # <meta> mit UTF-16 zählt ohnehin nicht
+], ids=["meta-latin1", "http-equiv", "meta-cp1252", "header-latin1", "header-ascii", "header-vor-meta",
+        "header-vor-meta-utf16"])
+def test_declared_single_byte_charset_is_read_as_cp1252(head, header):
+    raw = _cp1252_page(head)
+    assert fetcher_mod.page_encoding(raw, header) == "cp1252"
+    assert QUOTES in fetcher_mod.page_as_utf8(raw, header).decode("utf-8")
+
+
+def test_header_charset_beats_meta_in_both_directions():
+    text = "Zażółć gęślą jaźń"
+    raw = f'<html><head><meta charset="windows-1252"></head><body><p>{text}</p></body></html>'.encode("iso-8859-2")
+    assert text in fetcher_mod.page_as_utf8(raw, "ISO-8859-2").decode("utf-8")
+    assert text not in fetcher_mod.page_as_utf8(raw).decode("utf-8")      # ohne Kopfzeile gilt das <meta>
+
+
+def test_valid_utf8_stays_utf8_whatever_is_declared():
+    page = f'<html><head><meta charset="iso-8859-1"></head><body><p>{QUOTES}</p></body></html>'.encode("utf-8")
+    for header in (None, "iso-8859-1", "windows-1252"):
+        assert fetcher_mod.page_encoding(page, header) == "utf-8"
+        assert fetcher_mod.page_as_utf8(page, header) == page
+
+
+def test_undeclared_page_falls_back_to_trafilatura_guess(monkeypatch):
+    from trafilatura import utils as trafilatura_utils
+    raw = _cp1252_page()
+    assert fetcher_mod.page_encoding(raw) is None
+    assert fetcher_mod.page_as_utf8(raw) == trafilatura_utils.decode_file(raw).encode("utf-8")
+    # Unbekannte oder unzulässige Angaben zählen wie keine.
+    for header in ("x-kaputt", "rot13", "utf-7", "unicode-escape"):
+        assert fetcher_mod.page_encoding(raw, header) is None, header
+        assert fetcher_mod.page_encoding(_cp1252_page(f'<meta charset="{header}">')) is None, header
+
+
+def test_cp1252_gaps_become_c1_controls_like_in_browsers():
+    raw = b'<html><head><meta charset="windows-1252"></head><body><p>a\x81b\x9dc \x93x\x94</p></body></html>'
+    assert "a\x81b\x9dc “x”" in fetcher_mod.page_as_utf8(raw).decode("utf-8")
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("text/html; charset=ISO-8859-1", "ISO-8859-1"), ('text/html;charset="utf-8"', "utf-8"),
+    ("text/html; Charset = 'windows-1252'", "windows-1252"), ("text/html", None), ("", None), (None, None),
+])
+def test_header_charset(value, expected):
+    assert fetcher_mod.header_charset(value) == expected
+
+
+def test_pre_check_and_extract_see_the_same_bytes_with_header_charset():
+    seen = []
+
+    def spy(page, url):
+        seen.append(page)
+        return "ok"
+
+    raw = _cp1252_page()
+    assert fetcher_mod._extract_job(spy, raw, "https://x/a", "windows-1252") == "ok"
+    assert seen == [fetcher_mod.page_as_utf8(raw, "windows-1252")] and QUOTES.encode() in seen[0]
+    # Die Vorprüfung sieht die dekodierte Seite (UTF-16 laut Kopfzeile, ohne BOM).
+    hostile = ("<html><body><div " + " ".join(f"a{i}" for i in range(20_000)) + "></div></body></html>")
+    with pytest.raises(fetcher_mod.MarkupRejected, match="Attribute"):
+        fetcher_mod._extract_job(_no_extract, hostile.encode("utf-16-le"), "https://x/a", "utf-16le")
+
+
+async def test_article_charset_from_content_type_reaches_the_worker(db, settings):
+    """Ende zu Ende mit echtem Worker-Prozess und trafilatura: kleine windows-1252-Seite ohne <meta>,
+    Kodierung nur in der Kopfzeile (ISO-8859-1, gemeint ist windows-1252). trafilatura riete hier
+    cp1250 (è → č, à → ŕ)."""
+    body = "".join(f"<p>{QUOTES} Absatz {i} mit genug weiterem Text für die Extraktion.</p>" for i in range(6))
+    raw = f"<html><head><title>T</title></head><body><article><h1>Titel</h1>{body}</article></body></html>".encode("cp1252")
+    aid = _article(db)
+    f = make_fetcher(db, settings, lambda r: httpx.Response(
+        200, headers={"content-type": "text/html; charset=ISO-8859-1"}, content=raw))
+    try:
+        await asyncio.wait_for(on_demand(f, aid, f"{PUBLIC}/artikel"), timeout=60)
+    finally:
+        await f.close()
+    art = db.get_article(aid)
+    assert art["text_status"] in ("full", "partial"), art["text_error"]
+    assert QUOTES in art["body_text"]
 
 
 @pytest.mark.parametrize("raw", [

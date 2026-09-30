@@ -1,4 +1,5 @@
-"""Service Worker und index.html verweisen nur auf Dateien, die es unter static/ gibt."""
+"""Service Worker und index.html verweisen nur auf Dateien, die es unter static/ gibt; dazu feste Stellen
+in index.html und app.css."""
 from __future__ import annotations
 
 import re
@@ -40,3 +41,37 @@ def test_index_html_references_exist():
     missing = [r for r in refs if r.startswith("/") and not _file(r).is_file()]
     assert not missing, missing
 
+
+
+def test_index_html_has_one_build_placeholder():
+    """app.main.index setzt die Build-Kennung in genau dieses leere data-build an <html> ein."""
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    assert html.count('data-build=""') == 1 and html.count("data-build") == 1
+    assert re.search(r'<html [^>]*data-build=""', html)
+
+
+def _css_rule(css: str, selector: str) -> str:
+    m = re.search(r"(?m)^" + re.escape(selector) + r"\s*\{([^}]*)\}", css)
+    assert m, selector
+    return m.group(1)
+
+
+def test_source_error_wraps_inline_after_country():
+    """Zeitungen mit Fehler: „DE · • Fehler: …“ läuft als Text weiter und bricht um; kein Block
+    (inline-flex), der in die nächste Zeile rutscht und „DE ·“ allein stehen lässt."""
+    css = (STATIC / "css" / "app.css").read_text(encoding="utf-8")
+    assert "display" not in _css_rule(css, ".err-inline")
+    assert "white-space: nowrap" in _css_rule(css, ".err-inline-label")
+    dot = _css_rule(css, ".err-inline-label::before")
+    assert "display: inline-block" in dot and "vertical-align: middle" in dot
+    js = (STATIC / "js" / "views" / "sources.js").read_text(encoding="utf-8")
+    assert "h('span', { class: 'err-inline-label', text: 'Fehler:' }), ` ${s.last_error}`" in js
+
+
+def test_gap_after_body_figure_matches_hero():
+    """Nach einem Bild samt Bildzeile im Text 16px bis zum nächsten Absatz, wie nach dem Titelbild."""
+    css = (STATIC / "css" / "app.css").read_text(encoding="utf-8")
+    assert "--space-4: 16px" in (STATIC / "css" / "tokens.css").read_text(encoding="utf-8")
+    assert "--art-gap: var(--space-4)" in css
+    assert "margin-top: var(--space-4)" in _css_rule(css, ".article-body figure + *, .article-body figcaption + *")
+    assert "margin-top: var(--space-4)" in _css_rule(css, ".article-body > * + *")

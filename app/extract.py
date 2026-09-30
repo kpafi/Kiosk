@@ -5,6 +5,7 @@ import copy
 import html
 import json
 import logging
+import math
 import os
 import re
 from collections import Counter
@@ -446,11 +447,13 @@ _PUBLISHED_MAX_LEN = 60     # längere Absätze mit „Published On …“ sind 
 _NEWSFEED_RE = re.compile(r"^\s*<a\b[^>]*>\s*NewsFeed\s*</a>\s*$")
 # Etiketten, verglichen ohne Groß-/Kleinschreibung und ohne Doppelpunkt am Ende: Überschriften von
 # Teaser-Kästen (WELT, SZ, heise), Teilen-Knöpfe, Metazeilen ohne Wert („Stand:“ beim Tagesspiegel, der
-# Zeitpunkt selbst fällt weg), BBC „Get in touch“.
+# Zeitpunkt selbst fällt weg), BBC „Get in touch“, die Sprungmarken um die Newsletter-Werbung des Guardian
+# (zweite Sicherung neben _CHROME_ATTRS), ZEIT-Liveblog „Nach oben“ (Link zum Seitenanfang).
 _JUNK_LABELS = {"hide caption", "toggle caption", "advertisement", "werbung", "anzeige",
                 "lesen sie auch", "lesen sie mehr zum thema", "mehr zum thema", "stand", "lesezeit",
                 "videos by heise", "link kopieren", "auf facebook teilen", "auf x teilen", "per e-mail teilen",
-                "uns auf google folgen", "newsfeed", "get in touch"}
+                "uns auf google folgen", "newsfeed", "get in touch",
+                "skip past newsletter promotion", "after newsletter promotion", "nach oben"}
 # Metazeile, deren Wert nur Datum, Uhrzeit oder Dauer ist: „Stand: 28.09.2026 18:07 Uhr“, „Stand: 28.
 # September 2026“, „Lesezeit: 3 Min.“; „Stand: 2:1 für Leverkusen nach 70 Minuten.“ bleibt.
 # Die Wiederholung ist possessiv (++, Python ≥ 3.11): Ohne sie probiert die Suche bei „12.12.12…x“
@@ -462,8 +465,11 @@ _META_LINE_RE = re.compile(rf"^(?:stand|lesezeit)\s*:(?:\s*{_META_VALUE})++\s*$"
 _LOREM_RE = re.compile(r"^\s*Lorem ipsum dolor sit amet\b", re.I)
 # Kurze Absätze (< _PROMO_MAX_LEN) mit Eigenwerbung: Google „bevorzugte Quelle“ (WELT, NDR, Tagesspiegel,
 # FR, DW „Preferred Source“) bzw. „Folgen Sie uns auf Google“; Newsletter-Anmeldung („Sign up for our
-# weekly newsletter …“, El País, Straits Times, NPR); Meduza (Hinweis auf KI-Übersetzung, Kontaktadresse
-# für Fehler, Newsletter-Werbung), BBC-Radiowerbung und die App-Werbung am Ende des Times-of-India-Textes.
+# weekly newsletter …“, El País, Straits Times, NPR; BBC „Get our flagship newsletter … Sign up here.“;
+# Guardian-Knopf „Sign up for the Breaking News Australia email“);
+# Meduza (Hinweis auf KI-Übersetzung, Kontaktadresse für Fehler, Newsletter-Werbung), BBC-Radiowerbung, die
+# App-Werbung am Ende des Times-of-India-Textes und der Rechtevermerk unter WELT-Videos („© Axel Springer
+# Deutschland GmbH. Alle Rechte vorbehalten.“).
 _PROMO_MAX_LEN = 300
 # Nur mit Werbe-Wortlaut: „Die EU wirft Google vor, eigene Angebote bevorzugt anzuzeigen.“ bleibt.
 _GOOGLE_PROMO_RE = re.compile(
@@ -472,12 +478,19 @@ _GOOGLE_PROMO_RE = re.compile(
     re.I | re.S)
 _PROMO_RE = re.compile(
     r"^sign up\b.{0,200}\bnewsletters?\b"
+    r"|^get our\b.{0,120}\bnewsletter\b.{0,120}\bsign up here\b"
+    r"|^sign up for\b.{0,80}\bemail\.?$"
     r"|errors in this translation, please contact us\b"
     r"|^to read meduza.s exclusive content"
     r"|^listen to the best of bbc radio"
-    r"|download the toi app", re.I | re.S)
-# Meduza: Hinweis auf die KI-Übersetzung, länger als _PROMO_MAX_LEN.
-_MEDUZA_AI_RE = re.compile(r"^At Meduza, we are committed to transparency about our use of artificial intelligence")
+    r"|download the toi app"
+    r"|^©\s*axel springer\b.{0,60}\balle rechte vorbehalten\.?$", re.I | re.S)
+# Meduza: Hinweis auf die KI-Übersetzung, länger als _PROMO_MAX_LEN. Guardian-Liveblogs: stehender Hinweis zu
+# den Kommentaren („I’m afraid we are no longer able to have comments open below the line every day on this
+# blog. If you want to contact me, please email …“), je nach Ressort unterschiedlich lang.
+_MEDUZA_AI_RE = re.compile(
+    r"^At Meduza, we are committed to transparency about our use of artificial intelligence"
+    r"|^I[’']m afraid we are no longer able to have comments open below the line\b")
 # Le Monde: Rest des Artikels hinter der Paywall (markiert den Artikel, siehe _PAYWALL_TEXT_RE).
 _PAYWALL_NOTE_RE = re.compile(
     r"^You have [\d.,]+\s?% of this article left to read\.?(?:\s*The rest is for subscribers only\.?)?$", re.I)
@@ -561,8 +574,17 @@ def _drop_junk_paragraphs(body: str) -> str:
             return m.group(0)
         return "" if _is_label(html_to_text(inner)) else m.group(0)
 
-    body = _HEADING_RE.sub(heading, _PARA_RE.sub(repl, body))
+    body = _DANGLING_MORE_RE.sub("", _HEADING_RE.sub(heading, _PARA_RE.sub(repl, body)))
     return _drop_orphan_captions(_drop_reading_times(body))
+
+
+# Hinweis auf einen eingebetteten Inhalt, den die Extraktion verwirft (ZEIT-Liveblog: „Lesen Sie hier mehr zum
+# Frontverlauf:“ vor einer Karte als Tickaroo-Einbettung): nur als eigener Absatz mit Doppelpunkt am Ende und
+# nur, wenn danach nichts kommt, was er einleiten könnte (Ende des Textes, Zeitzeile des nächsten Eintrags,
+# Zwischenüberschrift).
+_DANGLING_MORE_RE = re.compile(
+    r"<p>\s*(?:<(?:i|em|b|strong)>\s*)?Lesen Sie (?:hier |dort )?mehr\b[^<:]{0,80}:\s*(?:</(?:i|em|b|strong)>\s*)?"
+    r"</p>\s*(?=\Z|<p>\s*<strong>\d{2}\.\d{2}\. \d{2}:\d{2}</strong>\s*</p>|<h[2-4]>)")
 
 
 def _drop_reading_times(body: str) -> str:
@@ -811,7 +833,7 @@ _CHROME_XPATH = (
 #   Übersicht „Wichtige Updates“ tik4-hs mit den Überschriften).
 # - Tagesspiegel debug-piano (Liste „showPaywall: false …“), ZEIT #summy-content (KI-Zusammenfassung),
 #   NPR „hide caption“/„toggle caption“, Guardian-Datumszeile (dateline; den angehefteten Eintrag eines
-#   Liveblogs behandelt _pinned_post), derStandard
+#   Liveblogs behandelt _pinned_post), ZEIT-Liveblog „Nach oben“, derStandard
 #   tcf-notloaded (versteckter Einwilligungs-Dialog).
 # - Der kleinste Kasten um einen Link „als bevorzugte Quelle bei Google“ (google.com/preferences/source).
 _CHROME_CLASSES = frozenset({
@@ -821,6 +843,7 @@ _CHROME_CLASSES = frozenset({
     "tik4-author", "tik4-author__thumb", "tik4-hs", "ad--inread-header", "id-Story-googleFollowButton",
     "bookmark-experience", "show-comments", "js-comment", "contribute-article", "js-article-read-also",
     "in-article-games", "tcf-notloaded", "nfy-ar-teaser", "nfy-teaser-box",
+    "liveblog__chapter-button--back-to-top",
 })
 _CHROME_CLASS_PARTS = ("TeaserInline_wrapper", "VideoInline_wrapper")   # CSS-Module: Klasse mit Suffix
 _CHROME_TAG_CLASSES = {"div": {"teaser"}, "figure": {"branding"}, "section": {"more-on", "catcher"},
@@ -832,7 +855,38 @@ _CHROME_ATTRS = {
     "data-gu-name": {"dateline"},
     "id": {"summy-content"},
     "data-area": {"embed"},   # SPIEGEL: eingebetteter Inhalt, ohne Einwilligung nur ein Platzhalter
+    # Guardian: Newsletter-Werbung im Text („skip past newsletter promotion“ … „after newsletter promotion“),
+    # eine <figure> um <gu-island name="EmailSignUpWrapper">
+    "data-spacefinder-type": {"model.dotcomrendering.pageElements.NewsletterSignupBlockElement"},
+    "name": {"EmailSignUpWrapper"},
 }
+# ZEIT-Liveblogs: Im Kasten „Überblick“ (section.liveblog-preceding-content) über den Einträgen steht eine
+# Liste mit stehenden Hinweisen („Alle Artikel zum Thema finden Sie auf unserer Themenseite …“, „Neben eigenen
+# Recherchen verwenden wir Material der Nachrichtenagenturen …“, „Wie wir bei der ZEIT Nachrichten zum
+# Ukrainekrieg machen …“, „Russische oder ukrainische Angaben zu Details einzelner Angriffe … lassen sich
+# derzeit nicht unabhängig verifizieren.“). Diese Listenpunkte fallen weg, andere im Kasten bleiben, auch
+# Meldungen mit der Agenturformel „Die Angaben lassen sich nicht unabhängig überprüfen.“: Der Hinweis zählt nur
+# als ganzer Listenpunkt in genau diesem Wortlaut.
+_ZEIT_OVERVIEW_CLASS = "liveblog-preceding-content"
+_ZEIT_NOTE_RE = re.compile(
+    r"^(?:Alle Artikel zum Thema finden Sie auf unserer|Neben eigenen Recherchen verwenden wir Material"
+    r"|Wie wir bei der ZEIT Nachrichten zum"
+    r"|(?:\w+ (?:oder|und) )?\w+ Angaben zu Details einzelner Angriffe\b[^.]{0,150}\blassen sich (?:derzeit )?"
+    r"nicht unabhängig (?:überprüfen|verifizieren|bestätigen)\.?$)")
+_ZEIT_NOTE_MAX = 400
+_ZEIT_NOTE_TAGS = 50        # Hinweise haben wenige Elemente (Links, <br>); größere Listenpunkte gar nicht lesen
+
+
+def _is_zeit_note(li) -> bool:
+    # Erst begrenzt zählen: Ohne Grenze läse jeder verschachtelte Listenpunkt alle inneren noch einmal
+    # (quadratisch). Ein Listenpunkt mit einem inneren ist kein Hinweis.
+    for n, el in enumerate(li.iter()):
+        if n >= _ZEIT_NOTE_TAGS or (n and el.tag == "li"):
+            return False
+    text = _short_text(li, _ZEIT_NOTE_MAX)
+    return bool(text) and len(text) <= _ZEIT_NOTE_MAX and _ZEIT_NOTE_RE.search(text) is not None
+
+
 _CHROME_TAGS = {"app-storyline-related-topics", "app-default-teaser", "app-guidelines-reference", "a-opt-in"}
 _GOOGLE_PREFS_XPATH = "//a[contains(@href, 'google.com/preferences/source')]/.."
 
@@ -842,6 +896,7 @@ def _chrome_elements(tree) -> list:
     (Klassen als Menge): Eine XPath-Abfrage mit dreißig contains(concat(normalize-space(@class)))
     brauchte bei großen Seiten Sekunden."""
     found = list(tree.xpath(_CHROME_XPATH))
+    zeit_notes = False
     for el in tree.iter():
         tag = el.tag
         if not isinstance(tag, str):
@@ -852,6 +907,9 @@ def _chrome_elements(tree) -> list:
         cls = el.get("class")
         if cls:
             names = set(cls.split())
+            if not zeit_notes and _ZEIT_OVERVIEW_CLASS in names:
+                zeit_notes = True   # nur der erste Kasten: verschachtelte würden sonst mehrfach durchsucht
+                found += [li for li in el.iter("li") if _is_zeit_note(li)]
             if (not names.isdisjoint(_CHROME_CLASSES) or any(part in cls for part in _CHROME_CLASS_PARTS)
                     or not names.isdisjoint(_CHROME_TAG_CLASSES.get(tag, ()))):
                 found.append(el)
@@ -860,11 +918,62 @@ def _chrome_elements(tree) -> list:
             found.append(el)
         elif tag == "img" and "/pu_gea/image/logo" in (el.get("src") or ""):
             found.append(el)
+        elif el.get("data-spacefinder-type") == _GUARDIAN_LINK_BLOCK and _is_newsletter_button(el):
+            found.append(el)
+        elif tag == "img" and "bbci.co.uk/" in (el.get("src") or ""):
+            block = _bbc_banner_block(el)
+            if block is not None:
+                found.append(block)
     # Der kleinste Kasten um den Link „als bevorzugte Quelle bei Google einrichten“
     found += [el for el in tree.xpath(_GOOGLE_PREFS_XPATH) if len(el.text_content()) < 600
               and len(_normalize_ws(el.text_content())) < 300]
     # Ein Element kann mehrfach passen (<button class="sr-only">, WELT-Kasten mit Google-Link): nur einmal
     return list(dict.fromkeys(found))
+
+
+# Guardian: Knopf zur Newsletter-Anmeldung im Text („Sign up for the Breaking News Australia email“), eine
+# <figure data-spacefinder-type="…LinkBlockElement"> mit einem Link auf /email-newsletters. Andere Knöpfe bleiben.
+_GUARDIAN_LINK_BLOCK = "model.dotcomrendering.pageElements.LinkBlockElement"
+_NEWSLETTER_LINK_RE = re.compile(r"/(?:email-)?newsletters?(?:[/?#]|$)", re.I)
+
+
+def _is_newsletter_button(el) -> bool:
+    links = el.xpath(".//a/@href")[:5]
+    return bool(links) and all(_NEWSLETTER_LINK_RE.search(h) for h in links)
+
+
+# BBC: Werbebanner am Ende des Textes (Newsletter „News Daily“, „Politics Essential“, „Your Voice“, BBC News
+# Africa) stehen wie Artikelbilder in <div data-block="image">, ohne eigene Kennung. Erkannt am Bild: PNG von
+# ichef.bbci.co.uk, sehr breit (1920 × 316, Seitenverhältnis ab _BANNER_RATIO) oder mit dem Alt-Text der
+# Banner („A thin, grey banner promoting the News Daily newsletter“, „Your Voice banner image“). Nur „banner“
+# reicht nicht: „The Daily Mirror front page carries the banner headline …“ ist ein Artikelbild. Fotos sind
+# JPEG; PNG-Grafiken im Text (Karten, Diagramme) sind nicht so breit. Ohne lesbare Breite und Höhe gilt nur
+# der Alt-Text.
+_BANNER_RATIO = 4
+_BANNER_ALT_RE = re.compile(r"\bbanner promoting\b|^\s*your voice banner\b|\bnewsletter banner\b", re.I)
+_BANNER_LEVELS = 10         # so viele Ebenen über dem Bild wird der Block gesucht (BBC: 7)
+
+
+def _bbc_banner_block(img):
+    """Der <div data-block="image"> um ein BBC-Werbebanner (siehe oben), sonst None. Sucht vom Bild aus nach
+    oben (höchstens _BANNER_LEVELS Ebenen): linear, auch bei verschachtelten Blöcken."""
+    src = img.get("src") or ""
+    if not src.split("?", 1)[0].lower().endswith(".png"):
+        return None
+    if not _BANNER_ALT_RE.search(img.get("alt") or ""):
+        try:
+            width, height = float(img.get("width") or 0), float(img.get("height") or 0)
+        except ValueError:
+            return None
+        if not (math.isfinite(width) and math.isfinite(height) and width > 0 and height > 0
+                and width / height >= _BANNER_RATIO):
+            return None
+    for level, block in enumerate(img.iterancestors()):
+        if level >= _BANNER_LEVELS:
+            break
+        if block.get("data-block") == "image":
+            return block
+    return None
 
 
 _SCREEN_READER_CLASSES = frozenset({"visually-hidden", "screen-reader-text", "sr-only"})
@@ -940,13 +1049,15 @@ def _precleaned(page: bytes):
 #   trafilatura gab ihn einmal als Absatz mit <br> und noch einmal Satz für Satz aus (ein Drittel doppelt).
 #   Jeder innere <div> (ohne Blockelemente darin) wird ein Absatz, an jedem <br> geteilt.
 # - FAZ: Die Bildunterschrift des Titelbilds steht im Kopf in <div class="meta2"> (Text und <small>Nachweis),
-#   den trafilatura verwirft; er wird ein Absatz, _arrange_top macht daraus die <figcaption>.
+#   den trafilatura verwirft; er wird ein Absatz mit <br> vor dem Nachweis, _arrange_top macht daraus die
+#   <figcaption> (mit dem Absatz, wenn trafilatura ihn behält, sonst aus _page_captions).
 _TREE_FIXES_RE = re.compile(
     rb"<a-img\b|-(?:jpe?g|png|webp)[\"'\s]|id=\"block-|tik4-meta__ts|tik4-rich-text|header-teaser-image"
-    rb"|/picture/\d+/\d{1,2}/", re.I)
-# taz: Im Text steht ein 14 px breiter Platzhalter (…/picture/<id>/14/…webp), das echte Bild daneben in
-# <noscript>; der Platzhalter bekommt dessen Adresse (ohne <noscript>-Bild fällt er weg).
-_TAZ_LQIP_RE = re.compile(r"/picture/\d+/\d{1,2}/[^/]+$")
+    rb"|taz\.de/picture/\d+/\d{1,2}/", re.I)
+# taz: Im Text steht ein 14 px breiter Platzhalter (https://taz.de/picture/<id>/14/…webp), das echte Bild
+# daneben in <noscript>; der Platzhalter bekommt dessen Adresse (ohne <noscript>-Bild fällt er weg). Nur
+# Bilder von taz.de: Andere Seiten können denselben Pfad für echte Bilder nutzen.
+_TAZ_LQIP_RE = re.compile(r"^\s*https?://(?:[\w-]+\.)*taz\.de/picture/\d+/\d{1,2}/[^/]+$", re.I)
 _IMG_EXT_FRAGMENT = "#.jpg"
 _EXTLESS_IMG_RE = re.compile(r"^https?://[^?#]+-(?:jpe?g|png|webp)$", re.I)
 
@@ -994,12 +1105,19 @@ def _fix_tree(tree) -> bool:
     for caption in tree.xpath("//*[@data-external-selector='header-teaser-image']"
                               "/following-sibling::div[1][contains(concat(' ', @class, ' '), ' meta2 ')]"):
         for credit in caption.xpath("./small"):
-            credit.text = " " + (credit.text or "")   # „… ausbilden lassen. AFP“
+            # „… ausbilden lassen.<br>AFP“: Unterschrift und Nachweis getrennt wie in den übrigen <figcaption>
+            credit.addprevious(credit.makeelement("br", {}))
         caption.tag = "p"   # FAZ: Bildunterschrift des Titelbilds im Kopf, trafilatura verwarf den <div>
         caption.set("data-kiosk-caption", "1")   # für _page_captions, falls trafilatura den Absatz verwirft
         changed = True
-    for pinned in tree.xpath("//*[@id='liveblog-body']//*[@data-component='pinned-post']"):
-        _pinned_post(pinned, tree)
+    pinned_posts = tree.xpath("//*[@id='liveblog-body']//*[@data-component='pinned-post']")
+    if pinned_posts:
+        # Echte Seiten haben einen angehefteten Eintrag; weitere fallen weg (je Eintrag die ganze Eintragsliste
+        # zu lesen wäre auf feindlichen Seiten quadratisch: 500 Einträge und 2,9 MB Text kosteten 30 s).
+        for extra in pinned_posts[1:]:
+            if extra.getparent() is not None:
+                extra.drop_tree()
+        _pinned_post(pinned_posts[0], tree)
         changed = True
     for block in tree.xpath("//*[@id='liveblog-body']//article[starts-with(@id, 'block-')]"):
         block.tag = "section"
@@ -1046,7 +1164,7 @@ def _pinned_post(pinned, tree) -> None:
     „Closing post“), bleibt er als eigener Eintrag oben: sein <article> wird wie die übrigen behandelt."""
     blocks = [b for b in tree.xpath("//*[@id='liveblog-body']//article[starts-with(@id, 'block-')]")
               if not any(a is pinned for a in b.iterancestors())]
-    timeline = _squash(" ".join(b.text_content() for b in blocks))
+    timeline = _squash(" ".join(b.text_content() for b in blocks))   # einmal je Seite (nur ein Eintrag)
     paras = [_squash(el.text_content()) for el in pinned.xpath(".//p | .//li | .//h2 | .//h3 | .//blockquote")]
     paras = [x for x in paras if len(x) >= 20][:100]
     if not paras or sum(x[:60] in timeline for x in paras) >= _PINNED_COVERED * len(paras):
@@ -1153,7 +1271,9 @@ def extract(page: bytes, url: str) -> Extraction:
     )
     image_url = author = title = None
     try:
-        meta = trafilatura.extract_metadata(doc, default_url=url)
+        # Ohne die ausführliche Datumssuche (htmldate/dateparser über jeden kurzen Text mit einer Zahl:
+        # 12 000 solche Absätze kosteten 29 s); das Datum der Seite nutzt die App nicht.
+        meta = trafilatura.extract_metadata(doc, default_url=url, extensive=False)
         if meta:
             image_url = safe_http_url(meta.image)
             author = clean_author(meta.author)
@@ -1199,6 +1319,10 @@ def extract(page: bytes, url: str) -> Extraction:
             clean, text = arranged, html_to_text(arranged)
     if text and tree is not None:
         clean, text = _with_lead(clean, text, tree, title)
+    if text:
+        unlabeled = _drop_liveblog_label(clean)
+        if unlabeled != clean and html_to_text(unlabeled):
+            clean, text = unlabeled, html_to_text(unlabeled)
     if not text:
         return Extraction("empty", None, None, 0, paywalled, image_url, author, title)
     status = "partial" if (paywalled or truncated or len(text) < MIN_FULL_CHARS) else "full"
@@ -1473,15 +1597,15 @@ def _image_block(clean: str, pos: int, captions: Collection[str],
         if len(alt_sq) >= _ALT_PREFIX_MIN and isinstance(captions, dict):
             found = next((t for c, t in captions.items() if c.startswith(alt_sq)), None)
             if found:
-                parts = [html.escape(found, quote=False)]
+                parts = [html.escape(part, quote=False) for part in found.split(_CAPTION_SEP)]
     if len(parts) == 1 and isinstance(captions, dict):
         # Nur der Bildnachweis kam an (taz: trafilatura verwarf den Text der <figcaption>, behielt den
         # Nachweis-Absatz darin): die ganze Unterschrift der Seite nehmen, die diesen Nachweis enthält
         credit = html_to_text(parts[0])
         credit_sq = _squash(credit)
         if _is_credit(credit) and len(credit_sq) >= 5:
-            full = next((t for c, t in captions.items() if credit_sq in c and len(c) > len(credit_sq) + 10
-                         and len(t) <= 2 * _CAPTION_MAX), None)
+            full = next((t.replace(_CAPTION_SEP, " ") for c, t in captions.items()
+                         if credit_sq in c and len(c) > len(credit_sq) + 10 and len(t) <= 2 * _CAPTION_MAX), None)
             if full and credit in full:
                 rest = _normalize_ws(full.replace(credit, " "))
                 if rest:
@@ -1557,19 +1681,46 @@ def _page_description(tree) -> str:
     return _normalize_ws(metas[0])[:_LEAD_MAX] if metas else ""
 
 
+_CAPTION_SEP = "\n"          # trennt in _page_captions Unterschrift und Nachweis (FAZ-Kopf, dort ein <br>)
+
+
 def _page_captions(tree) -> dict[str, str]:
     """Bildunterschriften der Seite (<figcaption>, FAZ-Kopf; höchstens 200): zusammengedrückt (_squash) →
-    Text."""
+    Text. Beim FAZ-Kopf (aus _fix_tree) sind die Teile am <br> mit _CAPTION_SEP getrennt: Sie kommen
+    wie die übrigen Teile einer Unterschrift mit <br> in die <figcaption>."""
     out: dict[str, str] = {}
     for el in tree.xpath("//figcaption | //p[@data-kiosk-caption]")[:200]:
         if len(el.text_content()) > 2000:
             continue
-        # Teile mit Leerzeichen verbinden: Unterschrift und Nachweis stehen oft in eigenen Elementen
-        # („… EU-Verträge.“<span>Peter Schneider / Keystone</span>, NZZ)
-        text = _normalize_ws(" ".join(el.itertext()))
+        if el.get("data-kiosk-caption"):
+            pieces: list[list[str]] = [[]]
+            for node in el.xpath(".//text() | .//br"):
+                if isinstance(node, str):
+                    pieces[-1].append(node)
+                else:
+                    pieces.append([])
+            text = _CAPTION_SEP.join(p for p in (_normalize_ws(" ".join(x)) for x in pieces) if p)
+        else:
+            # Teile mit Leerzeichen verbinden: Unterschrift und Nachweis stehen oft in eigenen Elementen
+            # („… EU-Verträge.“<span>Peter Schneider / Keystone</span>, NZZ)
+            text = _normalize_ws(" ".join(el.itertext()))
         if text:
             out[_squash(text)] = text
     return out
+
+
+# ZEIT-Liveblogs: Der Vorspann (auch og:description) endet mit dem Etikett „Das Liveblog“ („… Mehrere Tote nach
+# Raketenangriffen. Das Liveblog“). Nur im ersten Absatz und nur nach einem Satzende.
+_FIRST_PARA_RE = re.compile(r"<p>((?:(?!</p>).)*)</p>", re.S)
+_LIVEBLOG_LABEL_RE = re.compile(r"(?<=[.!?…“”\"])\s+Das Liveblog\s*\Z")
+
+
+def _drop_liveblog_label(clean: str) -> str:
+    m = _FIRST_PARA_RE.search(clean)
+    if not m:
+        return clean
+    inner = _LIVEBLOG_LABEL_RE.sub("", m.group(1))
+    return clean if inner == m.group(1) else f"{clean[:m.start(1)]}{inner}{clean[m.end(1):]}"
 
 
 def _with_lead(clean: str, text: str, tree, title: str | None = None) -> tuple[str, str]:

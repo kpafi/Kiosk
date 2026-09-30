@@ -7,10 +7,11 @@ import { articlesLoader, createFeed } from '../ui/feed.js';
 import { emptyState, nextRunSentence } from '../ui/empty.js';
 import { openMenu } from './menu.js';
 import {
-  beginCtxList, chipProfiles, ctxPageShown, ctxParams, isActiveProfile, isAdmin, keepWatermark, loadBar, loadStatus, on, profileById, replaceHash,
-  setUnreadFilter, state,
+  beginCtxList, chipProfiles, ctxPageShown, ctxParams, isActiveProfile, isAdmin, keepWatermark, loadBar, loadStatus, navigate, on,
+  profileById, replaceHash, setUnreadFilter, state,
 } from '../store.js';
 import { api, refreshError } from '../api.js';
+import { parseHash } from '../route.js';
 
 /** Pille „HOLE NEUE ARTIKEL · 25 ZEITUNGEN“, solange ein Sammellauf läuft. */
 export function statusPill() {
@@ -20,6 +21,36 @@ export function statusPill() {
   return h('div', { class: 'status-pill t-caption', role: 'status' },
     h('span', { class: 'load-dots', 'aria-hidden': 'true' }, h('span'), h('span'), h('span')),
     h('span', { text: n ? `Hole neue Artikel · ${n} Zeitungen` : 'Hole neue Artikel' }));
+}
+
+/** Tipp auf die Wortmarke: am Desktop direkt zur Liste (dort steht die Titelseite rechts, ohne toten
+ *  Verlaufseintrag #/titelseite), auf der Titelseite selbst nach oben scrollen statt neu zu routen.
+ *  Neuer Tab, Mittelklick usw. bleiben beim Link. */
+function wordmarkClick(e) {
+  if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+  if (isDesktop()) {
+    e.preventDefault();
+    navigate('#/');
+  } else if (parseHash(location.hash).name === 'front') {
+    e.preventDefault();
+    const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    window.scrollTo({ top: 0, behavior: reduce ? 'auto' : 'smooth' });
+  }
+}
+
+/**
+ * Kopf der Startseiten (Liste, Handy-Titelseite): Wortmarke, Suchen, Menü. Die Wortmarke führt am
+ * Handy zur Titelseite, am Desktop zur Liste. current: Titelseite ist gerade offen (aria-current).
+ */
+export function homeHeader({ current = false } = {}) {
+  return h('header', { class: 'hdr hdr--home' },
+    h('h1', { class: 'hdr-wordmark t-wordmark' },
+      h('a', {
+        class: 'hdr-wordmark-link', href: '#/titelseite', 'aria-current': current ? 'page' : null, text: 'KIOSK',
+        on: { click: wordmarkClick },
+      })),
+    iconButton(search(20), 'Suchen', { href: '#/suche' }),
+    iconButton(dots(20), 'Menü', { onClick: openMenu }));
 }
 
 // Filterchips: Ein gewählter Profil-Chip rückt an Stelle 2 direkt hinter „Ungelesen“. Die Liste wird
@@ -239,11 +270,7 @@ export function listView(route) {
   }
 
   const feedHolder = h('div', { class: 'feed-holder' }, feed.el);
-  const header = h('header', { class: 'hdr hdr--home' },
-    h('h1', { class: 'hdr-wordmark t-wordmark', text: 'KIOSK' }),
-    iconButton(search(20), 'Suchen', { href: '#/suche' }),
-    iconButton(dots(20), 'Menü', { onClick: openMenu }));
-  const el = h('div', { class: 'view-list' }, header, chipsEl, statusSlot, feedHolder);
+  const el = h('div', { class: 'view-list' }, homeHeader(), chipsEl, statusSlot, feedHolder);
 
   buildChips();
   // Nach dem Einhängen: Chipzeile ganz nach links (aktiver Chip sichtbar), dann ggf. gleiten lassen.

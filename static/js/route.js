@@ -16,6 +16,7 @@ export function parseHash(hash) {
     case undefined: return { ...r, name: 'list', key: `list:${params.get('p') || ''}` };
     case 'a': return parts[1] && /^\d+$/.test(parts[1]) ? { ...r, name: 'article' } : { ...r, name: 'list', key: 'list:' };
     case 's': return parts[1] ? { ...r, name: 'source', key: `source:${parts[1]}` } : { ...r, name: 'list', key: 'list:' };
+    case 'titelseite': return { ...r, name: 'front', key: 'front' };
     case 'suche': return { ...r, name: 'search', key: 'search' };
     case 'gemerkt': return { ...r, name: 'saved', key: `saved:${params.get('tab') || ''}` };
     case 'einstellungen': return { ...r, name: 'settings', key: 'settings' };

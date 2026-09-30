@@ -1,6 +1,6 @@
 // Titelseite (E3DesktopTitelseite): rechte Seite am Desktop ohne offenen Artikel, wenn in den
-// Einstellungen gewählt. Aufmacher (größte Geschichte des Tages) und je Profil bis zu drei
-// Geschichten. Daten aus GET /api/frontpage.
+// Einstellungen gewählt; am Handy eine eigene Seite (#/titelseite, views/front.js). Aufmacher (größte
+// Geschichte des Tages) und je Profil bis zu drei Geschichten. Daten aus GET /api/frontpage.
 import { h } from '../ui/dom.js';
 import { metaParts } from '../ui/row.js';
 import { cleanText, clockTime, shortDate } from '../format.js';
@@ -42,7 +42,7 @@ function lead(story) {
   if (img) el.append(img);
   el.append(h('span', { class: 'fp-lead-text' },
     h('span', { class: 'row-meta t-meta' }, metaParts(a)),
-    h('span', { class: 'fp-lead-title', text: a.title || '(ohne Titel)' }),
+    h('span', { class: `fp-lead-title${a.read ? ' is-read' : ''}`, text: a.title || '(ohne Titel)' }),
     summary ? h('span', { class: 'fp-lead-summary', text: summary }) : null,
     alsoIn(story.sources_count)));
   return el;
@@ -82,17 +82,36 @@ export function frontpageHeader(now = new Date(), range = 'today') {
       `${shortDate(now)} / `, h('span', { class: 'home-clock', text: clockTime(now) }), range === '24h' ? ' / Letzte 24 Std' : ' / aus deinen Profilen'));
 }
 
-export function frontpageContent(data, now = new Date()) {
-  // Teilantworten: Einträge ohne Artikel-ID und leere Rubriken fallen weg.
+/** Was die Titelseite zeigt. Teilantworten: Einträge ohne Artikel-ID und leere Rubriken fallen weg. */
+function shown(data) {
   const sections = (Array.isArray(data.sections) ? data.sections : [])
     .filter((s) => s && Array.isArray(s.items))
     .map((s) => ({ ...s, items: s.items.filter(hasArticle) }))
     .filter((s) => s.items.length);
-  const leadStory = hasArticle(data.lead) ? data.lead : null;
+  return { leadStory: hasArticle(data.lead) ? data.lead : null, sections };
+}
+
+/** Artikel der Titelseite in Anzeigereihenfolge (Aufmacher, dann die Rubriken), jeder nur einmal:
+ *  am Handy die Liste für „Nächster“ und die sofortige Vorschau (state.listItems). */
+export function frontpageArticles(data) {
+  const { leadStory, sections } = shown(data || {});
+  const seen = new Set();
+  const out = [];
+  for (const e of [leadStory, ...sections.flatMap((s) => s.items)]) {
+    if (!e || seen.has(e.article.id)) continue;
+    seen.add(e.article.id);
+    out.push(e.article);
+  }
+  return out;
+}
+
+/** keys: false lässt die Tastenhinweise im Leerzustand weg (Handy). */
+export function frontpageContent(data, now = new Date(), { keys = true } = {}) {
+  const { leadStory, sections } = shown(data);
   const top = frontpageHeader(now, data.window);
   if (!leadStory && !sections.length) {
     const empty = emptyState({ title: 'NOCH LEER', text: 'Für die Titelseite gibt es heute noch keine Geschichten aus deinen Profilen.' });
-    empty.append(keyHints());
+    if (keys) empty.append(keyHints());
     return h('div', { class: 'home-page home-page--front' }, top, empty);
   }
   return h('div', { class: 'home-page home-page--front' },

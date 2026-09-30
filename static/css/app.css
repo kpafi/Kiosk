@@ -90,6 +90,18 @@ h1, h2, h3, p { margin: 0; }
 }
 .hdr--home { padding: 18px var(--gutter) 10px; }
 .hdr-wordmark { margin: 0; flex-grow: 1; }
+/* Wortmarke führt zur Titelseite: sieht aus wie Text, Tippfläche 44px hoch. Seitlich etwas Luft für
+   den Fokusring, die Schrift bleibt an ihrer Stelle. */
+.hdr-wordmark-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--tap);
+  padding: 0 6px;
+  margin: 0 -6px;
+  border-radius: var(--radius-sm);
+  color: inherit;
+  text-decoration: none;
+}
 .hdr-title { flex-grow: 1; min-width: 0; }
 .hdr-titles { flex-grow: 1; display: flex; flex-direction: column; min-width: 0; }
 .hdr-titles .t-section { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1001,19 +1013,6 @@ body.has-update #shell:not(.has-bar) #view { padding-bottom: calc(var(--update-s
   .art-view.has-rail .art { padding-bottom: 32px; }
   .art-rail { max-width: var(--art-max); margin: 0 auto; padding: 0 40px 64px; }
   .art-rail-inner { display: flex; flex-direction: column; gap: 32px; padding-top: 24px; border-top: 1px solid var(--hairline); }
-  .rail-head, .home-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; padding-bottom: 12px; }
-  /* Kontextspalte: Titel darf zweizeilig werden, die Zahl bleibt oben rechts. */
-  .rail-head { flex-wrap: nowrap; }
-  .rail-head .t-caption, .home-head .t-caption { margin-left: auto; white-space: nowrap; }
-  .rail-title-sec, .home-sec {
-    font-family: var(--font-dot);
-    font-size: 16px;
-    line-height: 19px;
-    font-weight: 700;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    min-width: 0;
-  }
   .rail-list { display: flex; flex-direction: column; }
   .rail-item {
     display: flex;
@@ -1025,8 +1024,6 @@ body.has-update #shell:not(.has-bar) #view { padding-bottom: calc(var(--update-s
     text-decoration: none;
   }
   .rail-item:first-child { border-top: 0; }
-  .rail-item:focus-visible, .rail-more:focus-visible, .home-story:focus-visible, .home-profile:focus-visible,
-  .fp-lead:focus-visible, .fp-item:focus-visible { outline-offset: 4px; border-radius: var(--radius-sm); }
   .rail-loading { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; padding-top: 4px; }
   .rail-loading .matrix { width: 64px; gap: 8px; margin-bottom: 4px; }
   .rail-loading .matrix span { width: 6px; height: 6px; }
@@ -1034,8 +1031,6 @@ body.has-update #shell:not(.has-bar) #view { padding-bottom: calc(var(--update-s
   .key-hints { font-family: var(--font-sans); font-size: 13px; line-height: 18px; color: var(--muted); text-transform: none; }
   .key-hints span { white-space: nowrap; }
   .empty .key-hints { max-width: none; }
-  .home-error { gap: 8px; }
-  .home-page > .home-error, .home-page > .home-loading { flex: 1 0 auto; height: auto; }
   .rail-title { font-size: 16px; line-height: 22px; font-weight: 500; overflow-wrap: anywhere; }
   .rail-item.is-read .rail-title { color: var(--muted); }
   .rail-more {
@@ -1050,212 +1045,291 @@ body.has-update #shell:not(.has-bar) #view { padding-bottom: calc(var(--update-s
     text-align: left;
   }
 
-  /* Rechte Seite ohne Artikel: Tagesübersicht (E3DesktopUebersicht) und Titelseite
-     (E3DesktopTitelseite). Die Spalte ist 380px (900px Fenster) bis ~1400px breit: Umbruch per
-     Container-Abfrage auf .home. */
-  .home { container-type: inline-size; min-height: 100%; }
-  .home > .reader-empty { height: auto; min-height: 100dvh; }
-  .home-page { display: flex; flex-direction: column; gap: 28px; min-height: 100dvh; padding: 28px 40px; }
-  .home-page--front { gap: 24px; }
-  .home-top { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; }
-  .home-top .t-caption { margin-left: auto; }
-  .home-title {
-    font-family: var(--font-dot);
-    font-size: 32px;
-    line-height: 38px;
-    font-weight: 700;
-    letter-spacing: 0.08em;
-  }
-  .home-tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
-  .home-tile {
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    padding: 18px 20px;
-    border: 1px solid var(--hairline);
-    border-radius: var(--radius-md);
-  }
-  .home-tile-num {
-    font-family: var(--font-dot);
-    font-size: clamp(36px, 5cqi, 56px);
-    line-height: 1.2;
-    font-weight: 700;
-    letter-spacing: 0.04em;
-    white-space: nowrap;
-  }
-  .home-tile-num.is-signal { color: var(--signal-text); }
-  .home-cols { display: flex; gap: 40px; }
-  .home-col--main { flex: 1 1 0; min-width: 0; }
-  .home-col--side { width: 340px; flex-shrink: 0; display: flex; flex-direction: column; gap: 28px; }
-  .home-none { padding-top: 4px; }
-  .home-story {
-    display: flex;
-    align-items: flex-start;
-    gap: 20px;
-    padding: 14px 0;
-    border-top: 1px solid var(--hairline);
-    color: var(--ink);
-    text-decoration: none;
-  }
-  .home-story:first-child { border-top: 0; }
-  .home-story-num {
-    width: 56px;
-    flex-shrink: 0;
-    font-family: var(--font-dot);
-    font-size: 32px;
-    line-height: 38px;
-    font-weight: 700;
-    letter-spacing: 0.08em;
-    color: var(--signal-text);
-  }
-  .home-story-text { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-  .home-story-title { font-size: 18px; line-height: 24px; font-weight: 500; overflow-wrap: anywhere; }
-  .hist-grid { display: flex; gap: 5px; }
-  .hist-col { display: flex; flex-direction: column; gap: 4px; }
-  .hist-col span { width: 7px; height: 7px; border-radius: var(--radius-pill); background: var(--hairline); }
-  .hist-col--past span.on { background: var(--ink); }
-  .hist-col--now span.on { background: var(--signal); }
-  .hist-axis { display: grid; grid-template-columns: repeat(24, 7px); column-gap: 5px; padding-top: 8px; }
-  .hist-axis span { grid-row: 1; white-space: nowrap; }
-  .home-profile {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    min-height: 48px;
-    border-top: 1px solid var(--hairline);
-    color: var(--ink);
-    text-decoration: none;
-  }
-  .home-profile:first-child { border-top: 0; }
-  .home-profile-name { flex-grow: 1; min-width: 0; font-size: 16px; line-height: 22px; font-weight: 500; overflow-wrap: anywhere; }
-  .home-profile-num {
-    font-family: var(--font-dot);
-    font-size: 18px;
-    line-height: 21px;
-    font-weight: 700;
-    letter-spacing: 0.08em;
-    color: var(--signal-text);
-  }
-  .home-keys { margin-top: auto; }
-
-  .fp-lead {
-    display: flex;
-    gap: 32px;
-    padding-bottom: 24px;
-    border-bottom: 1px solid var(--hairline);
-    color: var(--ink);
-    text-decoration: none;
-  }
-  .fp-lead-img {
-    width: 50%;
-    max-width: 540px;
-    height: 300px;
-    flex-shrink: 0;
-    object-fit: cover;
-    border-radius: var(--radius-md);
-    background: var(--raised-2);
-  }
-  .fp-lead-text { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; justify-content: center; gap: 14px; }
-  .fp-lead-title {
-    font-size: calc(36px * var(--scale));
-    line-height: calc(42px * var(--scale));
-    font-weight: 500;
-    letter-spacing: -0.01em;
-    overflow-wrap: anywhere;
-  }
-  .fp-lead-summary {
-    font-size: calc(17px * var(--scale));
-    line-height: calc(26px * var(--scale));
-    color: var(--muted);
-    overflow: hidden;
-    display: -webkit-box;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 4;
-    line-clamp: 4;
-  }
-  .fp-also { color: var(--signal-text); }
-  .fp-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px; }
-  .fp-item { min-width: 0; display: flex; flex-direction: column; gap: 10px; color: var(--ink); text-decoration: none; }
-  .fp-item--noimg { padding-top: 12px; border-top: 1px solid var(--hairline); }
-  .fp-item-img--none { flex-shrink: 0; }
-  .fp-item-img {
-    display: block;
-    width: 100%;
-    height: 150px;
-    object-fit: cover;
-    border-radius: var(--radius-md);
-    background: var(--raised-2);
-  }
-  .fp-item-title {
-    font-size: calc(18px * var(--scale));
-    line-height: calc(24px * var(--scale));
-    font-weight: 500;
-    overflow-wrap: anywhere;
-  }
-  .fp-item-title.is-read { color: var(--muted); }
-
-  @container (max-width: 859px) {
-    .home-cols { flex-direction: column; gap: 28px; }
-    .home-col--side { width: auto; }
-    .fp-lead { flex-direction: column; gap: 16px; }
-    .fp-lead-img { width: 100%; max-width: none; height: 240px; }
-    .fp-lead-title { font-size: calc(28px * var(--scale)); line-height: calc(34px * var(--scale)); }
-    .fp-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  }
-  @container (max-width: 639px) {
-    .home-page { gap: 24px; padding: 24px; }
-    .home-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-    .home-tile { padding: 14px 16px; }
-    .home-tile-num { font-size: 36px; }
-  }
-  /* Karte quer (Bild links in Spaltenbreite, Text rechts): einzige Karte einer Rubrik ab zwei
-     Spalten, und bei zwei Spalten eine dritte Karte allein in ihrer Zeile. Ohne Bild (auch ohne
-     Platzhalter) nur Text mit Linie oben. */
-  @container (min-width: 560px) {
-    .fp-grid > .fp-item:only-child { grid-column: 1 / -1; }
-    .fp-grid > .fp-item:only-child:not(.fp-item--noimg):not(.fp-item--ph) {
-      display: grid;
-      grid-template-columns: calc((100% - 48px) / 3) minmax(0, 1fr);
-      grid-template-rows: auto 1fr;
-      column-gap: 24px;
-      row-gap: 10px;
-    }
-    .fp-grid > .fp-item:only-child:not(.fp-item--noimg):not(.fp-item--ph) > .fp-item-img { grid-column: 1; grid-row: 1 / span 2; }
-    .fp-grid > .fp-item:only-child:not(.fp-item--noimg):not(.fp-item--ph) > :not(.fp-item-img) { grid-column: 2; }
-    .fp-grid > .fp-item--ph:only-child > .fp-item-img--none { display: none; }
-    .fp-grid > .fp-item--ph:only-child { padding-top: 12px; border-top: 1px solid var(--hairline); }
-  }
-  @container (min-width: 560px) and (max-width: 859px) {
-    .fp-grid > .fp-item:nth-child(3):last-child { grid-column: 1 / -1; }
-    .fp-grid > .fp-item:only-child:not(.fp-item--noimg):not(.fp-item--ph),
-    .fp-grid > .fp-item:nth-child(3):last-child:not(.fp-item--noimg):not(.fp-item--ph) {
-      display: grid;
-      grid-template-columns: calc((100% - 24px) / 2) minmax(0, 1fr);
-      grid-template-rows: auto 1fr;
-      column-gap: 24px;
-      row-gap: 10px;
-    }
-    .fp-grid > .fp-item:nth-child(3):last-child:not(.fp-item--noimg):not(.fp-item--ph) > .fp-item-img { grid-column: 1; grid-row: 1 / span 2; }
-    .fp-grid > .fp-item:nth-child(3):last-child:not(.fp-item--noimg):not(.fp-item--ph) > :not(.fp-item-img) { grid-column: 2; }
-    .fp-grid > .fp-item--ph:nth-child(3):last-child > .fp-item-img--none { display: none; }
-    .fp-grid > .fp-item--ph:nth-child(3):last-child { padding-top: 12px; border-top: 1px solid var(--hairline); }
-  }
-  @container (max-width: 559px) {
-    .fp-grid { grid-template-columns: minmax(0, 1fr); }
-    /* Eine Spalte: keine grauen Flächen für fehlende Bilder, stattdessen die Linie oben. */
-    .fp-item-img--none { display: none; }
-    .fp-item--ph { padding-top: 12px; border-top: 1px solid var(--hairline); }
-    .fp-lead-img { height: 200px; }
-    .fp-lead-title { font-size: calc(24px * var(--scale)); line-height: calc(30px * var(--scale)); }
-  }
-
   /* Einstellungen: Abschnitt „Am PC“ (E3DesktopEinstellungen). */
   .set-pc { display: flex; flex-direction: column; padding-bottom: 16px; }
   .sec-pc { display: flex; align-items: center; gap: 12px; padding: 20px 0 8px; }
   .badge-signal { padding: 2px 8px; border: 1px solid var(--signal); border-radius: var(--radius-pill); color: var(--signal-text); }
   .set-label { padding: 4px 0 8px; }
 }
+
+/* ---- Tagesübersicht und Titelseite ---------------------------------------------------------
+   Rechte Seite am Desktop ohne Artikel: Tagesübersicht (E3DesktopUebersicht) oder Titelseite
+   (E3DesktopTitelseite); die Titelseite am Handy auch als eigene Seite (#/titelseite, .view-front).
+   Die Spalte ist 320px (Handy) bis ~1400px breit: Umbruch per Container-Abfrage auf .home. Die
+   Abschnittsköpfe teilt sich die Kontextspalte der Leseansicht (nur am Desktop). */
+.rail-head, .home-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; padding-bottom: 12px; }
+/* Kontextspalte: Titel darf zweizeilig werden, die Zahl bleibt oben rechts. */
+.rail-head { flex-wrap: nowrap; }
+.rail-head .t-caption, .home-head .t-caption { margin-left: auto; white-space: nowrap; }
+.rail-title-sec, .home-sec {
+  font-family: var(--font-dot);
+  font-size: 16px;
+  line-height: 19px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  min-width: 0;
+}
+.rail-item:focus-visible, .rail-more:focus-visible, .home-story:focus-visible, .home-profile:focus-visible,
+.fp-lead:focus-visible, .fp-item:focus-visible { outline-offset: 4px; border-radius: var(--radius-sm); }
+.home-error { gap: 8px; }
+.home-page > .home-error, .home-page > .home-loading { flex: 1 0 auto; height: auto; }
+.home { container-type: inline-size; }
+.home-page { display: flex; flex-direction: column; gap: 28px; padding: 28px 40px; }
+.home-page--front { gap: 24px; }
+.home-top { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; }
+.home-top .t-caption { margin-left: auto; }
+.home-title {
+  font-family: var(--font-dot);
+  font-size: 32px;
+  line-height: 38px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+.home-tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
+.home-tile {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 18px 20px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-md);
+}
+.home-tile-num {
+  font-family: var(--font-dot);
+  font-size: clamp(36px, 5cqi, 56px);
+  line-height: 1.2;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.home-tile-num.is-signal { color: var(--signal-text); }
+.home-cols { display: flex; gap: 40px; }
+.home-col--main { flex: 1 1 0; min-width: 0; }
+.home-col--side { width: 340px; flex-shrink: 0; display: flex; flex-direction: column; gap: 28px; }
+.home-none { padding-top: 4px; }
+.home-story {
+  display: flex;
+  align-items: flex-start;
+  gap: 20px;
+  padding: 14px 0;
+  border-top: 1px solid var(--hairline);
+  color: var(--ink);
+  text-decoration: none;
+}
+.home-story:first-child { border-top: 0; }
+.home-story-num {
+  width: 56px;
+  flex-shrink: 0;
+  font-family: var(--font-dot);
+  font-size: 32px;
+  line-height: 38px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--signal-text);
+}
+.home-story-text { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.home-story-title { font-size: 18px; line-height: 24px; font-weight: 500; overflow-wrap: anywhere; }
+.hist-grid { display: flex; gap: 5px; }
+.hist-col { display: flex; flex-direction: column; gap: 4px; }
+.hist-col span { width: 7px; height: 7px; border-radius: var(--radius-pill); background: var(--hairline); }
+.hist-col--past span.on { background: var(--ink); }
+.hist-col--now span.on { background: var(--signal); }
+.hist-axis { display: grid; grid-template-columns: repeat(24, 7px); column-gap: 5px; padding-top: 8px; }
+.hist-axis span { grid-row: 1; white-space: nowrap; }
+.home-profile {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 48px;
+  border-top: 1px solid var(--hairline);
+  color: var(--ink);
+  text-decoration: none;
+}
+.home-profile:first-child { border-top: 0; }
+.home-profile-name { flex-grow: 1; min-width: 0; font-size: 16px; line-height: 22px; font-weight: 500; overflow-wrap: anywhere; }
+.home-profile-num {
+  font-family: var(--font-dot);
+  font-size: 18px;
+  line-height: 21px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--signal-text);
+}
+.home-keys { margin-top: auto; }
+
+.fp-lead {
+  display: flex;
+  gap: 32px;
+  padding-bottom: 24px;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--ink);
+  text-decoration: none;
+}
+.fp-lead-img {
+  width: 50%;
+  max-width: 540px;
+  height: 300px;
+  flex-shrink: 0;
+  object-fit: cover;
+  border-radius: var(--radius-md);
+  background: var(--raised-2);
+}
+.fp-lead-text { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; justify-content: center; gap: 14px; }
+.fp-lead-title {
+  font-size: calc(36px * var(--scale));
+  line-height: calc(42px * var(--scale));
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+.fp-lead-title.is-read { color: var(--muted); }
+.fp-lead-summary {
+  font-size: calc(17px * var(--scale));
+  line-height: calc(26px * var(--scale));
+  color: var(--muted);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+  line-clamp: 4;
+}
+.fp-also { color: var(--signal-text); }
+.fp-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px; }
+.fp-item { min-width: 0; display: flex; flex-direction: column; gap: 10px; color: var(--ink); text-decoration: none; }
+.fp-item--noimg { padding-top: 12px; border-top: 1px solid var(--hairline); }
+.fp-item-img--none { flex-shrink: 0; }
+.fp-item-img {
+  display: block;
+  width: 100%;
+  height: 150px;
+  object-fit: cover;
+  border-radius: var(--radius-md);
+  background: var(--raised-2);
+}
+.fp-item-title {
+  font-size: calc(18px * var(--scale));
+  line-height: calc(24px * var(--scale));
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+.fp-item-title.is-read { color: var(--muted); }
+
+@container (max-width: 859px) {
+  .home-cols { flex-direction: column; gap: 28px; }
+  .home-col--side { width: auto; }
+  .fp-lead { flex-direction: column; gap: 16px; }
+  .fp-lead-img { width: 100%; max-width: none; height: 240px; }
+  .fp-lead-title { font-size: calc(28px * var(--scale)); line-height: calc(34px * var(--scale)); }
+  .fp-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@container (max-width: 639px) {
+  .home-page { gap: 24px; padding: 24px; }
+  .home-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .home-tile { padding: 14px 16px; }
+  .home-tile-num { font-size: 36px; }
+}
+/* Karte quer (Bild links in Spaltenbreite, Text rechts): einzige Karte einer Rubrik ab zwei
+   Spalten, und bei zwei Spalten eine dritte Karte allein in ihrer Zeile. Ohne Bild (auch ohne
+   Platzhalter) nur Text mit Linie oben. */
+@container (min-width: 560px) {
+  .fp-grid > .fp-item:only-child { grid-column: 1 / -1; }
+  .fp-grid > .fp-item:only-child:not(.fp-item--noimg):not(.fp-item--ph) {
+    display: grid;
+    grid-template-columns: calc((100% - 48px) / 3) minmax(0, 1fr);
+    grid-template-rows: auto 1fr;
+    column-gap: 24px;
+    row-gap: 10px;
+  }
+  .fp-grid > .fp-item:only-child:not(.fp-item--noimg):not(.fp-item--ph) > .fp-item-img { grid-column: 1; grid-row: 1 / span 2; }
+  .fp-grid > .fp-item:only-child:not(.fp-item--noimg):not(.fp-item--ph) > :not(.fp-item-img) { grid-column: 2; }
+  .fp-grid > .fp-item--ph:only-child > .fp-item-img--none { display: none; }
+  .fp-grid > .fp-item--ph:only-child { padding-top: 12px; border-top: 1px solid var(--hairline); }
+}
+@container (min-width: 560px) and (max-width: 859px) {
+  .fp-grid > .fp-item:nth-child(3):last-child { grid-column: 1 / -1; }
+  .fp-grid > .fp-item:only-child:not(.fp-item--noimg):not(.fp-item--ph),
+  .fp-grid > .fp-item:nth-child(3):last-child:not(.fp-item--noimg):not(.fp-item--ph) {
+    display: grid;
+    grid-template-columns: calc((100% - 24px) / 2) minmax(0, 1fr);
+    grid-template-rows: auto 1fr;
+    column-gap: 24px;
+    row-gap: 10px;
+  }
+  .fp-grid > .fp-item:nth-child(3):last-child:not(.fp-item--noimg):not(.fp-item--ph) > .fp-item-img { grid-column: 1; grid-row: 1 / span 2; }
+  .fp-grid > .fp-item:nth-child(3):last-child:not(.fp-item--noimg):not(.fp-item--ph) > :not(.fp-item-img) { grid-column: 2; }
+  .fp-grid > .fp-item--ph:nth-child(3):last-child > .fp-item-img--none { display: none; }
+  .fp-grid > .fp-item--ph:nth-child(3):last-child { padding-top: 12px; border-top: 1px solid var(--hairline); }
+}
+@container (max-width: 559px) {
+  .fp-grid { grid-template-columns: minmax(0, 1fr); }
+  /* Eine Spalte: keine grauen Flächen für fehlende Bilder, stattdessen die Linie oben. */
+  .fp-item-img--none { display: none; }
+  .fp-item--ph { padding-top: 12px; border-top: 1px solid var(--hairline); }
+  .fp-lead-img { height: 200px; }
+  .fp-lead-title { font-size: calc(24px * var(--scale)); line-height: calc(30px * var(--scale)); }
+}
+
+@media (min-width: 900px) {
+  .home { min-height: 100%; }
+  .home > .reader-empty { height: auto; min-height: 100dvh; }
+  .home-page { min-height: 100dvh; }
+}
+
+/* Handy: unter dem Kopf der Liste, Ränder wie die Liste; Platz über der Leiste und der Pille
+   „Neue Version“ hält #view (has-bar). Laden, Fehler und Leerzustand füllen die freie Höhe. */
+.view-front .home { flex: 1 0 auto; display: flex; flex-direction: column; }
+.view-front .home-page { flex: 1 0 auto; padding: 12px var(--gutter) 8px; }
+.view-front .home-page > .empty { flex: 1 0 auto; }
+/* Überschrift wie die anderen Seitentitel am Handy (Punktmatrix 20/24), Datum und Uhr darunter. */
+.view-front .home-top { flex-direction: column; align-items: flex-start; gap: 4px; }
+.view-front .home-top .t-caption { margin-left: 0; }
+.view-front .home-title { font-size: 20px; line-height: 24px; }
+.view-front .fp-lead-summary {
+  font-size: calc(15px * var(--scale));
+  line-height: calc(22px * var(--scale));
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+}
+/* Linie zwischen den Rubriken, sonst läuft der Rubrikkopf in die Zeile davor. */
+.view-front .fp-sec + .fp-sec { padding-top: 24px; border-top: 1px solid var(--hairline); }
+/* Am Handy ist .home kein Container: Die Karten-Raster der Container-Abfragen (2 und 3 Spalten, breite
+   Einzelkarten ab 560px) gelten nicht, bis 899px bleibt es beim Aufmacher oben und Listenzeilen. */
+.view-front .home { container-type: normal; }
+.view-front .fp-lead { flex-direction: column; gap: 16px; }
+.view-front .fp-lead-img { width: 100%; max-width: none; height: 200px; }
+.view-front .fp-lead-title { font-size: calc(24px * var(--scale)); line-height: calc(30px * var(--scale)); }
+/* Rubriken als Zeilen wie in der Liste (E2Liste): links Meta und Titel, rechts oben das Bild (80px).
+   Ohne Bild, auch wenn es nicht lädt (fp-item--ph, Platzhalter weg) oder Bilder aus sind
+   (fp-item--noimg): nur Text über die ganze Breite. Zwischen den Zeilen eine Linie, nicht über der
+   ersten (darüber steht der Rubrikkopf). */
+.view-front .fp-grid { display: flex; flex-direction: column; gap: 0; }
+.view-front .fp-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  column-gap: var(--space-4);
+  row-gap: var(--space-2);
+  min-height: var(--tap);
+  padding: 14px 0;
+  border-top: 1px solid var(--hairline);
+}
+.view-front .fp-item:first-child { border-top: 0; }
+.view-front .fp-item:not(.fp-item--ph):not(.fp-item--noimg) {
+  grid-template-columns: minmax(0, 1fr) var(--thumb);
+  grid-template-rows: auto 1fr;
+}
+.view-front .fp-item > * { grid-column: 1; }
+.view-front .fp-item > .fp-item-img {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  width: var(--thumb);
+  height: var(--thumb);
+  border-radius: var(--radius-sm);
+}
+.view-front .fp-item > .fp-item-img--none { display: none; }
+.view-front .fp-item:focus-visible { outline-offset: -2px; border-radius: var(--radius-md); }
 
 /* … ab 880px Breite der Leseansicht (bei 520px Liste: 1400px Fenster) ohne Fokusmodus als eigene
    Spalte rechts, die beim Scrollen stehen bleibt. */

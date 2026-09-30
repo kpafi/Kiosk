@@ -51,6 +51,7 @@ const SHELL = [
   '/js/views/home.js',
   '/js/views/overview.js',
   '/js/views/frontpage.js',
+  '/js/views/front.js',
   '/fonts/doto-700-latin.woff2',
   '/fonts/space-grotesk-latin.woff2',
   '/fonts/space-grotesk-latin-ext.woff2',

@@ -4,6 +4,7 @@
 // wieder in den Vordergrund kommt, wenn die Einstellung wechselt, Profile sich ändern und wenn in der
 // Zeitzone des Servers ein neuer Tag beginnt. Solange sie zu sehen ist, geht die Uhr im Kopf jede
 // Minute weiter (ein Zeitgeber, kein Abfragen des Servers).
+// Am Handy zeigt views/front.js mit derselben Logik die Titelseite als eigene Seite (#/titelseite).
 import { h, isDesktop, replace } from '../ui/dom.js';
 import { matrix } from '../ui/empty.js';
 import { api } from '../api.js';
@@ -33,13 +34,14 @@ function loading(kind, now) {
       matrix(), h('p', { class: 't-caption muted', text: 'Lädt' })));
 }
 
-/** Fehler ohne gezeigte Daten: Kopf wie sonst, darunter ein kurzer Hinweis und die Tastenhinweise. */
-function unreachable(kind, now) {
+/** Fehler ohne gezeigte Daten: Kopf wie sonst, darunter ein kurzer Hinweis und die Tastenhinweise
+ *  (Desktop) bzw. „Erneut versuchen“ (Handy: retry). */
+function unreachable(kind, now, retry = null) {
   return h('div', { class: 'home-page' },
     header(kind, now),
     h('div', { class: 'reader-empty home-error' },
       h('p', { class: 't-teaser muted', text: `${LABEL[kind]} gerade nicht erreichbar` }),
-      keyHints()));
+      retry ? h('button', { type: 'button', class: 'pill', text: 'Erneut versuchen', on: { click: retry } }) : keyHints()));
 }
 
 /**
@@ -54,7 +56,14 @@ function serverOffset(nowHour, started, ended) {
   return diff;
 }
 
-export function readerHome() {
+/**
+ * @param {object} [o]
+ * @param {'overview'|'frontpage'|null} [o.kind]  fest gezeigte Seite; null = nach desktop_empty
+ * @param {boolean} [o.desktopOnly]  true: rechte Seite am Desktop (nur dort sichtbar, beschriftet
+ *   #reader, Tastenhinweise). false: eigene Seite am Handy, ohne all das.
+ * @param {function} [o.onData]  bekommt die Antwort, sobald sie gezeichnet ist
+ */
+export function readerHome({ kind: fixedKind = null, desktopOnly = true, onData = null } = {}) {
   const el = h('div', { class: 'home' });
   let visible = false;
   let shownKind = null;    // was gerade gezeigt wird ('overview', 'frontpage' oder null = nichts)
@@ -70,8 +79,10 @@ export function readerHome() {
   /** Jetzt in der Zeitzone des Servers (als Datum mit verschobener Ortszeit). */
   const serverNow = () => new Date(Date.now() + offsetH * 3600000);
 
+  const kindNow = () => fixedKind || kindOf();
+
   function label() {
-    return LABEL[kindOf()];
+    return LABEL[kindNow()];
   }
 
   function paintClock() {
@@ -99,9 +110,9 @@ export function readerHome() {
     ctrl?.abort();
     ctrl = new AbortController();
     const { signal } = ctrl;
-    const kind = kindOf();
+    const kind = kindNow();
     lastStart = Date.now();
-    if (el.parentElement && !el.parentElement.querySelector('.art-view')) el.parentElement.setAttribute('aria-label', LABEL[kind]);
+    if (desktopOnly && el.parentElement && !el.parentElement.querySelector('.art-view')) el.parentElement.setAttribute('aria-label', LABEL[kind]);
     if (shownKind !== kind) {
       shownKind = null;
       replace(el, loading(kind, serverNow()));
@@ -133,14 +144,18 @@ export function readerHome() {
       el.removeAttribute('aria-busy');
       // Tastaturfokus auf einem Link überlebt das Neuzeichnen (gleiches Ziel, falls noch da).
       const focused = el.contains(document.activeElement) ? document.activeElement.getAttribute('href') : null;
-      replace(el, kind === 'frontpage' ? frontpageContent(d, now) : overviewContent(d, now));
+      replace(el, kind === 'frontpage' ? frontpageContent(d, now, { keys: desktopOnly }) : overviewContent(d, now));
       shownKind = kind;
       if (focused) el.querySelector(`a[href="${CSS.escape(focused)}"]`)?.focus({ preventScroll: true });
+      onData?.(d);
     } catch (err) {
       if (signal.aborted || (err && err.name === 'AbortError')) return;
       el.removeAttribute('aria-busy');
-      // Gezeigtes bleibt stehen; ohne Inhalt ein kurzer Hinweis mit den Tastenhinweisen.
-      if (shownKind !== kind) { replace(el, unreachable(kind, serverNow())); shownKind = null; }
+      // Gezeigtes bleibt stehen; ohne Inhalt ein kurzer Hinweis mit den Tastenhinweisen (Handy: Knopf).
+      if (shownKind !== kind) {
+        replace(el, unreachable(kind, serverNow(), desktopOnly ? null : () => refresh()));
+        shownKind = null;
+      }
     }
   }
 
@@ -157,20 +172,35 @@ export function readerHome() {
     timer = setTimeout(fire, REFRESH_MS);
   }
 
-  on('unread-changed', schedule);
-  on('profiles', schedule);
-  on('flags', (patch) => { if ('read' in patch || 'later' in patch) schedule(); });
-  on('settings', (patch) => { if ('desktop_empty' in patch) refresh(); });
-  document.addEventListener('visibilitychange', () => {
+  function onVisibility() {
     if (document.visibilityState === 'visible' && state.authed) schedule();
-  });
+  }
+  const offs = [
+    on('unread-changed', schedule),
+    on('profiles', schedule),
+    on('flags', (patch) => { if ('read' in patch || 'later' in patch) schedule(); }),
+    on('settings', (patch) => { if ('desktop_empty' in patch && !fixedKind) refresh(); }),
+  ];
+  document.addEventListener('visibilitychange', onVisibility);
+
+  /** Beim Benutzerwechsel: nichts vom vorigen Benutzer stehen lassen. */
+  function reset() {
+    clearTimeout(timer);
+    clearTimeout(tick);
+    ctrl?.abort();
+    visible = false;
+    shownKind = null;
+    shownDay = null;
+    shownHour = null;
+    replace(el);
+  }
 
   return {
     el,
     label,
     /** Sichtbarkeit setzen; beim Einblenden neu laden. */
     setVisible(value) {
-      const next = !!value && isDesktop();
+      const next = !!value && (!desktopOnly || isDesktop());
       if (next === visible) return;
       visible = next;
       if (visible) {
@@ -182,16 +212,12 @@ export function readerHome() {
         ctrl?.abort();
       }
     },
-    /** Beim Benutzerwechsel: nichts vom vorigen Benutzer stehen lassen. */
-    reset() {
-      clearTimeout(timer);
-      clearTimeout(tick);
-      ctrl?.abort();
-      visible = false;
-      shownKind = null;
-      shownDay = null;
-      shownHour = null;
-      replace(el);
+    reset,
+    /** Ansicht verworfen (Handy-Seite): Zeitgeber, Anfragen und Abonnements beenden. */
+    destroy() {
+      reset();
+      offs.forEach((off) => off());
+      document.removeEventListener('visibilitychange', onVisibility);
     },
   };
 }

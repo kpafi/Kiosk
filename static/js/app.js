@@ -15,9 +15,10 @@ import { listView } from './views/list.js';
 import { articleView } from './views/article.js';
 import { readerHome } from './views/home.js';
 import { installFocusRail, settleFocus } from './views/focus.js';
-import { barWanted as layoutBarWanted, homeVisible } from './layout.js';
+import { barWanted as layoutBarWanted, homeVisible, opensOnFront, startHash } from './layout.js';
 import { savedView } from './views/saved.js';
 import { searchView } from './views/search.js';
+import { frontView } from './views/front.js';
 import { sourceView } from './views/sourceView.js';
 import { settingsView } from './views/settings.js';
 import { sourcesView } from './views/sources.js';
@@ -34,7 +35,8 @@ const shell = document.getElementById('shell');
 const viewEl = document.getElementById('view');
 const readerEl = document.getElementById('reader');
 
-const LIST_VIEWS = { list: listView, source: sourceView, search: searchView, saved: savedView };
+// Titelseite (front) nur am Handy: dort bleibt sie wie eine Liste unter einem offenen Artikel stehen.
+const LIST_VIEWS = { list: listView, source: sourceView, search: searchView, saved: savedView, front: frontView };
 const PAGE_VIEWS = { settings: settingsView, sources: sourcesView, editor: profileEditorView };
 
 let current = { key: null, view: null };   // Inhalt von #view
@@ -64,10 +66,13 @@ function focusView(view) {
   viewEl.focus({ preventScroll: true });
 }
 
-/** Für Leseansicht und Profil-Blatt: links muss eine Liste stehen. */
+/** Für Leseansicht und Profil-Blatt: links muss eine Liste stehen. Am Desktop nie die Titelseite
+ *  (die steht dort rechts), dann die Startliste. */
 function ensureList() {
-  if (current.view && current.view.layout === 'list') return current.view;
-  const r = parseHash(state.lastListHash);
+  const desktopFront = isDesktop() && current.key === 'front';
+  if (current.view && current.view.layout === 'list' && !desktopFront) return current.view;
+  let r = parseHash(state.lastListHash);
+  if (r.name === 'front' && isDesktop()) r = parseHash('#/');
   return mount(LIST_VIEWS[r.name] ? r : parseHash('#/'), LIST_VIEWS[r.name] || listView);
 }
 
@@ -133,11 +138,11 @@ function showLogin() {
 }
 
 /** Ziel nach dem Anmelden. Profil-Adressen (#/profile/<id>, #/?p=<id>) gehören evtl. einem anderen
- *  Benutzer (Profil-IDs sind je Benutzer): dann lieber zur Startliste. */
+ *  Benutzer (Profil-IDs sind je Benutzer): dann lieber zur Startseite (Handy: Titelseite). */
 function loginTarget(hash) {
-  if (!hash || hash.startsWith('#/login')) return '#/';
+  if (!hash || hash.startsWith('#/login')) return startHash(isDesktop());
   const r = parseHash(hash);
-  if (r.name === 'editor' || (r.name === 'list' && r.params.get('p'))) return '#/';
+  if (r.name === 'editor' || (r.name === 'list' && r.params.get('p'))) return startHash(isDesktop());
   return hash;
 }
 
@@ -152,9 +157,9 @@ async function loggedIn() {
   afterLogin = null;
   afterLoginUser = null;
   // Die gemerkte Adresse gilt für denselben Benutzer und beim Kaltstart ohne vorherige Sitzung
-  // (Lesezeichen wie #/s/taz); wer sich als jemand anderes anmeldet, beginnt auf der Startliste.
+  // (Lesezeichen wie #/s/taz); wer sich als jemand anderes anmeldet, beginnt auf der Startseite.
   const same = savedUser === null || (state.user && state.user.id === savedUser);
-  replaceHash(same ? loginTarget(saved) : '#/');
+  replaceHash(same ? loginTarget(saved) : startHash(isDesktop()));
 }
 
 let routedHash = null;   // Adresse des letzten route()-Aufrufs
@@ -167,12 +172,15 @@ function route() {
   if (state.authed === null) return;           // Start läuft noch
   if (!state.authed) { showLogin(); return; }
   if (r.name === 'login') { replaceHash('#/'); return; }
+  // Titelseite am Desktop: steht rechts neben der Liste (Einstellung desktop_empty), nicht links.
+  if (r.name === 'front' && isDesktop()) { replaceHash('#/'); return; }
 
   if (r.name !== 'profiles' && isSheetOpen()) closeSheet({ silent: true });
   const wasArticle = shell.dataset.layout === 'article';
 
   if (r.name === 'article') {
-    ensureList();
+    const list = ensureList();
+    if (!isDesktop()) list.onCover?.(true);   // Handy: Liste bzw. Titelseite liegt unsichtbar darunter
     if (!wasArticle) listScroll = window.scrollY;
     reader?.destroy();
     reader = articleView(r.id);
@@ -194,7 +202,7 @@ function route() {
 
   closeReader();
   if (r.name === 'profiles') {
-    ensureList();
+    ensureList().onCover?.(false);   // unter dem Blatt wieder zu sehen
     setLayout('list');
     setTitle({ title: 'Profile' });
     openProfiles(r);
@@ -214,13 +222,14 @@ function route() {
     viewEl.scrollTop = 0;
   } else if (wasArticle && !isDesktop()) {
     // Zurück zur (wiederverwendeten) Liste: Scrollstand wiederherstellen, dann Fokus auf die Zeile
-    // des zuletzt geöffneten Artikels (fehlt sie, auf die Liste), damit Tastatur und Vorleser dort
-    // weitermachen.
+    // (Titelseite: Aufmacher oder Karte) des zuletzt geöffneten Artikels (fehlt sie, auf die Liste),
+    // damit Tastatur und Vorleser dort weitermachen.
     const id = openedId;
     requestAnimationFrame(() => {
       window.scrollTo(0, listScroll);
       if (current.view !== view || isSheetOpen()) return;
-      const row = id != null ? viewEl.querySelector(`.row[data-id="${id}"]`) : null;
+      const row = id != null
+        ? viewEl.querySelector(`.row[data-id="${id}"], .fp-lead[href="#/a/${id}"], .fp-item[href="#/a/${id}"]`) : null;
       (row || viewEl).focus({ preventScroll: true });
       // Nach mehrfach „Nächster“ kann die Zeile außerhalb des Bildes liegen: dann heranholen.
       if (row) {
@@ -368,11 +377,24 @@ async function boot() {
   window.addEventListener('online', () => versions.check({ force: true }));
   scheduleMidnightRefresh();
   desktopQuery.addEventListener('change', () => {
+    // Handy → Desktop mit der Titelseite links: auf der Titelseite selbst leitet route() zur Liste um,
+    // unter einem Artikel oder Blatt tritt die Startliste an ihre Stelle.
+    if (isDesktop() && current.key === 'front') {
+      if (parseHash(location.hash).name === 'front') { route(); return; }
+      ensureList();
+    }
     showBar(barWanted());
     syncHome();
   });
   // Fokusmodus blendet die Leiste aus (nur mit offenem Artikel am Desktop, siehe barWanted).
   on('settings', (patch) => { if ('focus_mode' in patch) showBar(barWanted()); });
+
+  // Am Handy beginnt die App auf der Titelseite (ohne eigenen Verlaufseintrag: Zurück verlässt die
+  // App). Nur beim ersten Start, nicht bei „Erneut versuchen“ im Offline-Hinweis.
+  const navType = performance.getEntriesByType('navigation')[0]?.type;
+  if (opensOnFront({ hash: location.hash, desktop: isDesktop(), navType })) {
+    history.replaceState(history.state, '', '#/titelseite');
+  }
 
   registerServiceWorker();
   await start();

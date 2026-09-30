@@ -32,7 +32,7 @@ console.log(JSON.stringify({
   cleanText: [fmt.cleanText(' None '), fmt.cleanText('null'), fmt.cleanText('Titel', ' titel '),
               fmt.cleanText('  Echter Text '), fmt.cleanText(undefined)],
   routes: ['', '#/', '#/?p=4', '#/a/12', '#/a/x', '#/s/taz', '#/gemerkt?tab=favoriten',
-           '#/profile', '#/profile/neu', '#/profile#zeitungen', '#/quatsch'].map(route),
+           '#/profile', '#/profile/neu', '#/profile#zeitungen', '#/quatsch', '#/titelseite'].map(route),
 }));
 """
 
@@ -64,7 +64,8 @@ def test_clean_text(out):
 
 def test_parse_hash(out):
     r = {h: v for h, v in zip(['', '#/', '#/?p=4', '#/a/12', '#/a/x', '#/s/taz', '#/gemerkt?tab=favoriten',
-                               '#/profile', '#/profile/neu', '#/profile#zeitungen', '#/quatsch'], out["routes"])}
+                               '#/profile', '#/profile/neu', '#/profile#zeitungen', '#/quatsch', '#/titelseite'],
+                              out["routes"])}
     assert r[""]["name"] == "list" and r[""]["key"] == "list:"
     assert r["#/?p=4"]["key"] == "list:4" and r["#/?p=4"]["p"] == "4"
     assert r["#/a/12"]["name"] == "article" and r["#/a/12"]["id"] == "12"
@@ -74,6 +75,8 @@ def test_parse_hash(out):
     assert r["#/profile"]["name"] == "profiles" and r["#/profile#zeitungen"]["frag"] == "zeitungen"
     assert r["#/profile/neu"]["name"] == "editor" and r["#/profile/neu"]["id"] == "neu"
     assert r["#/quatsch"]["name"] == "list" and r["#/quatsch"]["hash"] == "#/"
+    assert r["#/titelseite"]["name"] == "front" and r["#/titelseite"]["key"] == "front"
+    assert r["#/titelseite"]["hash"] == "#/titelseite"
 
 
 def test_image_key_matches_python():
@@ -288,7 +291,7 @@ for (const id of ['shell', 'view', 'reader', 'focus-rail', 'bar']) { ids[id] = n
 ids.bar.hidden = true;
 globalThis.Node = FakeNode;
 globalThis.document = { createElement: (t) => new FakeEl(t), createElementNS: (ns, t) => new FakeEl(t),
-  createTextNode: (t) => new FakeText(t), getElementById: (id) => ids[id] || null, addEventListener() {},
+  createTextNode: (t) => new FakeText(t), getElementById: (id) => ids[id] || null, addEventListener() {}, removeEventListener() {},
   querySelector: () => null, querySelectorAll: () => [], documentElement: new FakeEl('html'), body: new FakeEl('body'),
   activeElement: null, visibilityState: 'visible' };
 let desktop = true;
@@ -407,6 +410,125 @@ console.log(JSON.stringify({
     # Fokusmodus blendet die Leiste nur mit offenem Artikel aus; am Handy mit Artikel nie.
     assert got["bar"] == [True, True, False, False, True, False, False, False]
     assert got["home"] == [True, False, False, False, False]
+
+
+def test_start_hash_and_opens_on_front():
+    """Handy: Die App beginnt beim Öffnen ohne eigenes Ziel auf der Titelseite, nicht beim Neuladen oder
+    Zurück/Vor; nach dem Anmelden ist die Startseite am Handy die Titelseite, am Desktop die Liste."""
+    script = """
+const { opensOnFront, startHash } = await import(process.argv[1] + '/layout.js');
+const o = (x) => opensOnFront({ hash: '', desktop: false, navType: 'navigate', ...x });
+console.log(JSON.stringify({
+  opens: [o({}), o({ hash: '#' }), o({ hash: '#/' }), o({ navType: undefined }), o({ hash: '#/?p=4' }), o({ hash: '#/a/5' }),
+          o({ hash: '#/titelseite' }), o({ navType: 'reload' }), o({ navType: 'back_forward' }), o({ desktop: true })],
+  start: [startHash(false), startHash(true)],
+}));
+"""
+    got = _run_fake_dom(script)
+    assert got["opens"] == [True, True, True, True, False, False, False, False, False, False]
+    assert got["start"] == ["#/titelseite", "#/"]
+
+
+def test_phone_front_page_view():
+    """Titelseite am Handy (front.js mit readerHome): lädt erst beim Zeigen, auch schmal, zeigt immer die
+    Titelseite (egal was desktop_empty sagt), ohne Tastenhinweise; listItems in Anzeigereihenfolge
+    (Aufmacher, Rubriken, ohne Doppelte) für „Nächster“; kein Leisten-Kontext; destroy() meldet alle
+    Abonnements (Ereignisse, visibilitychange) wieder ab."""
+    script = """
+// Abonnements zählen: Ereignisbus (EventTarget in store.js) und document.
+const subs = {};
+const count = (type, d) => { subs[type] = (subs[type] || 0) + d; if (!subs[type]) delete subs[type]; };
+const add = EventTarget.prototype.addEventListener, del = EventTarget.prototype.removeEventListener;
+EventTarget.prototype.addEventListener = function (t, ...a) { count(t, 1); return add.call(this, t, ...a); };
+EventTarget.prototype.removeEventListener = function (t, ...a) { count(t, -1); return del.call(this, t, ...a); };
+document.addEventListener = (t) => count(t, 1);
+document.removeEventListener = (t) => count(t, -1);
+const store = await import(process.argv[1] + '/store.js');
+const { frontView } = await import(process.argv[1] + '/views/front.js');
+const { frontpageArticles } = await import(process.argv[1] + '/views/frontpage.js');
+desktop = false;
+store.state.settings.desktop_empty = 'overview';
+let empty = false;
+const art = (id, extra = {}) => ({ id, title: `T${id}`, read: 0, source_id: 'taz', ...extra });
+route = async (path) => {
+  if (path === '/api/profiles') return [{ id: 1, name: 'Deutschland', unread: 4 }];
+  if (path === '/api/frontpage') return empty ? { now_hour: new Date().getHours(), lead: null, sections: [] }
+    : { now_hour: new Date().getHours(), lead: { sources_count: 3, article: art(5, { read: 1 }) },
+      sections: [{ profile_id: 1, name: 'Deutschland', items: [{ article: art(7, { read: 1 }) }, { article: art(5) }, { article: {} }] },
+                 { profile_id: 2, name: 'Welt', items: [{ article: art(9) }] }] };
+  return {};
+};
+const order = frontpageArticles({ lead: { article: art(3) }, sections: [null, { items: [{ article: art(4) }, { article: art(3) }] }] });
+const baseline = JSON.stringify(subs);
+const v = frontView({});
+await tick(); await tick();
+const unseen = calls.length;                       // noch nicht gezeigt: keine Anfrage
+v.onShow(); await tick(); await tick(); await tick();
+const paths = () => calls.map((c) => c[1]);
+const shown = [v.el.querySelectorAll('.fp-lead').length, v.el.querySelectorAll('.fp-item').length,
+  v.el.querySelectorAll('.key-hints').length, v.el.querySelectorAll('.hdr-wordmark-link').map((a) => [a.getAttribute('aria-current'), a.getAttribute('aria-label')]),
+  paths().includes('/api/overview'), v.el.querySelectorAll('.is-read').length];
+const ctx = [store.state.ctx.type, store.state.nextCtx, store.state.listIsCtx, store.state.listItems.map((a) => a.id),
+  store.state.listItems[1].read, store.state.listItems[0].title];
+// Leerzustand: ohne Tastenhinweise
+empty = true; v.destroy(); const v2 = frontView({}); v2.onShow(); await tick(); await tick(); await tick();
+const emptyShown = [v2.el.querySelectorAll('.empty').length, v2.el.querySelectorAll('.key-hints').length, store.state.listItems.length];
+v2.destroy();
+console.log(JSON.stringify({ order: order.map((a) => a.id), unseen, shown, ctx, emptyShown, title: v.title, bar: v.bar,
+  subsBack: JSON.stringify(subs) === baseline, subs, baseline: JSON.parse(baseline) }));
+process.exit(0);
+"""
+    got = _run_fake_dom(script)
+    assert got["order"] == [3, 4]                                  # Aufmacher vorn, doppelte ID nur einmal
+    assert got["unseen"] == 0
+    # immer Titelseite, keine Tastenhinweise; Wortmarke ohne eigenen Namen (sichtbar „KIOSK“);
+    # gelesen: Aufmacher (5) und Karte 7 grau
+    assert got["shown"] == [1, 3, 0, [["page", None]], False, 2]
+    assert got["ctx"] == ["front", "local", False, [5, 7, 9], 1, "T5"]   # 5 (Aufmacher, auch als Karte) einmal
+    assert got["emptyShown"] == [1, 0, 0]
+    assert got["subsBack"], json.dumps([got["subs"], got["baseline"]])   # destroy(): alle Abonnements wieder ab
+    assert got["title"] == "Titelseite" and got["bar"] is True
+
+
+def test_phone_front_page_does_not_load_while_covered():
+    """Handy: Liegt ein Artikel über der Titelseite (onCover(true)), lädt sie nicht nach (Lesen,
+    Vordergrund); gelesene Artikel werden trotzdem sofort in listItems vermerkt. Beim Zurückkommen
+    (onShow) genau ein Neuladen, ohne Ladeanzeige."""
+    script = """
+const store = await import(process.argv[1] + '/store.js');
+const { frontView } = await import(process.argv[1] + '/views/front.js');
+desktop = false;
+const art = (id) => ({ id, title: `T${id}`, read: 0, source_id: 'taz' });
+route = async (path) => {
+  if (path === '/api/profiles') return [];
+  if (path === '/api/frontpage') return { now_hour: new Date().getHours(), lead: { article: art(5) },
+    sections: [{ profile_id: 1, name: 'P', items: [{ article: art(7) }] }] };
+  return {};
+};
+const fp = () => calls.filter((c) => c[1] === '/api/frontpage').length;
+const v = frontView({});
+v.onShow(); await tick(); await tick(); await tick();
+const first = fp();
+v.onCover(true);
+store.emit('flags', { id: 7, read: 1 }); store.emit('unread-changed'); store.emit('profiles');
+await new Promise((r) => setTimeout(r, 1200));
+const covered = [fp() - first, store.state.listItems.find((a) => a.id === 7).read];
+v.onShow();
+const loadingShown = v.el.querySelectorAll('.home-loading').length;
+await tick(); await tick(); await tick();
+const shown = [fp() - first, v.el.querySelectorAll('.fp-item').length];
+await new Promise((r) => setTimeout(r, 1200));
+const settled = fp() - first;
+v.destroy();
+console.log(JSON.stringify({ first, covered, loadingShown, shown, settled }));
+process.exit(0);
+"""
+    got = _run_fake_dom(script)
+    assert got["first"] == 1
+    assert got["covered"] == [0, 1]           # verdeckt: keine Anfrage, Lesestand trotzdem in listItems
+    assert got["loadingShown"] == 0           # Gezeigtes bleibt stehen, bis die Antwort da ist
+    assert got["shown"] == [1, 1]             # beim Zeigen genau einmal neu geladen
+    assert got["settled"] == 1                # danach nichts Nachgeholtes aus der verdeckten Zeit
 
 
 def test_home_view_switches_kind_and_resets_on_user_change():

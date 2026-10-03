@@ -1451,6 +1451,12 @@ def test_system_prompt_treats_block_as_material():
     assert f"verschiedene Zeitungen bevorzugt.\n{line}\n\nAntworte ausschließlich" in ed.SYSTEM_PROMPT
 
 
+def test_system_prompt_asks_for_an_it_security_section():
+    """Fester Abschnitt „IT-Sicherheit“ mit allen wichtigen Meldungen (Nutzerwunsch vom 03.10.2026)."""
+    assert "Zwischentitel „IT-Sicherheit“" in ed.SYSTEM_PROMPT
+    assert "Gibt es keine, entfällt der Abschnitt." in ed.SYSTEM_PROMPT
+
+
 def test_run_endpoint_force_must_be_a_real_bool(client):
     """10: force nur true/false."""
     for bad in ("yes", "1", 1, "true", None):

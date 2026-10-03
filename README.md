@@ -298,7 +298,7 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
   aus allen aktivierten Quellen mit `in_edition: true` (Standard ist der Wert von `in_all`; nicht generiert;
   unabhängig von `all_extra_sources`). So liest die KI-Ausgabe auch die Weltlage-Quellen, die nicht in ALLE
   stehen (UN News, ReliefWeb, The Hindu, Africanews, Guardian Global Development, Carbon Brief, Radio Dabanga:
-  `in_all: false, in_edition: true`), FOCUS online und heise Security aber weiter nicht. Die Artikel werden
+  `in_all: false, in_edition: true`) und heise Security (für den festen Abschnitt „IT-Sicherheit“), FOCUS online aber weiter nicht. Die Artikel werden
   nach Geschichte gruppiert, Gruppen nach Zahl der Zeitungen, dann der neueste Artikel;
   je Gruppe ein Vertreter mit Titel und Anreißer (220 Zeichen), die übrigen mit Titel (120 Zeichen, höchstens
   6, dann „… und N weitere“). Je Quelle höchstens 40 Artikel (die einer Geschichte zuerst, dann die neuesten),

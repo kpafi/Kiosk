@@ -54,7 +54,7 @@ sources:
   - {id: heise,        name: heise online,            short: "HEISE",         country: DE, lang: de, feed: "https://www.heise.de/rss/heise-atom.xml",               homepage: "https://www.heise.de",         category: tech,
      include_paths: ['^/(?!bestenlisten/)']}
   - {id: heisesec,     name: heise Security,          short: "HEISE SEC",     country: DE, lang: de, feed: "https://www.heise.de/security/rss/news-atom.xml",       homepage: "https://www.heise.de/security/", category: tech,
-     in_all: false, note: "Nicht in ALLE (Meldungen stehen auch bei heise online); eigene Ansicht oder Profil"}
+     in_all: false, in_edition: true, note: "Nicht in ALLE (Meldungen stehen auch bei heise online); eigene Ansicht, Profil und KI-Ausgabe (Abschnitt IT-Sicherheit)"}
   - {id: golem,        name: Golem.de,                short: "GOLEM",         country: DE, lang: de, feed: "https://rss.golem.de/rss.php?feed=RSS2.0",              homepage: "https://www.golem.de",         category: tech, default_enabled: false}
   # GEA: Der RSS-Feed ist tot (Einträge von 2018), deshalb die News-Sitemap (Index, dessen Kind jedes
   # Quartal den Namen wechselt). Nur Regionales: Reutlingen, Neckar-Alb, Blaulicht (Polizeimeldungen

@@ -393,11 +393,11 @@ def test_in_edition_defaults_to_in_all_and_is_validated(tmp_path):
 
 
 def test_shipped_catalog_in_edition():
-    """Bestand unverändert (FOCUS und heise Security bleiben aus der KI-Ausgabe, kiosk sowieso);
-    die Weltlage-Quellen stehen nicht in ALLE, aber in der KI-Ausgabe."""
+    """Bestand unverändert (FOCUS bleibt aus der KI-Ausgabe, kiosk sowieso); heise Security und die
+    Weltlage-Quellen stehen nicht in ALLE, aber in der KI-Ausgabe (heise Security für den Abschnitt IT-Sicherheit)."""
     catalog = Catalog.load(ROOT / "sources.yaml")
-    assert {s.id for s in catalog.all() if not s.in_edition} == {"focus", "heisesec", "kiosk"}
-    assert {s.id for s in catalog.all() if s.in_edition and not s.in_all} == WELTLAGE
+    assert {s.id for s in catalog.all() if not s.in_edition} == {"focus", "kiosk"}
+    assert {s.id for s in catalog.all() if s.in_edition and not s.in_all} == WELTLAGE | {"heisesec"}
 
 
 @pytest.mark.parametrize("sid,short,country", [

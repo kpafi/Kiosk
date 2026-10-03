@@ -23,6 +23,11 @@ Gleicher Server wie secure-chat und MailDigest (203.0.113.10, SSH-Alias `kiosk-s
   `docker-compose.yml` den Benutzer setzt, läuft auch ein älteres Image (`kiosk:good`, `kiosk:previous`,
   gebaut noch mit uid 1000) als 10100 und kann `data/` schreiben; `data/` also nie auf 1000 zurückstellen.
   Nur wer von Hand ein Image ohne dieses Compose-File startet, muss `--user 10100:10100` angeben.
+- KI-Ausgabe: `OPENROUTER_API_KEY` (und bei Bedarf `KIOSK_AI_MODEL`, `KIOSK_AI_MORNING`, `KIOSK_AI_EVENING`,
+  siehe `.env.example`) von Hand in `/opt/kiosk/.env` eintragen, dann `docker compose up -d` in `/opt/kiosk`
+  oder ein Deploy. deploy.sh trägt den Schlüssel nie ein (an der `.env` ergänzt es nur ein fehlendes
+  `KIOSK_FETCH_DENY_IPS` und hält sie bei root, Modus 600). Ohne Schlüssel ist die KI-Ausgabe aus (Hinweis im Log). Prüfen: `/api/status`
+  als Admin (`editions.enabled`), sofort eine Ausgabe schreiben: `POST /api/editions/run {"slot": "morning"}`.
 - Container `kiosk` lauscht nur auf `127.0.0.1:8100`. Caddy terminiert HTTPS unter `kiosk.example.org`.
 - Deploy: `bash deploy/deploy.sh` aus dem Repo-Root. Beim ersten Lauf wird ein Passwort erzeugt und in
   `/opt/kiosk/.env` abgelegt (nicht im Terminal ausgegeben). Fehlt `KIOSK_FETCH_DENY_IPS` in der `.env`,

@@ -839,6 +839,9 @@ class Fetcher:
         self.settings = settings
         self.state: dict[str, Any] = {
             "running": False, "last_started": None, "last_finished": None,
+            # Ende von Feeds und Geschichten eines Laufs (vor der Textextraktion): Darauf wartet die
+            # KI-Ausgabe beim Start (editions._wait_first_fetch), nicht auf den ganzen Lauf.
+            "feeds_finished": None,
             "last_new": 0, "last_extracted": 0, "last_purged": 0, "runs": 0,
         }
         self._run_lock = asyncio.Lock()
@@ -1075,6 +1078,7 @@ class Fetcher:
                     # wandert trotzdem weiter).
                     if new or time.monotonic() - self._stories_at >= STORIES_IDLE_REFRESH.total_seconds():
                         await self.update_stories()
+                    self.state["feeds_finished"] = utcnow()
                     extracted = await self._extract_pending()
                     await self.update_stories(only_if_new_bodies=True)
                 except Exception:
@@ -1112,7 +1116,8 @@ class Fetcher:
 
     async def _fetch_all_feeds(self) -> int:
         ids = set(self.db.enabled_source_ids())
-        sources = [s for s in self.catalog.all() if s.id in ids]
+        # Generierte Quellen (KI-Ausgabe, app/editions.py) haben keinen Feed.
+        sources = [s for s in self.catalog.all() if s.id in ids and not s.generated]
         sem = asyncio.Semaphore(FEED_CONCURRENCY)
 
         async def one(src: Source) -> int:

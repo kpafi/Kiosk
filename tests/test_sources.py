@@ -55,7 +55,8 @@ def test_short_defaults_to_upper_name_and_is_validated(tmp_path):
 def test_shipped_catalog_has_distinct_short_names():
     catalog = Catalog.load(ROOT / "sources.yaml")
     shorts = [s.short for s in catalog.all()]
-    assert len(shorts) == 93 and len(set(shorts)) == 93   # CNN und PBS am 28.09.2026 entfernt
+    # CNN und PBS am 28.09.2026 entfernt; dazu die KI-Ausgabe (kiosk) seit 03.10.2026
+    assert len(shorts) == 94 and len(set(shorts)) == 94
     assert all(0 < len(x) <= 12 and x == x.upper() for x in shorts)
     assert catalog.get("spiegel").short == "SPIEGEL"
 
@@ -325,3 +326,36 @@ def test_source_removed_from_catalog_does_not_break_the_app(app_env):
         assert r.status_code == 200 and r.json()["source_name"] == "cnn", (r.status_code, r.text[:200])
         assert "cnn" not in {s["id"] for s in c.get("/api/sources").json()}
         assert all(a["source_id"] != "cnn" for a in c.get("/api/articles").json()["items"])
+
+
+def test_generated_is_validated_and_allows_empty_feed(tmp_path):
+    """generated: nur true/false; ohne generated ist feed Pflicht (nicht leer), mit generated darf er leer
+    sein oder fehlen. generated_ids() nennt die generierten Quellen."""
+    path = tmp_path / "sources.yaml"
+    for bad in ('"ja"', "1", "[]"):
+        path.write_text(f'sources:\n  - {{id: x, name: X, country: DE, feed: "", generated: {bad}}}\n',
+                        encoding="utf-8")
+        with pytest.raises(ValueError, match="Quelle x: generated muss true oder false sein"):
+            Catalog.load(path)
+    for feed in ('feed: "",', 'feed: "  ",', ""):
+        path.write_text(f"sources:\n  - {{id: x, name: X, country: DE, {feed} homepage: \"\"}}\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="Quelle x: feed"):
+            Catalog.load(path)
+        path.write_text(f"sources:\n  - {{id: x, name: X, country: KI, {feed} generated: true}}\n", encoding="utf-8")
+        src = Catalog.load(path).get("x")
+        assert src.generated is True and src.feed == "" and src.homepage == ""
+    path.write_text('sources:\n  - {id: a, name: A, country: DE, feed: "https://a.example/f", generated: false}\n'
+                    '  - {id: b, name: B, country: KI, feed: "", generated: true}\n'
+                    '  - {id: c, name: C, country: DE, feed: "https://c.example/f"}\n', encoding="utf-8")
+    catalog = Catalog.load(path)
+    assert catalog.generated_ids() == frozenset({"b"})
+    assert not catalog.get("a").generated and not catalog.get("c").generated
+
+
+def test_shipped_catalog_has_the_kiosk_edition_last():
+    catalog = Catalog.load(ROOT / "sources.yaml")
+    kiosk = catalog.get("kiosk")
+    assert catalog.all()[-1] is kiosk and catalog.generated_ids() == frozenset({"kiosk"})
+    assert (kiosk.name, kiosk.short, kiosk.country, kiosk.lang, kiosk.feed, kiosk.homepage) == \
+        ("Kiosk", "KIOSK", "KI", "de", "", "")
+    assert kiosk.in_all and kiosk.default_enabled and "OPENROUTER_API_KEY" in kiosk.note

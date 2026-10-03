@@ -92,4 +92,8 @@ def app_env(tmp_path, monkeypatch):
     monkeypatch.setenv("KIOSK_DISABLE_FETCHER", "1")
     monkeypatch.delenv("KIOSK_COOKIE_SECURE", raising=False)
     monkeypatch.delenv("KIOSK_TZ", raising=False)
+    # KI-Ausgabe: nie ein Schlüssel aus der Umgebung des Entwicklers (kein Netz, Standardwerte)
+    for name in ("OPENROUTER_API_KEY", "KIOSK_AI_MODEL", "KIOSK_AI_BASE_URL", "KIOSK_AI_MORNING", "KIOSK_AI_EVENING",
+                 "KIOSK_AI_REASONING"):
+        monkeypatch.delenv(name, raising=False)
     return tmp_path

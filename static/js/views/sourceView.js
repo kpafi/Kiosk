@@ -57,10 +57,11 @@ export function sourceView(route) {
   function paintHeader() {
     const s = src();
     const name = s ? s.name : id;
-    const parts = [s ? s.country : null];
+    const parts = [s ? (s.generated ? 'KI-Ausgabe' : s.country) : null];
     const unread = unreadCount();
     if (typeof unread === 'number') parts.push(`${unread} ungelesen heute`);   // null: nicht berechnet
-    if (s && s.last_ok_at) parts.push(`${ago(s.last_ok_at)} geholt`);
+    // Generierte Quellen (KI-Ausgabe) holen nichts, sie schreiben.
+    if (s && s.last_ok_at) parts.push(`${ago(s.last_ok_at)} ${s.generated ? 'geschrieben' : 'geholt'}`);
     replace(titles,
       h('h1', { class: 't-section', text: name.toUpperCase() }),
       h('span', { class: 't-caption', text: parts.filter(Boolean).join(' · ') }));

@@ -480,7 +480,7 @@ export function dropWhenTiny(img, caption, author) {
  * dann einfügen: Links in neuem Tab, Bilder faul und ohne Referrer oder (show_images aus) entfernt.
  * Einzige HTML-Stelle: body_html ist serverseitig auf eine Whitelist bereinigt.
  */
-export function buildBody(html, title, author = '') {
+export function buildBody(html, title, author = '', generated = false) {
   const tpl = document.createElement('template');
   tpl.innerHTML = html;
   const frag = tpl.content;
@@ -488,8 +488,14 @@ export function buildBody(html, title, author = '') {
   // Liveblog-Uhrzeiten als Zeitzeile setzen (Mono, gehört zum Eintrag darunter).
   for (const p of frag.querySelectorAll('p')) if (isTimeLine(p)) p.classList.add('art-time');
   for (const a of frag.querySelectorAll('a')) {
-    a.target = '_blank';
-    a.rel = 'noopener noreferrer';
+    // Links in die App (KI-Ausgabe: „#/a/1234“) bleiben im selben Fenster, alle anderen in neuem Tab.
+    if (isAppLink(a.getAttribute('href'))) {
+      a.removeAttribute('target');
+      a.removeAttribute('rel');
+    } else {
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+    }
   }
   for (const img of frag.querySelectorAll('img')) {
     markCaption(img);
@@ -518,8 +524,58 @@ export function buildBody(html, title, author = '') {
   }
   const bodyEl = h('div', { class: 'article-body t-article' });
   bodyEl.append(frag);
-  dropTitleEcho(bodyEl, title);
+  // Eigene Texte (KI-Ausgabe): keine Heuristiken für Verlagsseiten, dafür Vorspann und Quellen setzen.
+  if (generated) markEdition(bodyEl);
+  else dropTitleEcho(bodyEl, title);
   return bodyEl;
+}
+
+/** KI-Ausgabe: Der Textkörper bekommt `is-edition` (nur dort sind Belege #/a/<id> blau). Der erste
+ *  Absatz, wenn er nur aus <strong> besteht (Vorspann), wird `art-lead`; der letzte Zwischentitel „Quellen“
+ *  und der Absatz danach werden `art-sources-h` und `art-sources`. */
+export function markEdition(root) {
+  root.classList.add('is-edition');
+  const kids = [...root.children];
+  const first = kids[0];
+  if (first && first.tagName === 'P' && first.children.length === 1 && first.children[0].tagName === 'STRONG'
+      && first.textContent.trim() === first.children[0].textContent.trim()) {
+    first.classList.add('art-lead');
+  }
+  const head = kids.filter((el) => el.tagName === 'H2' && el.textContent.trim() === 'Quellen').pop();
+  if (!head) return;
+  head.classList.add('art-sources-h');
+  const list = head.nextElementSibling;
+  if (list && list.tagName === 'P') list.classList.add('art-sources');
+}
+
+/** Link innerhalb der App (Hash-Route wie „#/a/1234“)? */
+export function isAppLink(href) {
+  return typeof href === 'string' && href.startsWith('#/');
+}
+
+/** Adresse für „Original öffnen“: nur http(s) (die KI-Ausgabe hat keine), sonst null. */
+export function originalUrl(item) {
+  const url = item && typeof item.url === 'string' ? item.url : '';
+  return /^https?:\/\//i.test(url) ? url : null;
+}
+
+/** Stammt der Artikel aus einer generierten Quelle (KI-Ausgabe)? Aus der Quellenliste; fehlt die noch
+ *  (Deep-Link), ist eine Adresse, die nicht http(s) ist, der Hinweis („kiosk:ausgabe/…“). null: unbekannt. */
+export function isGenerated(item, sourceMap = state.sourceMap) {
+  if (!item) return null;
+  const src = sourceMap ? sourceMap.get(item.source_id) : null;
+  if (src) return !!src.generated;
+  if (typeof item.url === 'string' && item.url) return originalUrl(item) === null;
+  return null;
+}
+
+/** Kontextspalte (dieselbe Geschichte, Themen) für diesen Artikel? Nicht für generierte Quellen (die
+ *  KI-Ausgabe erzählt alles und gehört zu keiner Geschichte); Bezahlartikel blendet sie selbst aus.
+ *  null: noch unbekannt; die Spalte entsteht dann sofort (Ladezustand) und fällt weg, falls sich nach dem
+ *  Laden eine Ausgabe herausstellt (der seltene Fall: Deep-Link auf eine Ausgabe). */
+export function wantsRail(item, sourceMap = state.sourceMap) {
+  const generated = isGenerated(item, sourceMap);
+  return generated === null ? null : !generated;
 }
 
 export function articleView(id) {
@@ -574,6 +630,10 @@ export function articleView(id) {
   let failed = false;       // Artikel ließ sich nicht laden: Kontextspalte bleibt weg
   function ensureRail() {
     if (rail || !alive || !isDesktop()) return;
+    // KI-Ausgabe: gar keine Kontextspalte (auch kein Platz dafür), wenn aus Liste oder Artikel bekannt.
+    // Unbekannt (Deep-Link ohne Liste): sofort anlegen wie für jeden Artikel, sonst springt das Layout bei
+    // jedem gewöhnlichen Artikel; eine Ausgabe nimmt sie nach dem Laden wieder weg (dropRail).
+    if (wantsRail(item || cachedItem(numId)) === false) return;
     rail = relatedRail();
     el.classList.add('has-rail');
     el.insertBefore(rail.el, focusNext);
@@ -582,6 +642,14 @@ export function articleView(id) {
       if (item.paywalled) rail.fail();
       else rail.load(item.id);
     }
+  }
+  /** Kontextspalte ganz entfernen (Element, Platz, Anfrage): der Artikel ist eine KI-Ausgabe. */
+  function dropRail() {
+    if (!rail) return;
+    rail.destroy();
+    rail.el.remove();
+    rail = null;
+    el.classList.remove('has-rail');
   }
   ensureRail();
   const onWidth = () => { if (desktopQuery.matches) ensureRail(); };
@@ -673,7 +741,7 @@ export function articleView(id) {
     if (item.paywalled) {
       parts.push(h('div', { class: 'art-note t-caption', text: 'Bezahlartikel werden nicht angezeigt' }));
     } else if (item.body_html) {
-      bodyEl = buildBody(item.body_html, item.title, author);
+      bodyEl = buildBody(item.body_html, item.title, author, isGenerated(item) === true);
     }
 
     const plan = state.settings.show_images && !item.paywalled ? planHero(bodyEl, item.image_url, author) : null;
@@ -742,9 +810,10 @@ export function articleView(id) {
     if (bodyEl) parts.push(bodyEl);
     else if (summary && !item.paywalled) parts.push(h('div', { class: 'article-body t-article' }, h('p', { text: summary })));
 
+    const original = originalUrl(item);
     parts.push(h('div', { class: 'art-actions' },
-      item.url ? h('a', {
-        class: 'pill', href: item.url, target: '_blank', rel: 'noopener noreferrer',
+      original ? h('a', {
+        class: 'pill', href: original, target: '_blank', rel: 'noopener noreferrer',
       }, h('span', { text: 'Original öffnen' }), external(16)) : null,
       nextPill));
 
@@ -826,7 +895,8 @@ export function articleView(id) {
         setFlag(item.id, 'read', true).catch(() => {});
       }
       if (first && rail) {
-        if (item.paywalled) rail.fail();
+        if (wantsRail(item) === false) dropRail();
+        else if (item.paywalled) rail.fail();
         else rail.load(item.id);
       }
       if (first) ensureRail();

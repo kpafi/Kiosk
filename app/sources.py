@@ -33,6 +33,10 @@ class Source:
     # ausdrücklich nennen, zählt aber nicht zu „alle Quellen“ (ALLE, Profile ohne Quellenliste, Suche
     # ohne Quelle). Regel an einer Stelle: api_ui.implicit_sources().
     in_all: bool = True
+    # True: Die Artikel entstehen in der App selbst (KI-Ausgabe, app/editions.py), es gibt keinen Feed.
+    # Der Sammler überspringt die Quelle; Geschichten, Titelseiten-Rubriken und die rechte Seite lassen
+    # sie aus (main.story_scope).
+    generated: bool = False
 
     def wants_url(self, url: str) -> bool:
         """True, wenn die Einträge dieser URL angelegt werden sollen (siehe include_paths)."""
@@ -94,13 +98,34 @@ def _guid_pattern(sid: str, raw) -> str:
     return raw
 
 
+def _bool_field(sid: str, name: str, raw, default: bool) -> bool:
+    """Schalter aus sources.yaml: nur true oder false (kein Text, keine Zahl)."""
+    if raw is None:
+        return default
+    if not isinstance(raw, bool):
+        raise ValueError(f"Quelle {sid}: {name} muss true oder false sein, ist {raw!r}")
+    return raw
+
+
 def _in_all(sid: str, raw) -> bool:
     """in_all aus sources.yaml: nur true oder false (kein Text, keine Zahl)."""
-    if raw is None:
-        return True
-    if not isinstance(raw, bool):
-        raise ValueError(f"Quelle {sid}: in_all muss true oder false sein, ist {raw!r}")
-    return raw
+    return _bool_field(sid, "in_all", raw, True)
+
+
+def _generated(sid: str, raw) -> bool:
+    """generated aus sources.yaml: nur true oder false; Standard false."""
+    return _bool_field(sid, "generated", raw, False)
+
+
+def _feed(sid: str, raw, generated: bool) -> str:
+    """feed aus sources.yaml: Pflicht (nicht leer), außer bei generierten Quellen."""
+    if raw is None and generated:
+        return ""
+    if not isinstance(raw, str):
+        raise ValueError(f"Quelle {sid}: feed muss ein Text sein, ist {raw!r}")
+    if not raw.strip() and not generated:
+        raise ValueError(f"Quelle {sid}: feed fehlt (leer geht nur mit generated: true)")
+    return raw.strip()
 
 
 class Catalog:
@@ -125,14 +150,15 @@ class Catalog:
                     f"Quelle {sid}: country muss ein Text sein (z. B. \"NO\" in Anführungszeichen), "
                     f"ist {country!r}"
                 )
+            generated = _generated(sid, item.get("generated"))
             sources.append(
                 Source(
                     id=sid,
                     name=item["name"],
                     country=country.strip().upper(),
                     lang=item.get("lang", "en"),
-                    feed=item["feed"],
-                    homepage=item.get("homepage", ""),
+                    feed=_feed(sid, item.get("feed"), generated),
+                    homepage=item.get("homepage") or "",
                     category=item.get("category", "general"),
                     default_enabled=bool(item.get("default_enabled", True)),
                     note=item.get("note", ""),
@@ -141,6 +167,7 @@ class Catalog:
                     include_paths=_include_paths(sid, item.get("include_paths")),
                     guid_pattern=_guid_pattern(sid, item.get("guid_pattern")),
                     in_all=_in_all(sid, item.get("in_all")),
+                    generated=generated,
                 )
             )
         return cls(sources)
@@ -150,6 +177,10 @@ class Catalog:
 
     def all(self) -> list[Source]:
         return [self._by_id[i] for i in self._order]
+
+    def generated_ids(self) -> frozenset[str]:
+        """Quellen mit generated: true (Artikel entstehen in der App, z. B. die KI-Ausgabe)."""
+        return frozenset(s.id for s in self._by_id.values() if s.generated)
 
     def __contains__(self, sid: str) -> bool:
         return sid in self._by_id

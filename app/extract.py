@@ -109,14 +109,20 @@ def is_paywalled(page_text: str, ld_decision: bool | None = None) -> bool:
     return bool(ld_decision or PAYWALL_RE.search(text) or _BLUR_CLASS_RE.search(page_text[:BLUR_SCAN_CHARS]))
 
 
+# Interner Link auf einen Artikel der App (Hash-Route der Oberfläche), siehe _Sanitizer.handle_starttag.
+_INTERNAL_LINK_RE = re.compile(r"#/a/[1-9][0-9]{0,17}")
+
+
 class _Sanitizer(HTMLParser):
     """Whitelist-Bereinigung. Mit `max_chars` endet die Ausgabe am ersten Element der obersten
     Ebene nach dieser Länge (spätestens bei der doppelten Länge, dann mit geschlossenen Tags);
     `truncated` sagt, ob gekürzt wurde. Mit `max_images` fallen weitere <img> weg."""
 
-    def __init__(self, base_url: str, max_chars: int | None = None, max_images: int | None = None):
+    def __init__(self, base_url: str, max_chars: int | None = None, max_images: int | None = None,
+                 allow_internal: bool = False):
         super().__init__(convert_charrefs=True)
         self.base = base_url
+        self.allow_internal = allow_internal   # interne Links #/a/<id> (nur sanitize_fragment)
         self.out: list[str] = []
         self.text: list[str] = []
         self._drop_depth = 0
@@ -175,10 +181,17 @@ class _Sanitizer(HTMLParser):
             return
         kept: list[str] = []
         allowed = ALLOWED_ATTRS.get(tag, set())
+        internal = False
         for name, value in attrs:
             if name not in allowed:
                 continue
-            if name in ("href", "src"):
+            if name == "href" and self.allow_internal and _INTERNAL_LINK_RE.fullmatch((value or "").strip()):
+                # Interner Link auf einen Kiosk-Artikel (#/a/<id>), nur ausdrücklich in eigenen Texten
+                # (KI-Ausgabe über sanitize_fragment); in Artikelseiten bleibt ein solcher Anker ein Link aufs
+                # Original bzw. fällt ohne Basis-URL weg.
+                value = value.strip()
+                internal = True
+            elif name in ("href", "src"):
                 value = self._safe_url(value)
                 if not value:
                     if tag == "img":
@@ -187,7 +200,7 @@ class _Sanitizer(HTMLParser):
                 if tag == "img" and value.endswith(_IMG_EXT_FRAGMENT):
                     value = value[:-len(_IMG_EXT_FRAGMENT)]   # Hilfsendung aus _fix_tree (WELT)
             kept.append(f' {name}="{html.escape(value or "", quote=True)}"')
-        if tag == "a":
+        if tag == "a" and not internal:
             kept.append(' target="_blank" rel="noopener noreferrer"')
         if tag == "img":
             if self.max_images is not None and self._images >= self.max_images:
@@ -270,6 +283,17 @@ def sanitize(fragment: str, base_url: str) -> tuple[str, str]:
     sanitize_limited."""
     clean, text, _ = sanitize_limited(fragment, base_url)
     return clean, text
+
+
+def sanitize_fragment(fragment: str) -> tuple[str, str]:
+    """Nur die Whitelist (_Sanitizer ohne Basis-URL, mit internen Links #/a/<id>), ohne die
+    Heuristiken für Verlagsseiten (Müll-Absätze, Bildzeilen, führende <h1>, doppelte Bilder): für eigene,
+    schon escapte Texte (KI-Ausgabe), in denen ein Zwischentitel „Anzeige“ oder ein Absatz auf „Name/dpa“
+    nicht still verschwinden darf. Liefert (html, reiner Text)."""
+    s = _Sanitizer("", allow_internal=True)
+    s.feed(fragment)
+    s.close()
+    return _EMPTY_P_RE.sub("", "".join(s.out)), _normalize_ws("".join(s.text))
 
 
 def sanitize_limited(fragment: str, base_url: str) -> tuple[str, str, bool]:

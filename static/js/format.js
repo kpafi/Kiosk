@@ -53,6 +53,17 @@ export function articleTime(iso, now = new Date()) {
   return `${dayMonth(d)} ${hhmm(d)}`;
 }
 
+/** Uhrzeit statt relativer Zeit (Rubrik AUSGABE, neben „7 MIN“ Lesezeit sonst doppeldeutig): „06:00“,
+ *  „GESTERN 20:00“, „24. SEP 20:00“. */
+export function clockLabel(iso, now = new Date()) {
+  const d = parseDate(iso);
+  if (!d) return '';
+  const n = daysAgo(d, now);
+  if (n <= 0) return hhmm(d);
+  if (n === 1) return `GESTERN ${hhmm(d)}`;
+  return `${dayMonth(d)} ${hhmm(d)}`;
+}
+
 /** „vor 12 Min“, „vor 3 Std“, „vor 2 Tagen“. */
 export function ago(iso, now = new Date()) {
   const d = parseDate(iso);
@@ -98,6 +109,7 @@ const COUNTRIES = {
   ID: 'Indonesien', PH: 'Philippinen', TH: 'Thailand', VN: 'Vietnam', MX: 'Mexiko', BR: 'Brasilien',
   AR: 'Argentinien', CL: 'Chile', CO: 'Kolumbien', PE: 'Peru', VE: 'Venezuela', CU: 'Kuba',
   INT: 'International', EU: 'Europa',
+  KI: 'KI-Ausgabe',   // die Zeitung Kiosk selbst (sources.yaml: kiosk, generated)
 };
 export function countryName(code) {
   return COUNTRIES[(code || '').toUpperCase()] || code || '?';

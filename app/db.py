@@ -219,6 +219,9 @@ PREFIX_MIN_LEN = 3
 _TOKEN_RE = re.compile(r"[^\W_]+")
 # seen_guids.first_seen wird bei erneutem Auftauchen höchstens so oft aufgefrischt.
 SEEN_REFRESH = timedelta(days=1)
+# KI-Ausgabe (edition_window): Artikel höchstens so lange vor dem Beginn des Zeitraums erschienen (Nachzügler,
+# die erst später geholt werden, ja; alte Artikel einer neu eingeschalteten Quelle nein).
+EDITION_LATE_MAX = timedelta(hours=48)
 # Leerraum am Rand eines Anreißers, wie stories._fields ihn abschneidet (Länge „kurzer Anreißer“ gleich
 # in SQL und Python): Leerzeichen, Tab, Zeilenumbrüche, geschütztes Leerzeichen.
 SUMMARY_TRIM = " \t\n\r\xa0"
@@ -1029,14 +1032,17 @@ class Database:
 
     # ---- Geschichten (app/stories.py) -------------------------------------
 
-    def story_window(self, since: str, body_chars: int, body_if_summary_below: int) -> list[sqlite3.Row]:
+    def story_window(self, since: str, body_chars: int, body_if_summary_below: int,
+                     exclude_sources: Collection[str] = ()) -> list[sqlite3.Row]:
         """Alle Artikel ab `since` für die Gruppierung: Titel, Anreißer, bisherige story_id und nur bei
-        kurzem Anreißer der Anfang des Volltexts (sonst NULL: die Texte bleiben ungelesen).
-        Hintergrundarbeit, ohne Zeitlimit."""
+        kurzem Anreißer der Anfang des Volltexts (sonst NULL: die Texte bleiben ungelesen). Artikel aus
+        `exclude_sources` (generierte Quellen, z. B. die KI-Ausgabe) fehlen. Hintergrundarbeit, ohne Zeitlimit."""
+        skip = sorted(exclude_sources)
+        cond = f" AND source_id NOT IN ({','.join('?' * len(skip))})" if skip else ""
         return self.q("SELECT id, source_id, url, title, summary, CASE WHEN length(trim(summary, ?)) < ? "
                       "THEN substr(body_text, 1, ?) END AS body_text, published_at, story_id "
-                      "FROM articles WHERE published_at >= ?",
-                      (SUMMARY_TRIM, body_if_summary_below, body_chars + 200, since), time_limit=None)
+                      f"FROM articles WHERE published_at >= ?{cond}",
+                      (SUMMARY_TRIM, body_if_summary_below, body_chars + 200, since, *skip), time_limit=None)
 
     def short_summaries_with_body(self, ids: list[int], below: int) -> int:
         """Wie viele dieser Artikel haben einen kurzen Anreißer (unter `below` Zeichen) und schon
@@ -1066,13 +1072,17 @@ class Database:
                                         time_limit=time_limit)]
 
     def topic_candidates(self, query: str, since: str, limit: int,
-                         time_limit: float | None = _FROM_CONTEXT) -> list[sqlite3.Row]:
+                         time_limit: float | None = _FROM_CONTEXT,
+                         exclude_sources: Collection[str] = ()) -> list[sqlite3.Row]:
         """Kandidaten für verwandte Themen aus dem Volltextindex (FTS5-Abfrage `query`, schon sicher
-        gebaut), ab `since`, nach bm25."""
+        gebaut), ab `since`, nach bm25; ohne Artikel aus `exclude_sources` (generierte Quellen: die
+        KI-Ausgabe erzählt alle Ereignisse und verdrängte sonst echte Kandidaten aus dem LIMIT)."""
+        skip = sorted(exclude_sources)
+        cond = f" AND a.source_id NOT IN ({','.join('?' * len(skip))})" if skip else ""
         return self.q(
             "SELECT a.id, a.source_id, a.title, a.summary, a.published_at, a.story_id FROM articles_fts f "
-            "JOIN articles a ON a.id = f.rowid WHERE articles_fts MATCH ? AND a.published_at >= ? "
-            "ORDER BY bm25(articles_fts) LIMIT ?", (query, since, limit), time_limit=time_limit)
+            f"JOIN articles a ON a.id = f.rowid WHERE articles_fts MATCH ? AND a.published_at >= ?{cond} "
+            "ORDER BY bm25(articles_fts) LIMIT ?", (query, since, *skip, limit), time_limit=time_limit)
 
     def story_articles(self, user_id: int, story_ids: list[int], *, sources: list[str] | None,
                        since: str | None = None, until: str | None = None,
@@ -1204,6 +1214,82 @@ class Database:
                 f"SELECT DISTINCT story_id FROM articles WHERE published_at < ? AND story_id IN "
                 f"({','.join('?' * len(chunk))})", (before, *chunk), time_limit=None))
         return out
+
+    # ---- KI-Ausgabe (app/editions.py) ------------------------------------------
+
+    def edition_window(self, sources: list[str], since: str, until: str | None = None,
+                       column: str = "fetched_at") -> list[sqlite3.Row]:
+        """Artikel ohne Paywall aus `sources` für die KI-Ausgabe: `column` (fetched_at im Betrieb, published_at
+        für Vergleiche) ab `since` bis einschließlich `until` (falls angegeben), dazu published_at höchstens
+        EDITION_LATE_MAX vor `since` (keine alten Nachzügler, wenn eine Quelle neu eingeschaltet wird). Über
+        fetched_at fehlt kein Artikel, der kurz vor der Grenze erschien, aber erst danach geholt wurde (oder
+        nur ein Tagesdatum trägt). Felder: id, source_id, title, summary, published_at, story_id (kein
+        Volltext), neueste zuerst. Hintergrundarbeit, ohne Zeitlimit; der Bereich über published_at hält den
+        Index (source_id, published_at, paywalled) eng, ein eigener Index für fetched_at ist nicht nötig."""
+        if column not in ("fetched_at", "published_at"):
+            raise ValueError(f"Unbekannte Spalte: {column!r}")
+        if not sources:
+            return []
+        floor = _iso(datetime.fromisoformat(since) - EDITION_LATE_MAX)
+        upper = f"AND a.{column} <= ? " if until is not None else ""   # Sekundengenau: einschließlich
+        params: tuple = (*sources, floor, since) + ((until,) if until is not None else ())
+        return self.q(f"SELECT a.id, a.source_id, a.title, a.summary, a.published_at, a.story_id "
+                      f"FROM articles a {COUNT_INDEX} WHERE a.source_id IN ({','.join('?' * len(sources))}) "
+                      f"AND a.published_at >= ? AND a.{column} >= ? {upper}AND a.paywalled=0 "
+                      "ORDER BY a.published_at DESC, a.id DESC", params, time_limit=None)
+
+    def edition_exists(self, guid: str, source_id: str = "kiosk") -> bool:
+        """Gibt es die Ausgabe (Quelle + GUID) schon?"""
+        return self.one("SELECT 1 AS ok FROM articles WHERE source_id=? AND guid=?", (source_id, guid),
+                        time_limit=None) is not None
+
+    def edition_published_at(self, guid: str, source_id: str = "kiosk") -> str | None:
+        """published_at der Ausgabe (Quelle + GUID), None, wenn es sie nicht gibt (Zeitplan: eine von Hand
+        vor ihrer Zeit geschriebene Ausgabe wird zur Zeit ersetzt)."""
+        row = self.one("SELECT published_at FROM articles WHERE source_id=? AND guid=?", (source_id, guid),
+                       time_limit=None)
+        return row["published_at"] if row is not None else None
+
+    def store_edition(self, row: dict[str, Any], force: bool = False) -> int:
+        """Speichert eine Ausgabe als fertigen Artikel (text_status 'full', ohne Bild und Paywall) und gibt
+        die ID zurück. `row`: source_id, guid, url, title, summary, author, body_html, body_text, optional
+        published_at (Standard: jetzt). Gibt es (source_id, guid) schon, bleibt sie ohne `force` unverändert
+        (ihre ID kommt zurück); mit `force` werden Titel, Texte, Autor und Zeit ersetzt, die ID (und damit
+        Gemerkt und Später lesen) bleibt, der Lesestand aller Benutzer geht auf ungelesen (neuer Inhalt).
+        Die FTS-Trigger halten den Suchindex dabei aktuell."""
+        now = utcnow()
+        published = row.get("published_at") or now
+        body_text = row.get("body_text") or ""
+        values = (row["url"], row["title"], row.get("summary") or "", row.get("author"), row.get("body_html"),
+                  body_text, len(body_text), published, now, now)
+        with self.tx() as c:
+            old = c.execute("SELECT id FROM articles WHERE source_id=? AND guid=?",
+                            (row["source_id"], row["guid"])).fetchone()
+            if old is not None:
+                if force:
+                    c.execute("UPDATE articles SET url=?, title=?, summary=?, author=?, body_html=?, body_text=?, "
+                              "body_len=?, published_at=?, fetched_at=?, extracted_at=?, text_status='full', "
+                              "text_error=NULL, attempts=0, next_attempt_at=NULL, paywalled=0, image_url=NULL, "
+                              "story_id=NULL WHERE id=?", (*values, old["id"]))
+                    # Neuer Inhalt: nicht grau als gelesen zeigen; starred/later bleiben.
+                    c.execute("UPDATE user_articles SET read=0, updated_at=? WHERE article_id=? AND read=1",
+                              (now, old["id"]))
+                return int(old["id"])
+            cur = c.execute("INSERT INTO articles (url, title, summary, author, body_html, body_text, body_len, "
+                            "published_at, fetched_at, extracted_at, source_id, guid, text_status, paywalled) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'full',0)", (*values, row["source_id"], row["guid"]))
+            return int(cur.lastrowid)
+
+    def latest_editions(self, user_id: int, sources: list[str], since: str, limit: int,
+                        time_limit: float | None = _FROM_CONTEXT) -> list[sqlite3.Row]:
+        """Ausgaben (Artikel aus `sources`, den generierten Quellen) ohne Paywall ab `since`, neueste
+        zuerst, Listenspalten mit dem Lesestand von `user_id` (für die Titelseite)."""
+        if not sources:
+            return []
+        return self.q(f"SELECT {ARTICLE_LIST_COLS} FROM articles a {USER_JOIN} "
+                      f"WHERE a.source_id IN ({','.join('?' * len(sources))}) AND a.paywalled=0 "
+                      "AND a.published_at >= ? ORDER BY a.published_at DESC, a.id DESC LIMIT ?",
+                      (user_id, *sources, since, limit), time_limit=time_limit)
 
     # ---- Profile ---------------------------------------------------------
 

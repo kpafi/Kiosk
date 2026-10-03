@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from html import escape as html_escape
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -21,12 +21,13 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi import Path as PathParam
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 from .auth import (COOKIE_NAMES, DEVICE_MAX_AGE, INVALID_NAME_KEY, LOGIN_ERROR, Auth, burn_time, hash_password,
                    ip_key, needs_rehash, normalize_username, verify_password, verify_password_evenly)
 from .config import docs_enabled, load_settings
 from .db import Database, QueryTimeout, _iso, utcnow
+from .editions import EditionBusy, EditionWriter
 from .extract import strip_reading_times
 from .fetcher import LOG_FORMAT, Fetcher
 from .sources import Catalog
@@ -109,8 +110,11 @@ async def _running(app: FastAPI):
     state.auth = Auth(state.settings)
     state.verify_slots = asyncio.Semaphore(VERIFY_SLOTS)
     state.fetcher = Fetcher(state.db, state.catalog, state.settings)
+    # Nach dem Speichern einer Ausgabe die Profil-Zähler verwerfen (sie hängen sonst am Ende des Sammellaufs).
+    state.editions = EditionWriter(state.db, state.catalog, state.settings, on_stored=invalidate_unread)
     state.started_at = datetime.now(timezone.utc)
     await state.fetcher.start()
+    await state.editions.start()
     # Geschichten einmal beim Start gruppieren (story_id und das Modell für verwandte Themen); das
     # Rechnen läuft in einem Thread, der Start wartet darauf (wenige Sekunden).
     await state.fetcher.update_stories()
@@ -120,12 +124,25 @@ async def _running(app: FastAPI):
     else:
         state.task = asyncio.create_task(state.fetcher.run_forever())
         state.watchdog = asyncio.create_task(_watchdog())
+    # KI-Ausgabe: Zeitplan nur mit Schlüssel und Sammler (Tests und KIOSK_DISABLE_FETCHER: kein Netz).
+    state.editions_task = None
+    if not state.settings.ai_api_key:
+        log.info("KI-Ausgabe aus: OPENROUTER_API_KEY fehlt")
+    elif state.settings.disable_fetcher:
+        log.info("KI-Ausgabe: kein Zeitplan (KIOSK_DISABLE_FETCHER), nur POST /api/editions/run")
+    else:
+        # Nachholen beim Start erst nach dem ersten Sammellauf (sonst aus dem Stand vor der Pause).
+        state.editions_task = asyncio.create_task(
+            state.editions.run_forever(state.fetcher.state, started_at=state.started_at))
+        log.info("KI-Ausgabe an: Modell %s, %s und %s Uhr (%s), Denkbudget %s", state.settings.ai_model,
+                 state.settings.ai_morning, state.settings.ai_evening, state.settings.tz,
+                 state.settings.ai_reasoning)
     log.info("Kiosk gestartet: %d Quellen im Katalog, Datenbank %s",
              len(state.catalog.all()), state.settings.db_path)
     try:
         yield
     finally:
-        for task in (state.watchdog, state.task):
+        for task in (state.watchdog, state.editions_task, state.task):
             if task is None:
                 continue
             task.cancel()
@@ -134,6 +151,8 @@ async def _running(app: FastAPI):
             except (asyncio.CancelledError, Exception):
                 pass
         state.watchdog = None
+        state.editions_task = None
+        await state.editions.close()
         await state.fetcher.close()
         state.db.close()
 
@@ -507,6 +526,8 @@ def _source_view(s, st, counts, favorites: set[str], in_all: set[str]) -> dict[s
         "category": s.category, "homepage": s.homepage, "note": s.note, "tags": list(s.tags),
         # false: nicht in ALLE und Profilen ohne Quellenliste; je Benutzer (all_extra_sources)
         "in_all": s.id in in_all,
+        # true: Artikel entstehen in der App (KI-Ausgabe), kein Feed
+        "generated": s.generated,
         "enabled": bool(st["enabled"]) if st else s.default_enabled,
         "last_ok_at": st["last_ok_at"] if st else None,
         "last_fetch_at": st["last_fetch_at"] if st else None,
@@ -787,6 +808,8 @@ FRONTPAGE_ITEMS = 3         # ... mit je so vielen Artikeln ...
 FRONTPAGE_HOURS = 24        # ... aus den letzten so vielen Stunden
 FRONTPAGE_GROUPS = 12       # Geschichten je Profil, aus denen die Titelseite wählt
 USER_LANG = "de"            # Sprache der Oberfläche: deutschsprachige Artikel zuerst
+EDITIONS_TODAY = 2          # Titelseite, Rubrik AUSGABE: höchstens so viele Ausgaben von heute ...
+EDITIONS_FALLBACK_HOURS = 36  # ... sonst die neueste aus so vielen Stunden
 # Übersicht und Titelseite haben zusammen höchstens so viele Sekunden für ihre Abfragen; was dann
 # fehlt (eine Rubrik, die Geschichten des Tages), bleibt leer statt einer 503.
 STORY_PAGE_BUDGET = 3.0
@@ -830,6 +853,14 @@ def _count_sources(rows) -> int:
 def _publishers() -> dict[str, str]:
     """Quelle -> Verlag für Quellen, die mit anderen als eine Zeitung zählen (für die SQL-Zählung)."""
     return {s.id: stories.publisher(s.id) for s in state.catalog.all() if stories.publisher(s.id) != s.id}
+
+
+def story_scope(user_id: int) -> list[str]:
+    """Quellen für Geschichten, Titelseite, Übersicht und rechte Seite: implicit_sources() ohne generierte
+    Quellen (die KI-Ausgabe erzählt alle Ereignisse und wäre sonst überall ein Treffer). In ALLE, Suche,
+    Zählern und der Zeitungsansicht steht sie trotzdem."""
+    generated = state.catalog.generated_ids()
+    return [s for s in implicit_sources(user_id) if s not in generated]
 
 
 def _ranked(rows, *, image_first: bool = False) -> list:
@@ -894,7 +925,11 @@ async def related(article_id: int = PathParam(ge=1, le=MAX_ID), user: dict = Dep
     if not row:
         raise HTTPException(404, "Artikel nicht gefunden")
     row = dict(row)
-    scope = implicit_sources(user["id"])
+    generated = state.catalog.generated_ids()
+    if row["source_id"] in generated:
+        # KI-Ausgabe: gehört zu keiner Geschichte und hat keine Themen (sie erzählt alles).
+        return {"story_id": None, "sources_count": 1, "same_story": [], "topic": []}
+    scope = story_scope(user["id"])
     budget = _Budget()                  # alle Abfragen der Seite zusammen (wie Übersicht und Titelseite)
     story_id = state.db.story_id_of(article_id)
     row["story_id"] = story_id          # get_article liefert sie nicht; topic_ids braucht sie (vor dem Fenster)
@@ -944,7 +979,7 @@ async def related(article_id: int = PathParam(ge=1, le=MAX_ID), user: dict = Dep
     # Zeitungen, die die Seite auch zeigt (und die eigene): Kopf und Liste passen zusammen.
     count = _count_sources([*shown, row])
     try:
-        ids = stories.topic_ids(state.db, row, exclude, time_limit=budget.limit())
+        ids = stories.topic_ids(state.db, row, exclude, time_limit=budget.limit(), exclude_sources=generated)
         found = {r["id"]: r for r in state.db.articles_by_ids(user["id"], ids, sources=scope,
                                                               time_limit=budget.limit())}
         topic = [_item(found[i]) for i in ids if i in found][:TOPIC_MAX]
@@ -962,10 +997,11 @@ async def overview(user: dict = Depends(current_user)):
     budget = _Budget()
     local = datetime.now(timezone.utc).astimezone(state.db.tz)
     today = state.db.today_start()
-    scope = implicit_sources(user["id"])
+    # Zähler wie der ALLE-Zähler (mit KI-Ausgabe); Artikel des Tages und Geschichten ohne generierte Quellen.
+    scope = story_scope(user["id"])
     counts = {"unread": None, "later": None}
     try:
-        counts = state.db.article_counts(user["id"], scope, time_limit=budget.limit())
+        counts = state.db.article_counts(user["id"], implicit_sources(user["id"]), time_limit=budget.limit())
     except QueryTimeout:
         log.warning("Tagesübersicht: Zähler abgebrochen (Zeitlimit)")
     hourly: list[int] = [0] * 24
@@ -1014,7 +1050,11 @@ async def frontpage(user: dict = Depends(current_user)):
     uid = user["id"]
     budget = _Budget()
     local = datetime.now(timezone.utc).astimezone(state.db.tz)
-    scope = implicit_sources(user["id"])
+    scope = story_scope(uid)
+    generated = state.catalog.generated_ids()
+    # Zuerst die Ausgaben (eine billige Abfrage): Sie sollen nicht fehlen, weil die Rubriken das Budget
+    # aufgebraucht haben.
+    editions = _frontpage_editions(uid, budget)
     lead = None
     window = "today"
     try:
@@ -1036,7 +1076,8 @@ async def frontpage(user: dict = Depends(current_user)):
     used_ids = {lead["article"]["id"]} if lead else set()
     sections = []
     for p in chosen:
-        sources, terms = effective_sources(uid, p), p["terms"] or None
+        sources = [sid for sid in effective_sources(uid, p) if sid not in generated]
+        terms = p["terms"] or None
         try:
             groups = [g for g in state.db.profile_story_groups(uid, sources=sources, terms=terms, since=since,
                                                                limit=FRONTPAGE_GROUPS + len(used_stories),
@@ -1075,7 +1116,28 @@ async def frontpage(user: dict = Depends(current_user)):
             sections.append({"profile_id": p["id"], "name": p["name"], "items": items})
     # Tag und Stunde des Servers (KIOSK_TZ) wie in der Übersicht: Die Oberfläche lädt um Mitternacht neu.
     return {"date": local.date().isoformat(), "now_hour": local.hour, "window": window, "lead": lead,
-            "sections": sections}
+            "sections": sections, "editions": editions,
+            "edition_times": [state.settings.ai_morning, state.settings.ai_evening]}
+
+
+def _frontpage_editions(user_id: int, budget: _Budget) -> list[dict[str, Any]]:
+    """KI-Ausgaben für die Titelseite: die von heute (ab 00:00 KIOSK_TZ), neueste zuerst, höchstens
+    EDITIONS_TODAY; gibt es heute keine, die neueste der letzten EDITIONS_FALLBACK_HOURS Stunden. Nur aus
+    aktivierten generierten Quellen. Reicht das Zeitbudget nicht: []."""
+    enabled = set(state.db.enabled_source_ids())
+    sources = sorted(s for s in state.catalog.generated_ids() if s in enabled)
+    if not sources:
+        return []
+    try:
+        rows = state.db.latest_editions(user_id, sources, state.db.today_start(), EDITIONS_TODAY,
+                                        time_limit=budget.limit())
+        if not rows:
+            since = _iso(datetime.now(timezone.utc) - timedelta(hours=EDITIONS_FALLBACK_HOURS))
+            rows = state.db.latest_editions(user_id, sources, since, 1, time_limit=budget.limit())
+    except QueryTimeout:
+        log.warning("Titelseite: Ausgaben abgebrochen (Zeitlimit)")
+        return []
+    return [_item(r) for r in rows]
 
 
 class FlagBody(BaseModel):
@@ -1152,14 +1214,45 @@ async def refresh():
     return {"started": True}
 
 
+class EditionRunBody(BaseModel):
+    slot: Literal["morning", "evening"]
+    force: StrictBool = False          # nur true/false, kein "yes" oder 1
+
+
+@app.post("/api/editions/run", status_code=202, dependencies=[Depends(admin_user)])
+async def run_edition(body: EditionRunBody):
+    """KI-Ausgabe sofort schreiben (nur Admin). Läuft im Hintergrund (das Modell braucht Minuten); das
+    Ergebnis steht in Log, /api/status (editions) und der Zeitungsliste. `force` ersetzt eine vorhandene
+    Ausgabe desselben Tages (ID, Gemerkt und Später lesen bleiben, gelesen wird zurückgesetzt); ohne `force`
+    gibt es dann 409. Vor der Zeit ihres Slots ist sie eine Vorschau: Der Zeitplan ersetzt sie zur Zeit."""
+    if not state.editions.enabled:
+        raise HTTPException(503, "KI-Ausgabe aus: OPENROUTER_API_KEY fehlt")
+    if not state.editions.source_enabled():
+        raise HTTPException(503, "Die Quelle Kiosk ist ausgeschaltet")
+    if not body.force and state.editions.exists_today(body.slot):
+        raise HTTPException(409, "Ausgabe gibt es schon; force: true ersetzt sie")
+    try:
+        await state.editions.launch(body.slot, body.force)
+    except EditionBusy:
+        raise HTTPException(409, "Eine Ausgabe wird gerade geschrieben") from None
+    return {"started": True}
+
+
+def _editions_status(admin: bool) -> dict[str, Any]:
+    """Zustand der KI-Ausgabe; ohne Admin nur, ob sie an ist und läuft. Nie der Schlüssel."""
+    st = dict(state.editions.state)
+    return st if admin else {"enabled": st["enabled"], "running": st["running"]}
+
+
 @app.get("/api/status")
 async def status(user: dict = Depends(current_user)):
-    # Nicht-Admins sehen nur Build und Sammler-Zustand, keine Server-Werte.
+    # Nicht-Admins sehen nur Build, Sammler-Zustand und ob die KI-Ausgabe an ist, keine Server-Werte.
     if not user["is_admin"]:
-        return {"build": _build(), "fetcher": state.fetcher.state}
+        return {"build": _build(), "fetcher": state.fetcher.state, "editions": _editions_status(False)}
     return {
         "build": _build(),
         "fetcher": state.fetcher.state,
+        "editions": _editions_status(True),
         "db": state.db.stats(user["id"]),
         "settings": {
             "fetch_interval": state.settings.fetch_interval,

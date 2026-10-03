@@ -986,6 +986,35 @@ async def test_unexpected_extraction_error_does_not_abort_run(db, settings, monk
     assert f.state["runs"] == 1 and f.state["last_purged"] == 1 and f.state["running"] is False
 
 
+async def test_feeds_finished_is_set_before_extraction(db, settings, monkeypatch):
+    """Die KI-Ausgabe wartet beim Start auf die Feeds, nicht auf die lange Textextraktion: feeds_finished
+    steht schon, wenn die Extraktion beginnt; scheitern die Feeds, bleibt es leer."""
+    f = make_fetcher(db, settings, lambda r: httpx.Response(503))
+    seen = {}
+
+    async def no_feeds():
+        return 0
+
+    async def extract():
+        seen.update(feeds=f.state["feeds_finished"], last=f.state["last_finished"])
+        return 0
+
+    monkeypatch.setattr(f, "_fetch_all_feeds", no_feeds)
+    monkeypatch.setattr(f, "_extract_pending", extract)
+    assert f.state["feeds_finished"] is None
+    await f.run_once()
+    assert seen["feeds"] is not None and seen["last"] is None and f.state["last_finished"] >= seen["feeds"]
+
+    async def broken():
+        raise RuntimeError("kaputt")
+
+    g = make_fetcher(db, settings, lambda r: httpx.Response(503))
+    monkeypatch.setattr(g, "_fetch_all_feeds", broken)
+    with pytest.raises(RuntimeError):
+        await g.run_once()
+    assert g.state["feeds_finished"] is None and g.state["last_finished"] is not None
+
+
 # ---- Retry-After, Validatoren, feindliche Feeds -------------------------------------------
 
 @pytest.mark.parametrize("raw", ["nan", "NaN", "inf", "-inf", "infinity"])
@@ -1801,3 +1830,25 @@ async def test_timeouts_and_sizes_are_stored_readably(db, settings):
         await f.close()
     assert db.get_article(aid)["text_error"] == "Zeitüberschreitung beim Abruf"
     assert fetcher_mod._mb(123_400_000) == "117,7 MB" and fetcher_mod._mb(5 * 2**20) == "5 MB"
+
+
+async def test_collector_skips_generated_sources(db, settings):
+    """Generierte Quellen (KI-Ausgabe, generated: true) haben keinen Feed: Der Sammler fragt sie nie an und
+    trägt für sie keinen Abruf ein, auch wenn sie eingeschaltet sind."""
+    gen = Source(id="kiosk", name="Kiosk", country="KI", lang="de", feed="", homepage="", generated=True)
+    db.ensure_sources([("kiosk", True)])
+    f = make_fetcher(db, settings, lambda r: httpx.Response(304))
+    f.catalog = Catalog([SRC, gen])
+    asked = []
+
+    async def fake_fetch(src):
+        asked.append(src.id)
+        return 0
+
+    f._fetch_feed = fake_fetch
+    try:
+        assert await f._fetch_all_feeds() == 0
+    finally:
+        await f.close()
+    assert asked == ["alpha"]
+    assert db.source_states()["kiosk"]["last_fetch_at"] is None

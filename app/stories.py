@@ -2085,7 +2085,10 @@ async def _refresh(db: Any, catalog: Any, now: datetime | None) -> dict[str, Any
     global _model
     started = time.monotonic()
     since = _iso((now or datetime.now(timezone.utc)) - WINDOW)
-    rows = [dict(r) for r in db.story_window(since, BODY_CHARS, BODY_IF_SUMMARY_BELOW)]
+    # Generierte Quellen (KI-Ausgabe) nie gruppieren: Sie erzählen alle Ereignisse des Tages.
+    skip = catalog.generated_ids() if hasattr(catalog, "generated_ids") else frozenset()
+    rows = [dict(r) for r in (db.story_window(since, BODY_CHARS, BODY_IF_SUMMARY_BELOW, exclude_sources=skip)
+                              if skip else db.story_window(since, BODY_CHARS, BODY_IF_SUMMARY_BELOW))]
     langs = {s.id: s.lang for s in catalog.all()}
     for r in rows:
         r["lang"] = langs.get(r["source_id"], "en")
@@ -2259,14 +2262,15 @@ def _best_per_story(model: Model, scored: list[tuple[float, int, int | None]], l
 
 
 def topic_ids(db: Any, row: dict[str, Any], exclude: set[int], limit: int = TOPIC_LIMIT,
-              time_limit: float | None = None) -> list[int]:
+              time_limit: float | None = None, exclude_sources: frozenset[str] | set[str] = frozenset()) -> list[int]:
     """Artikel-IDs zum selben Thema, aber nicht derselben Geschichte, beste zuerst (mehr als `limit`,
     damit nach Filtern der Aufrufer noch genug übrig sind; höchstens 3 * limit).
 
     Liegt der Artikel im Fenster des letzten Laufs, kommen Kandidaten aus dem invertierten Index;
     finden sich so weniger als `limit` (oder liegt er davor), sucht der Volltextindex (Titel und
     Anreißer) der letzten RELATED_DAYS Tage nach Paaren seiner informativsten Wörter. Alle Kandidaten werden mit den Vektoren bewertet.
-    `exclude` (Artikel selbst, seine Geschichte) kommt nie zurück; `time_limit` für die Volltextsuche."""
+    `exclude` (Artikel selbst, seine Geschichte) kommt nie zurück; `time_limit` für die Volltextsuche,
+    deren Kandidaten aus `exclude_sources` (generierte Quellen) gar nicht erst kommen."""
     model = _model
     if model is None:
         return []
@@ -2296,8 +2300,12 @@ def topic_ids(db: Any, row: dict[str, Any], exclude: set[int], limit: int = TOPI
             since = _iso(datetime.now(timezone.utc) - timedelta(days=RELATED_DAYS))
             known = {aid for _, aid, _ in scored}
             own = copy_key(row)
-            fts = (db.topic_candidates(query, since, limit=4 * want) if time_limit is None
-                   else db.topic_candidates(query, since, limit=4 * want, time_limit=time_limit))
+            extra: dict[str, Any] = {}
+            if time_limit is not None:
+                extra["time_limit"] = time_limit
+            if exclude_sources:
+                extra["exclude_sources"] = exclude_sources
+            fts = db.topic_candidates(query, since, limit=4 * want, **extra)
             for r in fts:
                 r = dict(r)
                 if r["id"] in exclude or r["id"] in known or (own and copy_key(r) == own):

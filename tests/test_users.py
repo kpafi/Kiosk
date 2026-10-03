@@ -457,8 +457,10 @@ def test_only_admin_may_switch_sources_and_refresh(two):
 
 def test_status_reduced_for_non_admins(two):
     admin, anna = two
-    assert set(anna.get("/api/status").json()) == {"build", "fetcher"}
-    assert {"build", "fetcher", "db", "settings"} <= set(admin.get("/api/status").json())
+    reduced = anna.get("/api/status").json()
+    assert set(reduced) == {"build", "fetcher", "editions"}
+    assert reduced["editions"] == {"enabled": False, "running": False}       # KI-Ausgabe: nur an/läuft
+    assert {"build", "fetcher", "editions", "db", "settings"} <= set(admin.get("/api/status").json())
 
 
 # ---- Kommandozeile ----------------------------------------------------------------

@@ -659,6 +659,8 @@ mark {
   font-weight: 600;
   margin-top: var(--space-6);
 }
+/* Zwischentitel ohne einzelnes Wort in der letzten Zeile (KI-Ausgabe hat viele kurze h2). */
+.article-body h2 { text-wrap: balance; }
 .article-body ul, .article-body ol { padding-left: 1.3em; }
 .article-body li + li { margin-top: var(--space-2); }
 .article-body blockquote { padding-left: var(--space-4); border-left: 2px solid var(--rule); }
@@ -686,6 +688,42 @@ mark {
 .article-body .art-time strong, .article-body .art-time b { font-weight: 400; }
 .article-body .art-time + * { margin-top: 4px; }
 .article-body a { color: var(--ink); text-decoration: underline; text-underline-offset: 2px; }
+/* Space Grotesk ist nur bis 600 eingebunden; 700 wäre künstlich gefettet. */
+.article-body strong, .article-body b { font-weight: 600; }
+/* KI-Ausgabe (is-edition aus markEdition): Belege (#/a/<id>) blau, der Unterstrich bleibt (erkennbar auch
+   ohne Farbe), abgeschwächt. Nur dort: In Verlagstexten sind solche Anker Links aufs Original. */
+.article-body.is-edition a[href^="#/a/"] {
+  color: var(--signal-text);
+  text-decoration-color: var(--signal-text);
+  text-decoration-color: color-mix(in srgb, var(--signal-text) 45%, transparent);
+}
+/* KI-Ausgabe (Klassen aus markEdition): Vorspann größer, Quellen als Block mit Punktschrift-Kopf. */
+.article-body .art-lead {
+  font-size: calc(19px * var(--scale));
+  line-height: calc(29px * var(--scale));
+  font-weight: 500;
+}
+.article-body .art-lead strong { font-weight: inherit; }
+.article-body .art-sources-h {
+  border-top: 1px solid var(--hairline);
+  padding-top: 16px;
+  margin-top: 8px;
+  font-family: var(--font-dot);
+  font-size: 16px;
+  line-height: 19px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 700;
+}
+.article-body .art-sources-h + .art-sources {
+  margin-top: 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 18px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
 .article-body table { border-collapse: collapse; display: block; overflow-x: auto; }
 .article-body td, .article-body th { border-top: 1px solid var(--hairline); padding: 6px 8px; text-align: left; }
 .article-body pre { white-space: pre-wrap; font-family: var(--font-mono); font-size: 14px; }
@@ -1215,6 +1253,40 @@ body.has-update #shell:not(.has-bar) #view { padding-bottom: calc(var(--update-s
   overflow-wrap: anywhere;
 }
 .fp-item-title.is-read { color: var(--muted); }
+/* Rubrik AUSGABE (KI-Ausgaben): Zeilen wie die Liste, ohne Bild, Linie zwischen den Zeilen. */
+.fp-ed-list { display: flex; flex-direction: column; }
+.fp-ed-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 0;
+  color: var(--ink);
+  text-decoration: none;
+}
+.fp-ed-row + .fp-ed-row { border-top: 1px solid var(--hairline); }
+.fp-ed-row:focus-visible { outline-offset: 4px; border-radius: var(--radius-sm); }
+.fp-ed-title {
+  font-size: calc(21px * var(--scale));
+  line-height: calc(27px * var(--scale));
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+.fp-ed-title.is-read { color: var(--muted); }
+.fp-ed-teaser {
+  font-size: calc(15px * var(--scale));
+  line-height: calc(22px * var(--scale));
+  color: var(--muted);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+}
+/* Breit genug: zwei Ausgaben nebeneinander, ohne Linie dazwischen; eine allein nimmt eine von zwei Spalten. */
+@container (min-width: 560px) {
+  .fp-ed-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 24px; }
+  .fp-ed-row + .fp-ed-row { border-top: 0; }
+}
 
 @container (max-width: 859px) {
   .home-cols { flex-direction: column; gap: 28px; }
@@ -1417,6 +1489,10 @@ body.has-update #shell:not(.has-bar) #view { padding-bottom: calc(var(--update-s
   }
   /* Liveblog-Uhrzeit bleibt Mono-Zeitzeile (sonst gewänne die Absatzgröße oben). */
   html[data-focus="on"] .article-body .art-time { font-size: 13px; line-height: 18px; }
+  /* KI-Ausgabe: Vorspann bleibt größer als die Absätze, Quellen bleiben klein. */
+  html[data-focus="on"] .article-body .art-lead { font-size: calc(21px * var(--scale)); line-height: calc(32px * var(--scale)); }
+  html[data-focus="on"] .article-body .art-sources-h { font-size: 16px; line-height: 19px; }
+  html[data-focus="on"] .article-body .art-sources { font-size: 12px; line-height: 18px; }
   /* Bildzeilen bleiben klein (sonst gewänne die Absatzgröße oben). */
   html[data-focus="on"] .article-body .art-caption, html[data-focus="on"] .article-body figcaption {
     font-size: 12px;

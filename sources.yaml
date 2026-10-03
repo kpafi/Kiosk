@@ -8,6 +8,8 @@
 # ausdrücklich nennen, aber nicht in ALLE, in Profilen ohne Quellenliste und in der Suche ohne Quelle.
 # guid_pattern: optionaler regulärer Ausdruck mit genau einer Gruppe, auf die URL angewandt; die Gruppe
 # ist die GUID (z. B. die Artikelnummer, damit ein geänderter Titel im URL-Slug kein Duplikat erzeugt).
+# generated: true heißt, die Artikel entstehen in der App selbst (KI-Ausgabe, app/editions.py); feed darf dann
+# leer sein, der Sammler überspringt die Quelle. Für alle anderen Quellen ist feed Pflicht.
 # default_enabled: false bedeutet nur, dass die Quelle beim ersten Start aus ist; sie lässt sich in der App einschalten.
 # Bewusst nicht aufgenommen: Boulevard (Bild, Sun, Daily Mail ...), reine Bezahlmedien ohne Gratisartikel (WSJ, FT, Economist, Nikkei),
 # und Seiten, die Server-Zugriffe blocken (Politico, Axios, The Hill, France 24, RFI, Sky News, Washington Post, AP).
@@ -163,3 +165,7 @@ sources:
   - {id: mailguardian, name: Mail & Guardian,         short: "M&G",           country: ZA, lang: en, feed: "https://mg.co.za/feed/",                                homepage: "https://mg.co.za",             default_enabled: false}
   - {id: premiumtimes, name: Premium Times,           short: "PREMIUM T.",    country: NG, lang: en, feed: "https://www.premiumtimesng.com/feed",                   homepage: "https://www.premiumtimesng.com", default_enabled: false, note: "Investigativ, Nigeria"}
   - {id: standardke,   name: The Standard,            short: "STANDARD KE",   country: KE, lang: en, feed: "https://www.standardmedia.co.ke/rss/headlines.php",     homepage: "https://www.standardmedia.co.ke", default_enabled: false}
+
+  # ---------------- Kiosk selbst ----------------
+  # Die KI-Ausgabe: zweimal täglich ein zusammenfassender Artikel aus den Artikeln aller Zeitungen (app/editions.py).
+  - {id: kiosk,        name: Kiosk,                   short: "KIOSK",         country: KI, lang: de, feed: "",                                                     homepage: "",                             generated: true, note: "KI-Zusammenfassung aller Zeitungen, morgens und abends; braucht OPENROUTER_API_KEY"}

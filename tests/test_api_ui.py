@@ -1321,7 +1321,8 @@ def test_frontpage_lead_and_profile_sections(story_client):
     _add("alpha", 5, 30)                          # älter als 24 h
     sids = _link_stories()
     body = c.get("/api/frontpage").json()
-    assert set(body) == {"date", "now_hour", "window", "lead", "sections"}
+    assert set(body) == {"date", "now_hour", "window", "lead", "sections", "editions", "edition_times"}
+    assert body["editions"] == [] and body["edition_times"] == ["06:00", "20:00"]
     assert body["window"] == "today"
     assert body["date"] == c.get("/api/overview").json()["date"] and 0 <= body["now_hour"] <= 23
     lead = body["lead"]

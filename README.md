@@ -14,6 +14,7 @@ Konto, Lesestand, Profilen, Lieblingszeitungen, Leiste und Einstellungen (siehe 
   - `db.py` SQLite mit WAL und FTS5-Volltextsuche
   - `api_ui.py` Routen für die Oberfläche: Profile, Lieblingszeitungen, Leiste, Einstellungen, Zähler
   - `stories.py` Geschichten: erkennt Artikel verschiedener Zeitungen über dasselbe Ereignis (de/en)
+  - `editions.py` KI-Ausgabe: zweimal täglich ein zusammenfassender Artikel aller Zeitungen über OpenRouter
   - `auth.py` Passwort-Hashes (scrypt), signiertes Cookie pro Benutzer, Login-Bremse
   - `users.py` Konten verwalten auf der Kommandozeile (`python -m app.users`)
 - `static/` Web-Oberfläche (PWA ohne Build-Schritt: `index.html`, `js/`, `css/`, `sw.js`)
@@ -82,7 +83,7 @@ Anfangsbuchstaben („Admin“). Der letzte aktive Admin lässt sich nicht lösc
 | POST | `/api/logout` | Abmelden; beendet alle Sitzungen dieses Benutzers auf allen Geräten |
 | GET | `/api/session` | Ohne Login: `{authenticated, user}`, `user` ist `{id, username, display_name, is_admin}` oder `null` |
 | GET | `/api/me` | Der angemeldete Benutzer `{id, username, display_name, is_admin}` |
-| GET | `/api/sources` | Alle Quellen mit Status und Zählern, Kurzname `short`, `is_favorite` |
+| GET | `/api/sources` | Alle Quellen mit Status und Zählern, Kurzname `short`, `is_favorite`, `generated` (KI-Ausgabe, kein Feed) |
 | PATCH | `/api/sources/{id}` `{enabled}` | Quelle ein-/ausschalten (nur Admin, sonst 403) |
 | POST | `/api/sources/bulk` `{enabled:[], disabled:[]}` | Mehrere Quellen umschalten (nur Admin) |
 | GET | `/api/articles?source=&country=&profile=&q=&unread=&starred=&later=&free=&days=&before=&offset=&limit=` | Artikelliste, siehe Blättern und Filter |
@@ -90,7 +91,7 @@ Anfangsbuchstaben („Admin“). Der letzte aktive Admin lässt sich nicht lösc
 | GET | `/api/articles/{id}/next?source=&country=&profile=&unread=true&starred=&later=&free=&days=` | Nächster älterer Artikel im selben Filterkontext: `{item}` oder `{item: null}` |
 | GET | `/api/articles/{id}/related` | Rechte Seite zum Artikel: `{story_id, sources_count, same_story, topic}`, siehe Geschichten |
 | GET | `/api/overview` | Tagesübersicht: `{date, now_hour, counts, top_stories, hourly}`, siehe Geschichten |
-| GET | `/api/frontpage` | Titelseite: `{lead, sections}`, siehe Geschichten |
+| GET | `/api/frontpage` | Titelseite: `{lead, sections, editions, edition_times}`, siehe Geschichten und KI-Ausgabe |
 | POST | `/api/articles/{id}/read` `{value}` | Gelesen-Status |
 | POST | `/api/articles/{id}/star` `{value}` | Favorit |
 | POST | `/api/articles/{id}/later` `{value}` | Später lesen |
@@ -110,7 +111,8 @@ Anfangsbuchstaben („Admin“). Der letzte aktive Admin lässt sich nicht lösc
 | PATCH | `/api/settings` (Teilfelder) | Einstellungen ändern (validiert); liefert alle |
 | GET | `/api/counts` | `{unread, later, starred, profiles, favorites, sources_enabled, sources_total, sources_failing}` |
 | POST | `/api/refresh` | Sammellauf sofort starten (nur Admin) |
-| GET | `/api/status` | Admin: Build-Zeitstempel (`build`), Sammler-Status (`fetcher`), Datenbank (`db`), Einstellungen (`settings`); andere Benutzer nur `{build, fetcher}` |
+| POST | `/api/editions/run` `{slot: morning\|evening, force}` | KI-Ausgabe im Hintergrund schreiben (nur Admin): 202 `{started: true}`; 503 ohne Schlüssel oder bei ausgeschalteter Quelle `kiosk`, 409 während eines Laufs oder wenn es die Ausgabe heute schon gibt und `force` fehlt, 422 bei anderem `slot` oder `force`, das nicht `true`/`false` ist |
+| GET | `/api/status` | Admin: Build-Zeitstempel (`build`), Sammler-Status (`fetcher`), KI-Ausgabe (`editions`), Datenbank (`db`), Einstellungen (`settings`); andere Benutzer nur `{build, fetcher, editions: {enabled, running}}` |
 | GET | `/api/build` | Ohne Login: `{build}` (Version des Service Workers) |
 | GET | `/favicon.ico` | Ohne Login: Icon |
 | GET | `/healthz` | Ohne Login; 503, wenn die Datenbank nicht antwortet, die Sammler-Schleife beendet ist (`fetcher`) oder hängt (`fetcher_stalled`: seit mehr als 3 Intervallen + 10 min kein Lauf fertig, bzw. der laufende Lauf dauert schon über 3 h). Im zweiten und dritten Fall beendet ein Wachhund den Prozess nach spätestens 1 min (Exit-Code 3), Docker startet neu |
@@ -270,14 +272,101 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
   3 Artikeln der letzten 24 h, je Geschichte einer (Vertreter wie oben, das Bild vor der Sprache), meiste
   Zeitungen zuerst, dann die neuesten. Der Aufmacher und schon gezeigte Geschichten fehlen in späteren
   Rubriken; Rubriken ohne Artikel fallen weg. Gruppiert wird in SQL über alle Artikel der 24 h.
+- Quellen mit `generated: true` (die KI-Ausgabe `kiosk`) gehören nie zu einer Geschichte und fehlen in
+  Aufmacher, Rubriken (auch in Profilen, die sie ausdrücklich nennen), MEISTBERICHTET, den Artikeln des
+  Tages der Übersicht (`new_today`, `active_sources`, `hourly`) und auf der rechten Seite; `related` zu einer
+  Ausgabe ist immer `{story_id: null, sources_count: 1, same_story: [], topic: []}`. `unread_today` zählt wie
+  der ALLE-Zähler mit ihr.
 - Übersicht, Titelseite und die Seite zum Artikel (`related`) haben je höchstens 3 s für ihre Abfragen;
   was dann fehlt (eine Rubrik, die Geschichten des Tages, die Stunden, dieselbe Geschichte, die Themen),
   bleibt leer statt einer 503.
 
+### KI-Ausgabe
+
+- Zweimal am Tag (`KIOSK_AI_MORNING` 06:00 und `KIOSK_AI_EVENING` 20:00, Ortszeit `KIOSK_TZ`) schreibt ein
+  Modell über die OpenRouter-API einen zusammenfassenden Artikel auf Deutsch aus den Artikeln aller Zeitungen
+  (`app/editions.py`). Die Ausgaben sind eine eigene Zeitung „Kiosk“ (Quelle `kiosk` mit `generated: true` in
+  `sources.yaml`, Kurzname KIOSK, Ländercode KI): eigene Ansicht `#/s/kiosk`, Lieblingszeitung und Leiste,
+  Lesestand, Gemerkt, Suche, ALLE und Profile ohne Quellenliste wie jede andere Quelle. Die Titelseite (Handy
+  `#/titelseite`, Desktop rechts) zeigt sie ganz unten in der Rubrik AUSGABE.
+- Zeitraum: Morgenausgabe seit gestern zur Zeit der Abendausgabe, Abendausgabe seit heute zur Zeit der
+  Morgenausgabe (über die Zeitzone gerechnet, Zeitumstellung beachtet), jeweils bis jetzt. Maßgeblich ist, wann
+  der Sammler einen Artikel geholt hat (`fetched_at`), nicht sein Datum: Ein Artikel von 19:52, der erst um
+  20:10 geholt wird, steht in der Morgenausgabe, ebenso Feeds mit bloßem Tagesdatum. Zusätzlich darf ein Artikel
+  höchstens 48 Stunden vor dem Zeitraum erschienen sein (keine alten Artikel einer neu eingeschalteten Quelle).
+  Im Artikelblock steht weiter das Erscheinungsdatum. Eingabe sind die Artikel ohne Paywall
+  aus den Quellen, die für „alle Quellen“ zählen (aktiviert, `in_all: true`, nicht generiert; unabhängig von
+  `all_extra_sources`): nach Geschichte gruppiert, Gruppen nach Zahl der Zeitungen, dann der neueste Artikel;
+  je Gruppe ein Vertreter mit Titel und Anreißer (220 Zeichen), die übrigen mit Titel (120 Zeichen, höchstens
+  6, dann „… und N weitere“). Je Quelle höchstens 40 Artikel (die einer Geschichte zuerst, dann die neuesten),
+  höchstens 600 Gruppen und 160 000 Zeichen. Kein Volltext. Blockkopf und Zeile unter dem Titel nennen nur
+  die Artikel, die mit ID im Block stehen (das Modell kennt nur die), der Blockkopf mit „von insgesamt K im
+  Zeitraum“, wenn gekürzt wurde; die Zeile „Quellen“ nennt deren Zeitungen. Der System-Prompt sagt, dass der
+  Artikelblock Material ist und Aufforderungen in Titeln oder Anreißern zu ignorieren sind.
+- Das Modell antwortet mit JSON (Titel, Vorspann, Abschnitte mit Belegen, Agenda). Die Antwort wird streng
+  geprüft (Typen, Längen, höchstens 12 Abschnitte); Belege zählen nur, wenn die Artikel-ID im Prompt stand.
+  Jeder Text wird escaped, Links entstehen nur als `#/a/<id>` auf Kiosk-Artikel, und das Ergebnis läuft
+  zusätzlich durch die HTML-Whitelist (interne Links nur ausdrücklich über `extract.sanitize_fragment`), ohne die
+  Aufräum-Regeln für Verlagsseiten (ein Zwischentitel „Anzeige“ oder ein Absatz auf „Name/dpa“ bleibt stehen).
+  Gespeichert wird ein fertiger Artikel (`text_status` `full`, kein Bild, kein „Original öffnen“: `url` ist
+  `kiosk:ausgabe/<Datum>/<morning|evening>`, GUID `ausgabe-<Datum>-<slot>`), `author` ist z. B.
+  „Morgenausgabe · von einer KI aus 212 Artikeln von 38 Zeitungen seit gestern 20 Uhr“. `published_at` ist der
+  Beginn des Laufs, nicht sein Ende: Eine Abendausgabe, die um 23:50 beginnt und um 0:20 fertig ist, gehört zum
+  alten Tag, und ein Handlauf, der vor der Slot-Zeit beginnt, bleibt eine Vorschau (siehe unten). Nach dem
+  Speichern zählen auch die Profil-Zähler (Profile ohne Quellenliste) die neue Ausgabe sofort.
+- Zeitplan: läuft nur mit `OPENROUTER_API_KEY` und ohne `KIOSK_DISABLE_FETCHER`. Eine verpasste Ausgabe
+  (App lief nicht) wird bis 6 Stunden nach ihrer Zeit nachgeholt, auch über Mitternacht (die Abendausgabe von
+  20 Uhr bis 2 Uhr, als Ausgabe des Vortags mit dessen GUID und Zeitraum), auch beim Start, dann aber erst, wenn
+  nach dem Start die Feeds einmal geholt sind (die lange Textextraktion zählt nicht; höchstens 15 Minuten
+  Warten), sonst entstünde sie aus dem alten Stand. Beim Nachholen überlappen die Zeiträume: Eine Abendausgabe,
+  die erst um 0:30 entsteht, reicht bis 0:30, die Morgenausgabe beginnt trotzdem um 20 Uhr; Artikel dazwischen
+  stehen dann in beiden (lieber doppelt als verloren).
+  Scheitert ein Lauf, versucht es der Zeitplan innerhalb dieser 6 Stunden erneut: bei Netzfehlern, 5xx, 408,
+  429, Zeitüberschreitung und ausgeschalteter Quelle bis zu 3 weitere Male im Abstand von 30 Minuten, bei
+  unlesbarer Antwort (kaputtes JSON oder außerhalb des Schemas) einmal; bei 401/403, anderen 4xx, abgeschnittener
+  Antwort und ohne Artikel im Zeitraum erst am nächsten Termin. Ein fehlender Schlüssel ist kein Grund: Ohne
+  Schlüssel gibt es keinen Zeitplan. Läuft gerade ein Admin-Lauf, sieht er nach einer Minute wieder nach.
+  Bekannte Grenze: Die Zahl der Wiederholungen steht nur im Speicher; ein Neustart innerhalb des Nachholfensters
+  beginnt sie von vorn. Innerhalb eines Laufs gibt es bis zu 3 Versuche (Pausen 2 und 5 Minuten) bei
+  Netzfehlern (auch zu langsamem Verbindungsaufbau), 5xx, 408, 429 und kaputtem JSON; eine Zeitüberschreitung
+  und eine Antwort außerhalb des Schemas (oft modellabhängig) werden nur einmal wiederholt; bei 401/403
+  (falscher Schlüssel) und anderen 4xx, auch als `error` mit solchem Code in einer 200-Antwort (402 Guthaben,
+  413 Kontextlänge), und bei abgeschnittener Antwort (`finish_reason` `length`) keinen weiteren. Das Ergebnis
+  steht in der Zeitungsliste (letzter Lauf bzw. Fehler der Quelle `kiosk`, „vor 3 Std geschrieben“), im Log (mit
+  Token-Verbrauch) und in `/api/status` unter `editions` (`enabled, model, running, last_started,
+  last_finished, last_slot, last_error, last_usage`). Der Schlüssel erscheint nirgends.
+- Von Hand (Admin): `POST /api/editions/run {"slot": "morning"}`; gibt es die Ausgabe heute schon, kommt ohne
+  `"force": true` 409. Mit `force` wird sie ersetzt (ID, Gemerkt und Später lesen bleiben; gelesen wird
+  für alle zurückgesetzt, der Inhalt ist neu). Der Prompt nennt die echte Uhrzeit und den echten Zeitraum
+  („Es ist …, 10:12 Uhr“, „seit heute 6 Uhr“). Eine von Hand vor ihrer Zeit geschriebene Ausgabe (z. B. die
+  Abendausgabe um 10 Uhr) ist eine Vorschau: Der Zeitplan ersetzt sie zur Zeit des Slots.
+- Kosten und Grenzen grob: Der Prompt hat höchstens ca. 160 000 Zeichen, gemessen 74 000 Tokens mit 912
+  Artikeln, also rund 70 000 bis 80 000 Tokens Eingabe; die Antwort höchstens 16 000 Tokens (`max_tokens`;
+  großzügig, weil Modelle, die vor der Antwort „denken“, das vom selben Budget abziehen). Bei Sonnet (3 USD je
+  Million Eingabe-, 15 USD je Million Ausgabe-Tokens) kostet ein Versuch höchstens etwa 0,50 USD, typisch
+  (Antwort 2 000 bis 4 000 Tokens) um 0,30 USD. Zweimal am Tag ohne Wiederholungen sind das grob 18 bis 30 USD im
+  Monat; der tatsächliche Verbrauch steht in `last_usage`. Höchstfall je Slot nach den Regeln oben: unlesbare
+  Antworten 2 Läufe mit je bis zu 3 Versuchen (kaputtes JSON) bzw. 2 (Schema), also höchstens 6 berechnete
+  Antworten, rund 3 USD; Zeitüberschreitungen 4 Läufe mit je 2 Versuchen, rund 4 USD, falls der Anbieter
+  abgebrochene Anfragen berechnet. Netzfehler und 5xx kosten in der Regel nichts. Zeitlimit je Anfrage: 20 s für
+  den Verbindungsaufbau, 600 s Lese-Limit (ohne Streaming kommt die ganze Antwort am Ende) und 900 s insgesamt
+  (auch wenn der Server die Verbindung mit einzelnen Bytes offen hält).
+- Denkbudget: `KIOSK_AI_REASONING` (`none` Standard: nichts senden, `low`, `medium`, `high`) schickt
+  `"reasoning": {"effort": …}` an OpenRouter. „Denkende“ Modelle (etwa DeepSeek v4 flash, Qwen, GLM)
+  verbrauchen ohne Begrenzung das ganze Token-Budget mit Denken und brechen mit `finish_reason` `length` ab
+  („Antwort abgeschnitten“); mit `low` sind sie brauchbar. Mit Denkbudget geht die Anfrage ohne eigene
+  `temperature` hinaus (Claude-Modelle lehnen die Kombination sonst ab).
+- Handlauf nach Mitternacht: Die Abendausgabe des Vortags holt der Zeitplan selbst nach (bis 6 Stunden
+  nach ihrer Zeit); ein Handlauf `evening` zwischen 0 und 6 Uhr erzeugt dagegen eine Vorschau für den
+  neuen Tag.
+- Ausschalten: Quelle `kiosk` in der Zeitungsliste aus (der Zeitplan überspringt sie) oder
+  `OPENROUTER_API_KEY` entfernen.
+
 ### Text- und HTML-Vertrag
 
 - Nur `body_html` ist HTML, und zwar serverseitig auf eine Whitelist bereinigt (keine Skripte,
-  keine Event-Attribute, Links und Bilder nur http(s)).
+  keine Event-Attribute, Links und Bilder nur http(s); in der KI-Ausgabe zusätzlich Links `#/a/<id>` auf
+  Kiosk-Artikel, die in der App bleiben).
 - `title`, `summary`, `author` sind reiner Text und müssen in jeder Oberfläche als Text
   (z. B. `textContent`) ausgegeben werden, nie als HTML. Platzhalter aus Feeds („None“, „null“,
   „undefined“) und ein Teaser, der nur den Titel wiederholt, werden beim Abruf verworfen (Schema v5
@@ -400,7 +489,7 @@ Suche, Zähler, Artikel per ID).
 |---|---|---|
 | `KIOSK_ADMIN_USER` | `admin` | Name des Admins, den `KIOSK_PASSWORD` beim ersten Start anlegt |
 | `KIOSK_COOKIE_SECURE` | `true` | Cookie `__Host-kiosk_session` mit Secure-Flag; für lokale Entwicklung über http `false` (dann `kiosk_session`) |
-| `KIOSK_DISABLE_FETCHER` | `false` | Kein automatischer Sammellauf (für Tests, keine Netzwerkzugriffe) |
+| `KIOSK_DISABLE_FETCHER` | `false` | Kein automatischer Sammellauf und kein Zeitplan der KI-Ausgabe (für Tests, keine Netzwerkzugriffe) |
 | `KIOSK_FETCH_INTERVAL` | `900` | Sekunden zwischen Sammelläufen, mindestens 60 |
 | `KIOSK_RETENTION_DAYS` | `90` | 1 bis 3650 |
 | `KIOSK_EXTRACT_CONCURRENCY` | `6` | Gleichzeitige Hintergrund-Extraktionen, 1 bis 32 |
@@ -408,9 +497,15 @@ Suche, Zähler, Artikel per ID).
 | `KIOSK_TZ` | `Europe/Berlin` | Zeitzone (IANA-Name), in der der Tag für die Ungelesen-Zähler um 00:00 beginnt |
 | `KIOSK_DOCS` | `0` | `1` schaltet die API-Doku unter `/docs` und `/openapi.json` ein (nach Login); in Produktion aus |
 | `KIOSK_SECRET` | – | Secret der Session-Cookies, mindestens 32 Zeichen; sonst wird `/data/secret.key` einmalig erzeugt |
+| `OPENROUTER_API_KEY` | – | Schlüssel für die KI-Ausgabe (OpenRouter); leer: KI-Ausgabe aus (Hinweis im Log). Nie in Log, Status oder Fehlertexten |
+| `KIOSK_AI_MODEL` | `anthropic/claude-sonnet-5.5` | Modell der KI-Ausgabe (OpenRouter-Name; Platzhalter, noch nicht endgültig gewählt) |
+| `KIOSK_AI_BASE_URL` | `https://openrouter.ai/api/v1` | Endpunkt (OpenAI-kompatibel, `/chat/completions` wird angehängt) |
+| `KIOSK_AI_MORNING` / `KIOSK_AI_EVENING` | `06:00` / `20:00` | Uhrzeiten der Ausgaben (HH:MM, Ortszeit `KIOSK_TZ`); der Morgen muss vor dem Abend liegen |
+| `KIOSK_AI_REASONING` | `none` | Denkbudget (`none`, `low`, `medium`, `high`); außer `none` als `reasoning.effort` an OpenRouter. Für „denkende“ Modelle (DeepSeek v4 flash, Qwen, GLM) `low`, sonst verbrauchen sie das Token-Budget mit Denken |
 | `KIOSK_FETCH_DENY_IPS` | – | Zusätzlich gesperrte Ziele für Feed- und Artikelabrufe: IPs oder Netze (CIDR), kommagetrennt, z. B. die Adressen des eigenen Servers `203.0.113.10,2001:db8:1234:5678::/64` (kein ganzes Provider-Netz wie `2a01:4f8::/32`, das sperrte auch dort gehostete Nachrichtenseiten); `deploy.sh` trägt diesen Wert ein, wenn er in der `.env` fehlt |
 
-Werte außerhalb der Grenzen, unbekannte Zeitzonen, ungültige Einträge in `KIOSK_FETCH_DENY_IPS` und ein
+Werte außerhalb der Grenzen, unbekannte Zeitzonen, ungültige Einträge in `KIOSK_FETCH_DENY_IPS`, ungültige
+Uhrzeiten oder Adressen der KI-Ausgabe und ein
 Secret unter 32 Zeichen (auch eine leere oder zu kurze `secret.key`) brechen den Start mit einer klaren
 Fehlermeldung ab. Die App legt Dateien nur für den eigenen Benutzer lesbar an (umask 077).
 

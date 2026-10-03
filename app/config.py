@@ -4,8 +4,9 @@ import ipaddress
 import os
 import re
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_UA = (
@@ -22,6 +23,15 @@ USERNAME_RE = re.compile(r"[a-z0-9._-]{2,32}")
 DEFAULT_TZ = "Europe/Berlin"
 # Mindestlänge des Secrets für die Session-Cookies (KIOSK_SECRET oder secret.key).
 MIN_SECRET_LEN = 32
+# KI-Ausgabe (app/editions.py): Modell und Endpunkt bei OpenRouter, Uhrzeiten der beiden Ausgaben.
+# Das Modell ist nur ein Platzhalter, der Betreiber legt es per KIOSK_AI_MODEL fest.
+DEFAULT_AI_MODEL = "anthropic/claude-sonnet-5.5"
+DEFAULT_AI_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_AI_MORNING = "06:00"
+DEFAULT_AI_EVENING = "20:00"
+# Denkbudget (OpenRouter `reasoning.effort`): none = nichts senden (Standard des Modells).
+AI_REASONING_LEVELS = ("none", "low", "medium", "high")
+_HHMM_RE = re.compile(r"([01]?[0-9]|2[0-3]):([0-5][0-9])")
 
 
 @dataclass(frozen=True)
@@ -43,6 +53,15 @@ class Settings:
     tz: str = DEFAULT_TZ        # KIOSK_TZ: Zeitzone für den Tagesbeginn der Zähler
     # KIOSK_FETCH_DENY_IPS: zusätzlich gesperrte Ziel-Netze für Feed- und Artikelabrufe
     fetch_deny_ips: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = ()
+    # KI-Ausgabe: OPENROUTER_API_KEY ("" = aus; nie in repr, Log oder Status), KIOSK_AI_MODEL,
+    # KIOSK_AI_BASE_URL (ohne / am Ende), KIOSK_AI_MORNING/KIOSK_AI_EVENING ("HH:MM", Ortszeit KIOSK_TZ),
+    # KIOSK_AI_REASONING (AI_REASONING_LEVELS).
+    ai_api_key: str = field(default="", repr=False)
+    ai_model: str = DEFAULT_AI_MODEL
+    ai_base_url: str = DEFAULT_AI_BASE_URL
+    ai_morning: str = DEFAULT_AI_MORNING
+    ai_evening: str = DEFAULT_AI_EVENING
+    ai_reasoning: str = "none"
 
 
 def _int(name: str, default: int, lo: int | None = None, hi: int | None = None) -> int:
@@ -73,6 +92,53 @@ def _tz(name: str, default: str) -> str:
     except (ZoneInfoNotFoundError, ValueError, OSError):
         raise RuntimeError(f"{name} ist keine bekannte Zeitzone: {raw!r} (z. B. Europe/Berlin)") from None
     return raw
+
+
+def _hhmm(name: str, default: str) -> str:
+    """Uhrzeit "HH:MM" (auch "6:00") aus der Umgebung, normalisiert auf zwei Stellen; sonst RuntimeError."""
+    raw = os.environ.get(name, "").strip() or default
+    m = _HHMM_RE.fullmatch(raw)
+    if not m:
+        raise RuntimeError(f"{name} muss eine Uhrzeit HH:MM sein (z. B. 06:00), ist {raw!r}")
+    return f"{int(m.group(1)):02d}:{m.group(2)}"
+
+
+# Hosts, für die KIOSK_AI_BASE_URL auch http sein darf (lokaler Modell-Server).
+_LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def _ai_settings() -> dict:
+    """Einstellungen der KI-Ausgabe aus der Umgebung, geprüft (RuntimeError bei Unsinn). Fehlermeldungen
+    nennen nie den Schlüssel selbst."""
+    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if key and (any(c.isspace() for c in key) or not key.isprintable()):
+        raise RuntimeError("OPENROUTER_API_KEY enthält Leerzeichen oder Steuerzeichen")
+    if not key.isascii():
+        # z. B. ein typografischer Bindestrich aus Copy-Paste: scheiterte sonst erst beim Aufruf im Header
+        raise RuntimeError("OPENROUTER_API_KEY enthält Zeichen außerhalb von ASCII (kopiert mit falschem Bindestrich?)")
+    model = os.environ.get("KIOSK_AI_MODEL", "").strip() or DEFAULT_AI_MODEL
+    if any(c.isspace() for c in model) or not model.isprintable() or len(model) > 200:
+        raise RuntimeError(f"KIOSK_AI_MODEL ist kein gültiger Modellname: {model!r}")
+    base = (os.environ.get("KIOSK_AI_BASE_URL", "").strip() or DEFAULT_AI_BASE_URL).rstrip("/")
+    m = re.fullmatch(r"(https?)://([^\s/?#]+)(/[^\s?#]*)?", base)
+    if not m:
+        raise RuntimeError(f"KIOSK_AI_BASE_URL muss eine https-Adresse sein, ist {base!r}")
+    try:
+        host = urlparse(base).hostname
+    except ValueError:      # z. B. „[::1“ ohne schließende Klammer
+        raise RuntimeError(f"KIOSK_AI_BASE_URL ist keine gültige Adresse: {base!r}") from None
+    if m.group(1) == "http" and host not in _LOCAL_HOSTS:
+        # Der Schlüssel ginge sonst im Klartext übers Netz; http nur für einen Server auf diesem Rechner.
+        raise RuntimeError(f"KIOSK_AI_BASE_URL muss https sein (http nur für localhost), ist {base!r}")
+    morning = _hhmm("KIOSK_AI_MORNING", DEFAULT_AI_MORNING)
+    evening = _hhmm("KIOSK_AI_EVENING", DEFAULT_AI_EVENING)
+    if morning >= evening:
+        raise RuntimeError(f"KIOSK_AI_MORNING ({morning}) muss vor KIOSK_AI_EVENING ({evening}) liegen")
+    reasoning = os.environ.get("KIOSK_AI_REASONING", "").strip().lower() or "none"
+    if reasoning not in AI_REASONING_LEVELS:
+        raise RuntimeError(f"KIOSK_AI_REASONING muss {', '.join(AI_REASONING_LEVELS)} sein, ist {reasoning!r}")
+    return {"ai_api_key": key, "ai_model": model, "ai_base_url": base, "ai_morning": morning,
+            "ai_evening": evening, "ai_reasoning": reasoning}
 
 
 def fetch_deny_networks(name: str = "KIOSK_FETCH_DENY_IPS") -> tuple:
@@ -203,4 +269,5 @@ def load_settings() -> Settings:
         admin_user=admin_user,
         tz=_tz("KIOSK_TZ", DEFAULT_TZ),
         fetch_deny_ips=fetch_deny_networks(),
+        **_ai_settings(),
     )

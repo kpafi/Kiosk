@@ -1457,6 +1457,44 @@ view.destroy();
     assert got == {"before": True, "enabled": True, "off": False}
 
 
+def test_source_view_caption_for_generated_source():
+    """Zeitungsansicht: Die KI-Ausgabe holt nichts, sie schreibt („vor 3 Std geschrieben“, „KI-Ausgabe“
+    statt Ländercode); andere Zeitungen bleiben bei „geholt“."""
+    script = """
+Object.defineProperty(FakeEl.prototype, 'isConnected', { get() { return true; } });
+FakeEl.prototype.getClientRects = () => [];
+globalThis.IntersectionObserver = class { observe() {} disconnect() {} };
+document.createDocumentFragment = () => new FakeEl('fragment');
+globalThis.document.body.classList.add = () => {};
+const store = await import(process.argv[1] + '/store.js');
+const { sourceView } = await import(process.argv[1] + '/views/sourceView.js');
+store.state.user = { id: 1, is_admin: false };
+const at = new Date(Date.now() - 3 * 3600 * 1000).toISOString();
+const list = () => [
+  { id: 'kiosk', name: 'Kiosk', country: 'KI', enabled: true, generated: true, last_ok_at: at, total: 1, unread: 0, unread_all: 0 },
+  { id: 'taz', name: 'taz', country: 'DE', enabled: true, generated: false, last_ok_at: at, total: 1, unread: 0, unread_all: 0 }];
+store.state.sources = list();
+store.state.sourceMap = new Map(store.state.sources.map((s) => [s.id, s]));
+route = (path) => {
+  if (path === '/api/sources') return list();
+  if (path === '/api/bar') return { items: [] };
+  if (path === '/api/status') return {};
+  return { items: [], next_before: null, max_id: 0 };
+};
+const out = {};
+for (const id of ['kiosk', 'taz']) {
+  const view = sourceView({ id, params: new URLSearchParams() });
+  for (let i = 0; i < 10; i++) await tick();
+  out[id] = view.el.all().filter((e) => e.cls().includes('t-caption')).map((e) => e.textContent)[0];
+  view.destroy();
+}
+console.log(JSON.stringify(out));
+"""
+    got = _run_fake_dom(script)
+    assert got["kiosk"].startswith("KI-Ausgabe · ") and got["kiosk"].endswith(" geschrieben")
+    assert got["taz"].startswith("DE · ") and got["taz"].endswith(" geholt")
+
+
 # Schein-DOM-Erweiterung für die Leseansicht: Tag-Selektoren, closest(Tag), previousElementSibling.
 ARTICLE_DOM = """
 const origQSA = FakeEl.prototype.querySelectorAll;
@@ -1575,3 +1613,172 @@ console.log(JSON.stringify({ toasts, log }));
     assert got["toasts"] == [[False, "Alles gelesen"], [True, "Nur der Admin kann Zeitungen einschalten"],
                              [True, "Fehler: kaputt"]]
     assert got["log"] == ["a-dispose", "b-dispose", "c-dispose", "c-close"]
+
+
+def test_frontpage_editions_section_and_caption():
+    """Rubrik AUSGABE ganz unten: Kopf mit den Zeiten, je Ausgabe eine Zeile (Meta mit Lesezeit, Titel,
+    Vorspann, gelesen grau); Einträge ohne ID fallen weg; ohne Ausgaben keine Rubrik. Nur Ausgaben: kein
+    Leerzustand. „Nächster“ am Handy nimmt die Ausgaben hinten mit."""
+    script = """
+const { frontpageContent, frontpageArticles, editionCaption, editionsSection } = await import(process.argv[1] + '/views/frontpage.js');
+const { clockLabel } = await import(process.argv[1] + '/format.js');
+const now = new Date(2026, 9, 3, 7, 0);
+const ed = (id, extra = {}) => ({ id, title: `Ausgabe ${id}`, summary: `Vorspann ${id}`, read: 0, source_id: 'kiosk',
+  country: 'KI', published_at: new Date(2026, 9, 3, 6, 2).toISOString(), read_minutes: 5, ...extra });
+const art = (id) => ({ id, title: `T${id}`, read: 0, source_id: 'taz' });
+const only = frontpageContent({ lead: null, sections: [], edition_times: ['06:00', '20:00'],
+  editions: [ed(8), ed(9, { read: 1, read_minutes: 0, summary: 'Ausgabe 9' }), { title: 'ohne id' }, null] }, now);
+const rows = only.querySelectorAll('.fp-ed-row');
+const none = frontpageContent({ lead: null, sections: [], editions: [] }, now);
+const withLead = frontpageContent({ lead: { article: art(3) }, sections: [], editions: [ed(8)] }, now);
+console.log(JSON.stringify({
+  captions: [editionCaption(['06:00', '20:00']), editionCaption(['06:30', '19:00']), editionCaption(undefined),
+             editionCaption(['x', '20:00']), editionCaption([])],
+  head: only.querySelectorAll('.home-head').map((e) => e.textContent),
+  empty: [only.querySelectorAll('.empty').length, none.querySelectorAll('.empty').length,
+          none.querySelectorAll('.fp-ed').length, withLead.querySelectorAll('.fp-ed').length],
+  hrefs: rows.map((r) => r.getAttribute('href')),
+  metas: rows.map((r) => r.querySelector('.row-meta').textContent),
+  titles: rows.map((r) => [r.querySelector('.fp-ed-title').textContent, r.querySelector('.fp-ed-title').classList.contains('is-read')]),
+  teasers: rows.map((r) => (r.querySelector('.fp-ed-teaser') || { textContent: null }).textContent),
+  dots: rows.map((r) => r.querySelectorAll('.unread-dot').length),
+  imgs: only.querySelectorAll('.fp-item-img').length,
+  noSection: editionsSection({ editions: [{}] }),
+  yesterday: editionsSection({ editions: [ed(7, { published_at: new Date(2026, 9, 2, 20, 0).toISOString() })] }, now)
+    .querySelector('.row-meta').textContent,
+  clock: [clockLabel(new Date(2026, 9, 3, 6, 0).toISOString(), now), clockLabel(new Date(2026, 9, 2, 20, 0).toISOString(), now),
+          clockLabel(new Date(2026, 8, 24, 20, 5).toISOString(), now), clockLabel('kaputt', now)],
+  order: frontpageArticles({ lead: { article: art(3) }, sections: [{ items: [{ article: art(4) }] }],
+                            editions: [ed(8), ed(3), { id: 'x' }] }).map((a) => a.id),
+}));
+"""
+    got = _run_fake_dom(script)
+    assert got["captions"] == ["Morgen 6 · Abend 20 Uhr", "Morgen 6:30 · Abend 19 Uhr", "Morgen und Abend",
+                               "Morgen und Abend", "Morgen und Abend"]
+    assert got["head"] == ["AUSGABEMorgen 6 · Abend 20 Uhr"]
+    assert got["empty"] == [0, 1, 0, 1]
+    assert got["hrefs"] == ["#/a/8", "#/a/9"]
+    # ohne geladene Quellenliste steht die ID statt des Kurznamens („KIOSK“)
+    # Uhrzeit statt „1 STD“: neben der Lesezeit „5 MIN“ eindeutig
+    assert got["metas"][0] == "kiosk/ KI / 06:02/ 5 MIN"
+    assert got["yesterday"] == "kiosk/ KI / GESTERN 20:00/ 5 MIN"
+    assert got["clock"] == ["06:00", "GESTERN 20:00", "24. SEP 20:05", ""]
+    assert "MIN" not in got["metas"][1]                       # ohne Lesezeit keine Angabe
+    assert got["titles"] == [["Ausgabe 8", False], ["Ausgabe 9", True]]
+    assert got["teasers"] == ["Vorspann 8", None]             # Vorspann gleich dem Titel: keiner
+    assert got["dots"] == [1, 0] and got["imgs"] == 0
+    assert got["noSection"] is None
+    assert got["order"] == [3, 4, 8]                          # Ausgaben hinten, doppelte ID nur einmal
+
+
+def test_article_links_original_and_rail_rules():
+    """Leseansicht: Links „#/…“ bleiben in der App; „Original öffnen“ nur für http(s)-Adressen (die
+    KI-Ausgabe hat „kiosk:…“); keine Kontextspalte für generierte Quellen."""
+    script = """
+const { isAppLink, originalUrl, wantsRail, isGenerated } = await import(process.argv[1] + '/views/article.js');
+const map = new Map([['kiosk', { id: 'kiosk', generated: true }], ['taz', { id: 'taz', generated: false }]]);
+const empty = new Map();
+console.log(JSON.stringify({
+  app: ['#/a/12', '#/s/taz', 'https://x.example/#/a/1', '#', '', null, undefined].map(isAppLink),
+  original: [{ url: 'https://taz.de/a' }, { url: 'HTTP://x.example/' }, { url: 'kiosk:ausgabe/2026-10-03/morning' },
+             { url: 'javascript:alert(1)' }, { url: '' }, {}, null].map(originalUrl),
+  rail: [{ source_id: 'kiosk' }, { source_id: 'taz' }, { source_id: 'unbekannt' }, null].map((i) => wantsRail(i, map)),
+  // Deep-Link ohne Quellenliste: die Adresse entscheidet, ohne Adresse unbekannt (null)
+  railDeep: [{ source_id: 'kiosk', url: 'kiosk:ausgabe/2026-10-03/morning' }, { source_id: 'taz', url: 'https://taz.de/a' },
+             { source_id: 'kiosk' }, { source_id: 'taz', url: 'https://taz.de/a' }].map((i, n) => wantsRail(i, n < 3 ? empty : null)),
+  // die Quellenliste geht der Adresse vor
+  gen: [isGenerated({ source_id: 'taz', url: 'kiosk:x' }, map), isGenerated({ source_id: 'kiosk', url: 'https://x' }, map)],
+}));
+"""
+    got = _run_fake_dom(script)
+    assert got["app"] == [True, True, False, False, False, False, False]
+    assert got["original"] == ["https://taz.de/a", "HTTP://x.example/", None, None, None, None, None]
+    assert got["rail"] == [False, True, None, None]
+    assert got["railDeep"] == [False, True, None, True]
+    assert got["gen"] == [False, True]
+
+
+def test_rail_is_there_at_once_and_goes_for_an_edition_deep_link():
+    """Status unbekannt (Deep-Link ohne Liste und Quellenliste): Kontextspalte sofort mit Ladezustand wie bei
+    jedem Artikel; stellt sich nach dem Laden eine KI-Ausgabe heraus, verschwinden Spalte und has-rail (ohne
+    Anfrage nach verwandten Artikeln). Kommt die Ausgabe aus einer Liste (Quelle bekannt), entsteht sie gar nicht."""
+    script = """
+globalThis.requestAnimationFrame = (fn) => setTimeout(fn, 0);
+globalThis.cancelAnimationFrame = (id) => clearTimeout(id);
+globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+const mk = document.createElement;
+document.createElement = (t) => { const e = mk(t); if (t === 'template') e.content = mk('div'); return e; };
+const { state } = await import(process.argv[1] + '/store.js');
+const { articleView } = await import(process.argv[1] + '/views/article.js');
+const items = {
+  5: { id: 5, title: 'Gewöhnlich', source_id: 'taz', url: 'https://taz.de/a', body_html: '<p>x</p>', text_status: 'full', read: 1 },
+  6: { id: 6, title: 'Ausgabe', source_id: 'kiosk', url: 'kiosk:ausgabe/2026-10-03/morning', body_html: '<p>x</p>',
+       text_status: 'full', read: 1 },
+};
+const gate = defer();
+route = async (path) => {
+  const m = /articles\\/(\\d+)(\\/related)?$/.exec(path);
+  if (m && m[2]) return { story_id: null, sources_count: 1, same_story: [], topic: [] };
+  if (m) { await gate.p; return items[m[1]]; }
+  return {};
+};
+const snap = (v) => [v.el.classList.contains('has-rail'), v.el.querySelectorAll('.art-rail').length];
+const plain = articleView('5');
+const edition = articleView('6');
+const early = [snap(plain), snap(edition)];
+gate.resolve();
+for (let i = 0; i < 5; i++) await tick();
+const late = [snap(plain), snap(edition)];
+// aus der Liste geöffnet (Titelseite): Quelle bekannt, keine Spalte
+state.sourceMap = new Map([['kiosk', { id: 'kiosk', generated: true }]]);
+state.listItems = [{ id: 6, source_id: 'kiosk', title: 'Ausgabe' }];
+const known = articleView('6');
+const knownEarly = snap(known);
+for (let i = 0; i < 5; i++) await tick();
+console.log(JSON.stringify({ early, late, knownEarly, knownLate: snap(known),
+  related: calls.map((c) => c[1]).filter((p) => p.endsWith('/related')) }));
+"""
+    got = _run_fake_dom(script)
+    assert got["early"] == [[True, 1], [True, 1]]
+    assert got["late"] == [[True, 1], [False, 0]]
+    assert got["knownEarly"] == [False, 0] and got["knownLate"] == [False, 0]
+    assert got["related"] == ["/api/articles/5/related"]
+
+
+def test_mark_edition_sets_lead_and_sources_classes():
+    """KI-Ausgabe: Vorspann (erster Absatz nur aus <strong>) wird art-lead, der letzte Zwischentitel
+    „Quellen“ und der Absatz danach art-sources-h/art-sources; anderes bleibt ohne Klassen."""
+    script = """
+const { markEdition } = await import(process.argv[1] + '/views/article.js');
+const el = (tag, ...kids) => { const e = document.createElement(tag); e.append(...kids); return e; };
+const build = (...kids) => el('div', ...kids);
+const root = build(el('p', el('strong', 'Vorspann')), el('h2', 'Lage'), el('p', 'Absatz'), el('h2', 'Quellen'),
+                   el('p', 'SPIEGEL · FAZ'));
+markEdition(root);
+const other = build(el('p', 'Text ', el('strong', 'fett')), el('h2', 'Quellen'), el('ul'));
+markEdition(other);
+const cls = (r) => r.children.map((c) => c.className);
+console.log(JSON.stringify({ root: cls(root), other: cls(other), body: [root.className, other.className] }));
+"""
+    got = _run_fake_dom(script)
+    assert got["root"] == ["art-lead", "", "", "art-sources-h", "art-sources"]
+    assert got["other"] == ["", "art-sources-h", ""]
+    assert got["body"] == ["is-edition", "is-edition"]          # nur in Ausgaben sind Belege blau
+
+
+def test_edition_css_rules():
+    """KI-Ausgabe im Stylesheet: Belege blau mit Unterstrich, Vorspann, Quellen-Block, zwei Spalten."""
+    css = (JS.parent / "css" / "app.css").read_text(encoding="utf-8")
+    flat = " ".join(css.split())
+    assert '.article-body.is-edition a[href^="#/a/"] { color: var(--signal-text);' in flat
+    assert '.article-body a[href^="#/a/"]' not in flat.replace('.article-body.is-edition a[href^="#/a/"]', "")
+    assert ".article-body h2 { text-wrap: balance; }" in flat
+    assert ".article-body a { color: var(--ink); text-decoration: underline;" in flat
+    assert ".article-body strong, .article-body b { font-weight: 600; }" in flat
+    assert ".article-body .art-lead { font-size: calc(19px * var(--scale)); line-height: calc(29px * var(--scale)); " \
+           "font-weight: 500; }" in flat
+    assert ".article-body .art-lead strong { font-weight: inherit; }" in flat
+    assert ".article-body .art-sources-h { border-top: 1px solid var(--hairline); padding-top: 16px; margin-top: 8px; " \
+           "font-family: var(--font-dot);" in flat
+    assert "@container (min-width: 560px) { .fp-ed-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); " \
+           "column-gap: 24px; } .fp-ed-row + .fp-ed-row { border-top: 0; } }" in flat

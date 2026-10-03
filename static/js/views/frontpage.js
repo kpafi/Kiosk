@@ -1,9 +1,10 @@
 // Titelseite (E3DesktopTitelseite): rechte Seite am Desktop ohne offenen Artikel, wenn in den
 // Einstellungen gewählt; am Handy eine eigene Seite (#/titelseite, views/front.js). Aufmacher (größte
-// Geschichte des Tages) und je Profil bis zu drei Geschichten. Daten aus GET /api/frontpage.
+// Geschichte des Tages), je Profil bis zu drei Geschichten und ganz unten die KI-Ausgaben des Tages
+// (Rubrik AUSGABE). Daten aus GET /api/frontpage.
 import { h } from '../ui/dom.js';
 import { metaParts } from '../ui/row.js';
-import { cleanText, clockTime, shortDate } from '../format.js';
+import { cleanText, clockLabel, clockTime, readMinutes, shortDate } from '../format.js';
 import { profileById, state } from '../store.js';
 import { emptyState } from '../ui/empty.js';
 import { homeHead } from './overview.js';
@@ -73,6 +74,43 @@ function section(sec) {
 
 const hasArticle = (e) => !!(e && e.article && Number.isInteger(e.article.id));
 
+/** „Morgen 6 · Abend 20 Uhr“ aus edition_times (["06:00", "20:00"]); fehlt es: „Morgen und Abend“. */
+export function editionCaption(times) {
+  const hour = (t) => {
+    const m = /^(\d{1,2}):(\d{2})$/.exec(String(t ?? ''));
+    if (!m) return null;
+    return m[2] === '00' ? String(Number(m[1])) : `${Number(m[1])}:${m[2]}`;
+  };
+  const [morning, evening] = Array.isArray(times) ? times.map(hour) : [];
+  return morning && evening ? `Morgen ${morning} · Abend ${evening} Uhr` : 'Morgen und Abend';
+}
+
+/** Eine Ausgabe als Zeile wie in der Liste: Meta mit Lesezeit, Titel, zwei Zeilen Vorspann, kein Bild. */
+function editionRow(a, now = new Date()) {
+  const minutes = readMinutes(a);
+  const teaser = cleanText(a.summary, a.title);
+  return h('a', { class: 'fp-ed-row', href: `#/a/${a.id}` },
+    // Uhrzeit („06:00“) statt „2 STD“: neben der Lesezeit „7 MIN“ wäre „2 MIN“ doppeldeutig.
+    h('span', { class: 'row-meta t-meta' }, metaParts(a, (iso) => clockLabel(iso, now)),
+      minutes > 0 ? h('span', { class: 'row-when fp-ed-min', text: `/ ${minutes} MIN` }) : null),
+    h('span', { class: `fp-ed-title${a.read ? ' is-read' : ''}`, text: a.title || '(ohne Titel)' }),
+    teaser ? h('span', { class: 'fp-ed-teaser', text: teaser }) : null);
+}
+
+/** Rubrik AUSGABE (KI-Ausgaben des Tages, neueste zuerst); ohne Ausgaben null. */
+export function editionsSection(data, now = new Date()) {
+  const items = editionsOf(data || {});
+  if (!items.length) return null;
+  return h('section', { class: 'fp-sec fp-ed' },
+    homeHead('AUSGABE', editionCaption(data.edition_times)),
+    h('div', { class: 'fp-ed-list' }, items.map((a) => editionRow(a, now))));
+}
+
+/** Ausgaben mit gültiger Artikel-ID (Teilantworten: der Rest fällt weg). */
+function editionsOf(data) {
+  return (Array.isArray(data.editions) ? data.editions : []).filter((a) => a && Number.isInteger(a.id));
+}
+
 /** Kopf der Titelseite: TITELSEITE, Kurzdatum, Uhr, „aus deinen Profilen“ (window '24h': kurz nach
  *  Mitternacht zeigt der Server die letzten 24 Stunden, dann „Letzte 24 Std“). */
 export function frontpageHeader(now = new Date(), range = 'today') {
@@ -88,28 +126,28 @@ function shown(data) {
     .filter((s) => s && Array.isArray(s.items))
     .map((s) => ({ ...s, items: s.items.filter(hasArticle) }))
     .filter((s) => s.items.length);
-  return { leadStory: hasArticle(data.lead) ? data.lead : null, sections };
+  return { leadStory: hasArticle(data.lead) ? data.lead : null, sections, editions: editionsOf(data) };
 }
 
-/** Artikel der Titelseite in Anzeigereihenfolge (Aufmacher, dann die Rubriken), jeder nur einmal:
- *  am Handy die Liste für „Nächster“ und die sofortige Vorschau (state.listItems). */
+/** Artikel der Titelseite in Anzeigereihenfolge (Aufmacher, die Rubriken, zuletzt die Ausgaben), jeder
+ *  nur einmal: am Handy die Liste für „Nächster“ und die sofortige Vorschau (state.listItems). */
 export function frontpageArticles(data) {
-  const { leadStory, sections } = shown(data || {});
+  const { leadStory, sections, editions } = shown(data || {});
   const seen = new Set();
   const out = [];
-  for (const e of [leadStory, ...sections.flatMap((s) => s.items)]) {
-    if (!e || seen.has(e.article.id)) continue;
-    seen.add(e.article.id);
-    out.push(e.article);
+  for (const a of [leadStory?.article, ...sections.flatMap((s) => s.items.map((e) => e.article)), ...editions]) {
+    if (!a || seen.has(a.id)) continue;
+    seen.add(a.id);
+    out.push(a);
   }
   return out;
 }
 
 /** keys: false lässt die Tastenhinweise im Leerzustand weg (Handy). */
 export function frontpageContent(data, now = new Date(), { keys = true } = {}) {
-  const { leadStory, sections } = shown(data);
+  const { leadStory, sections, editions } = shown(data);
   const top = frontpageHeader(now, data.window);
-  if (!leadStory && !sections.length) {
+  if (!leadStory && !sections.length && !editions.length) {
     const empty = emptyState({ title: 'NOCH LEER', text: 'Für die Titelseite gibt es heute noch keine Geschichten aus deinen Profilen.' });
     if (keys) empty.append(keyHints());
     return h('div', { class: 'home-page home-page--front' }, top, empty);
@@ -117,5 +155,6 @@ export function frontpageContent(data, now = new Date(), { keys = true } = {}) {
   return h('div', { class: 'home-page home-page--front' },
     top,
     leadStory ? lead(leadStory) : null,
-    sections.map(section));
+    sections.map(section),
+    editionsSection(data, now));
 }

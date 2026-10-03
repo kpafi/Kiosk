@@ -46,16 +46,18 @@ function markIcon(item, mode) {
 }
 
 /** Meta-Zeile wie in der Liste ohne Markierung: Ungelesen-Punkt, QUELLE, „/ LAND / ZEIT“. */
-export function metaParts(item) {
+/** Meta-Zeile: Ungelesen-Punkt, Kurzname, „/ LAND / ZEIT“; `timeText(iso)` setzt die Zeit (Standard:
+ *  relativ wie in der Liste, listTime). */
+export function metaParts(item, timeText = listTime) {
   return [
     !item.read ? h('span', { class: 'unread-dot', role: 'img', 'aria-label': 'Ungelesen' }) : null,
     h('span', { class: 'row-src', text: sourceLabel(item.source_id, item.source_name) }),
-    h('span', { class: 'row-when', text: whenText(item) }),
+    h('span', { class: 'row-when', text: whenText(item, timeText) }),
   ];
 }
 
-function whenText(item) {
-  return `/ ${item.country || '?'} / ${listTime(item.published_at)}`;
+function whenText(item, timeText = listTime) {
+  return `/ ${item.country || '?'} / ${timeText(item.published_at)}`;
 }
 
 /** Relative Zeit einer Listenzeile neu schreiben (sie veraltet in einer lange offenen App). */

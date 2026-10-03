@@ -331,6 +331,9 @@ def test_catalog_uses_default_ports_only():
     from urllib.parse import urlparse
     catalog = Catalog.load(Path(__file__).resolve().parent.parent / "sources.yaml")
     for src in catalog.all():
+        if src.generated:
+            assert src.feed == ""           # KI-Ausgabe: kein Feed
+            continue
         parsed = urlparse(src.feed)
         assert parsed.scheme in ("http", "https") and parsed.port in (None, {"http": 80, "https": 443}[parsed.scheme]), src.id
 

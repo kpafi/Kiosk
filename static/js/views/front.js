@@ -1,6 +1,6 @@
 // Titelseite am Handy (#/titelseite): Kopf wie die Liste, darunter dieselbe Titelseite wie rechts am
-// Desktop (Aufmacher, je Profil bis zu drei Geschichten). Laden, Neuladen und Uhr wie dort (readerHome
-// in home.js). Die App beginnt am Handy hier; am Desktop leitet app.js zur Liste um.
+// Desktop (Aufmacher, je Profil bis zu drei Geschichten, die KI-Ausgaben). Laden, Neuladen und Uhr wie
+// dort (readerHome in home.js). Die App beginnt am Handy hier; am Desktop leitet app.js zur Liste um.
 import { h } from '../ui/dom.js';
 import { on, state } from '../store.js';
 import { homeHeader } from './list.js';
@@ -27,7 +27,7 @@ export function frontView() {
   const offFlags = on('flags', (patch) => {
     if (!('read' in patch)) return;
     const link = `a[href="#/a/${Number(patch.id)}"]`;
-    for (const t of home.el.querySelectorAll(`${link} .fp-item-title, ${link} .fp-lead-title`)) {
+    for (const t of home.el.querySelectorAll(`${link} .fp-item-title, ${link} .fp-lead-title, ${link} .fp-ed-title`)) {
       t.classList.toggle('is-read', !!patch.read);
     }
   });

@@ -25,7 +25,8 @@ function errText(err) {
 }
 
 function subLine(s, admin) {
-  const cc = s.country || '?';
+  // Generierte Quelle (KI-Ausgabe): statt des Ländercodes, was sie ist.
+  const cc = s.generated ? 'KI-Ausgabe' : (s.country || '?');
   // Nicht-Admins sehen AUS schon rechts in der Zeile, hier nicht noch einmal.
   if (!s.enabled) return h('span', { class: 't-caption', text: admin ? `${cc} · Aus` : cc });
   if (s.last_error) {

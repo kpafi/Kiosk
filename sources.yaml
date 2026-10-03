@@ -176,8 +176,10 @@ sources:
   # UN und AFR sind keine ISO-Codes (Vereinte Nationen, Afrika mehrerer Länder); Namen in static/js/format.js.
   - {id: unnews,       name: UN News,                 short: "UN NEWS",       country: UN, lang: en, feed: "https://news.un.org/feed/subscribe/en/news/all/rss.xml", homepage: "https://news.un.org/en/",
      in_all: false, in_edition: true, note: "Nicht in ALLE; eigene Ansicht, Profil und KI-Ausgabe"}
+  # ReliefWeb: vom Laptop aus geht der Feed, vom Hetzner-Server antwortet er dem Sammler mit HTTP 202 und leerem Rumpf
+  # (Bot-Schutz gegen HTTP/1.1-Clients aus Rechenzentren; curl mit HTTP/2 bekommt 200; 03.10.2026): deshalb aus.
   - {id: reliefweb,    name: ReliefWeb,               short: "RELIEFWEB",     country: UN, lang: en, feed: "https://reliefweb.int/updates/rss.xml?view=headlines", homepage: "https://reliefweb.int",
-     in_all: false, in_edition: true, note: "UN-Dienst für humanitäre Lageberichte; nicht in ALLE; eigene Ansicht, Profil und KI-Ausgabe"}
+     in_all: false, in_edition: true, default_enabled: false, note: "UN-Dienst für humanitäre Lageberichte; nicht in ALLE; eigene Ansicht, Profil und KI-Ausgabe; der Feed sperrt den Server (HTTP 202 ohne Inhalt)"}
   # The Hindu: ohne Videos (/videos/) und Podcasts (/podcast/), kein Artikeltext. Vom Laptop aus geht der Feed,
   # vom Hetzner-Server antwortet er mit einer Cloudflare-Prüfseite (HTTP 403, 03.10.2026): deshalb aus.
   - {id: thehindu,     name: The Hindu,               short: "THE HINDU",     country: IN, lang: en, feed: "https://www.thehindu.com/news/international/feeder/default.rss", homepage: "https://www.thehindu.com",

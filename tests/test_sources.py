@@ -410,8 +410,8 @@ def test_weltlage_sources(sid, short, country):
     assert (src.short, src.country, src.lang) == (short, country, "en")
     assert len(src.short) <= SHORT_MAX
     assert src.in_all is False and src.in_edition is True
-    # The Hindu sperrt Server-Zugriffe (Cloudflare-Prüfseite vom Hetzner-Server aus), deshalb aus
-    assert src.default_enabled is (sid != "thehindu")
+    # The Hindu (Cloudflare-Prüfseite) und ReliefWeb (HTTP 202 ohne Inhalt) sperren den Server: aus
+    assert src.default_enabled is (sid not in ("thehindu", "reliefweb"))
     assert not src.generated and src.category == "general"
     assert src.feed.startswith("https://") and src.homepage.startswith("https://")
     assert "nicht in alle" in src.note.lower() and "KI-Ausgabe" in src.note

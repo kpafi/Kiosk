@@ -126,6 +126,26 @@ CATALOG = Catalog([
 ])
 
 
+def test_edition_sources_follow_in_edition(db):
+    """Die KI-Ausgabe liest aktivierte Quellen mit in_edition (Standard wie in_all), nie generierte und nie
+    ausgeschaltete."""
+    catalog = Catalog([
+        Source(id="alpha", name="Alpha", country="DE", lang="de", feed="https://a.example/f", homepage=""),
+        Source(id="beta", name="Beta", country="GB", lang="en", feed="https://b.example/f", homepage="",
+               in_all=False, in_edition=True),
+        Source(id="gamma", name="Gamma", country="FR", lang="fr", feed="https://c.example/f", homepage="",
+               in_all=False, in_edition=True),
+        Source(id="delta", name="Delta", country="DE", lang="de", feed="https://d.example/f", homepage="",
+               in_edition=False),
+        Source(id="zeta", name="Zeta", country="DE", lang="de", feed="https://z.example/f", homepage="",
+               in_all=False),
+        Source(id="kiosk", name="Kiosk", country="KI", lang="de", feed="", homepage="", generated=True,
+               in_edition=True),
+    ])
+    db.ensure_sources([("delta", True), ("zeta", True), ("kiosk", True)])   # gamma bleibt aus (Fixture)
+    assert ed.edition_sources(db, catalog) == ["alpha", "beta"]
+
+
 @pytest.fixture
 def edb(db):
     """Datenbank mit dem Katalog oben: alpha, beta, delta, zeta, kiosk an; gamma aus."""
@@ -807,6 +827,7 @@ def test_edition_is_in_all_search_and_source_view_but_never_a_story(client):
     sources = {s["id"]: s for s in c.get("/api/sources").json()}
     assert sources["kiosk"]["generated"] is True and sources["alpha"]["generated"] is False
     assert sources["kiosk"]["total"] == 1 and sources["kiosk"]["in_all"] is True
+    assert sources["kiosk"]["in_edition"] is False and sources["alpha"]["in_edition"] is True
 
 
 def test_profile_with_kiosk_in_its_list_shows_no_edition_on_the_front_page(client):
@@ -1469,3 +1490,30 @@ def test_render_binds_names_and_never_starts_a_line_with_a_dot():
     line = body.split("<h2>Quellen</h2><p>")[1]
     assert line.startswith("TIMES\u00a0INDIA\u00a0· AL\u00a0JAZEERA\u00a0· Z0") and line.endswith("\u00a0· 13\u00a0weitere</p>")
     assert " ·" not in line and line.count("·") == 12
+
+
+def test_collect_drops_the_same_page_from_two_feeds(edb):
+    """Dieselbe Seite in zwei Feeds eines Verlags (Guardian World und Global Development) steht nur einmal im
+    Block: bevorzugt aus der Quelle in ALLE, sonst die zuerst gesehene; Query und Fragment zählen nicht."""
+    catalog = Catalog([
+        Source(id="alpha", name="Alpha", short="ALPHA", country="DE", lang="de", feed="https://a.example/f", homepage=""),
+        Source(id="delta", name="Delta", short="DELTA", country="DE", lang="de", feed="https://d.example/f", homepage=""),
+        Source(id="zeta", name="Zeta", short="ZETA", country="DE", lang="de", feed="https://z.example/f", homepage="",
+               in_all=False, in_edition=True),
+        Source(id="kiosk", name="Kiosk", short="KIOSK", country="KI", lang="de", feed="", homepage="", generated=True),
+    ])
+    url = "https://www.example.org/world/2026/oct/03/story"
+    # zeta (nicht in ALLE) ist neuer, alpha (in ALLE) wird trotzdem behalten
+    z = add(edb, "zeta", 1, ago(hours=1), title="Story", summary="Teaser der Meldung.", url=url + "?utm=x")
+    a = add(edb, "alpha", 1, ago(hours=2), title="Story", summary="Teaser der Meldung.", url=url + "#top")
+    # zwei Quellen in ALLE mit derselben Seite: die zuerst gesehene (neueste) bleibt
+    d1 = add(edb, "delta", 1, ago(hours=1), title="Andere", summary="Zweite Meldung.", url="https://www.example.org/x")
+    add(edb, "alpha", 2, ago(hours=3), title="Andere", summary="Zweite Meldung.", url="HTTPS://WWW.EXAMPLE.ORG/x/")
+    # ohne URL nichts zusammenlegen
+    e1 = add(edb, "alpha", 3, ago(hours=4), title="Ohne", summary="Keine Adresse.", url="")
+    e2 = add(edb, "delta", 3, ago(hours=5), title="Ohne", summary="Keine Adresse.", url="")
+    groups, stats = ed.collect(edb, catalog, ago(hours=10))
+    ids = {g["rep"]["id"] for g in groups}
+    assert a in ids and z not in ids
+    assert d1 in ids and e1 in ids and e2 in ids
+    assert stats["shown_articles"] == 4

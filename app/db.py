@@ -1233,7 +1233,7 @@ class Database:
         floor = _iso(datetime.fromisoformat(since) - EDITION_LATE_MAX)
         upper = f"AND a.{column} <= ? " if until is not None else ""   # Sekundengenau: einschließlich
         params: tuple = (*sources, floor, since) + ((until,) if until is not None else ())
-        return self.q(f"SELECT a.id, a.source_id, a.title, a.summary, a.published_at, a.story_id "
+        return self.q(f"SELECT a.id, a.source_id, a.url, a.title, a.summary, a.published_at, a.story_id "
                       f"FROM articles a {COUNT_INDEX} WHERE a.source_id IN ({','.join('?' * len(sources))}) "
                       f"AND a.published_at >= ? AND a.{column} >= ? {upper}AND a.paywalled=0 "
                       "ORDER BY a.published_at DESC, a.id DESC", params, time_limit=None)

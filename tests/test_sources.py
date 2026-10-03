@@ -5,9 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from app.sources import Catalog
+from app.sources import SHORT_MAX, Catalog, Source
 
 ROOT = Path(__file__).resolve().parent.parent
+# Nicht in ALLE, aber Lesestoff der KI-Ausgabe (in_all: false, in_edition: true)
+WELTLAGE = {"unnews", "reliefweb", "thehindu", "africanews", "guardiandev", "carbonbrief", "dabanga"}
 
 
 def _load(tmp_path, country_yaml: str) -> Catalog:
@@ -55,8 +57,9 @@ def test_short_defaults_to_upper_name_and_is_validated(tmp_path):
 def test_shipped_catalog_has_distinct_short_names():
     catalog = Catalog.load(ROOT / "sources.yaml")
     shorts = [s.short for s in catalog.all()]
-    # CNN und PBS am 28.09.2026 entfernt; dazu die KI-Ausgabe (kiosk) seit 03.10.2026
-    assert len(shorts) == 94 and len(set(shorts)) == 94
+    # CNN und PBS am 28.09.2026 entfernt; dazu die KI-Ausgabe (kiosk) seit 03.10.2026 und die sieben
+    # Weltlage-Quellen für die KI-Ausgabe
+    assert len(shorts) == 101 and len(set(shorts)) == 101
     assert all(0 < len(x) <= 12 and x == x.upper() for x in shorts)
     assert catalog.get("spiegel").short == "SPIEGEL"
 
@@ -165,7 +168,7 @@ def test_focus_include_paths(path, wanted):
 def test_focus_is_not_in_all_by_default():
     """FOCUS steht nur für Konten mit all_extra_sources in ALLE (wie heise Security gar nicht)."""
     catalog = Catalog.load(ROOT / "sources.yaml")
-    assert {s.id for s in catalog.all() if not s.in_all} == {"heisesec", "focus"}
+    assert {s.id for s in catalog.all() if not s.in_all} == {"heisesec", "focus"} | WELTLAGE
     assert catalog.get("focus").default_enabled is True and "Nicht in ALLE" in catalog.get("focus").note
 
 
@@ -223,7 +226,7 @@ def test_in_all_is_validated_and_set_for_heise_security(tmp_path):
     assert Catalog.load(path).get("x").in_all is False
     assert _load(tmp_path, "country: DE,").get("x").in_all is True
     catalog = Catalog.load(ROOT / "sources.yaml")
-    assert [s.id for s in catalog.all() if not s.in_all] == ["focus", "heisesec"]   # FOCUS: siehe unten
+    assert [s.id for s in catalog.all() if not s.in_all and s.id not in WELTLAGE] == ["focus", "heisesec"]
     sec = catalog.get("heisesec")
     assert sec.default_enabled is True and "Nicht in ALLE" in sec.note
 
@@ -359,3 +362,84 @@ def test_shipped_catalog_has_the_kiosk_edition_last():
     assert (kiosk.name, kiosk.short, kiosk.country, kiosk.lang, kiosk.feed, kiosk.homepage) == \
         ("Kiosk", "KIOSK", "KI", "de", "", "")
     assert kiosk.in_all and kiosk.default_enabled and "OPENROUTER_API_KEY" in kiosk.note
+
+
+def test_in_edition_defaults_to_in_all_and_is_validated(tmp_path):
+    """in_edition: nur true/false; ohne Angabe wie in_all; generierte Quellen nie."""
+    path = tmp_path / "sources.yaml"
+    for bad in ('"true"', "1", "0", "ja", "[]"):
+        path.write_text(f'sources:\n  - {{id: x, name: X, country: DE, feed: "https://x.example/f", in_edition: {bad}}}\n',
+                        encoding="utf-8")
+        with pytest.raises(ValueError, match="Quelle x: in_edition muss true oder false sein"):
+            Catalog.load(path)
+    rows = {
+        "a": "",                                    # Standard: in_all true -> true
+        "b": "in_all: false,",                      # Standard: wie in_all -> false
+        "c": "in_all: false, in_edition: true,",
+        "d": "in_edition: false,",
+        "e": "in_all: true, in_edition: true,",
+    }
+    path.write_text("sources:\n" + "".join(
+        f'  - {{id: {sid}, name: {sid.upper()}, country: DE, {extra} feed: "https://{sid}.example/f"}}\n'
+        for sid, extra in rows.items()) + '  - {id: k, name: K, country: KI, feed: "", generated: true, in_edition: true}\n',
+        encoding="utf-8")
+    catalog = Catalog.load(path)
+    assert {s.id: (s.in_all, s.in_edition) for s in catalog.all()} == {
+        "a": (True, True), "b": (False, False), "c": (False, True), "d": (True, False), "e": (True, True),
+        "k": (True, False)}
+    # Direkt gebaute Quellen (Tests) folgen derselben Regel
+    assert Source(id="z", name="Z", country="DE", lang="de", feed="f", homepage="", in_all=False).in_edition is False
+    assert Source(id="z", name="Z", country="DE", lang="de", feed="f", homepage="").in_edition is True
+
+
+def test_shipped_catalog_in_edition():
+    """Bestand unverändert (FOCUS und heise Security bleiben aus der KI-Ausgabe, kiosk sowieso);
+    die Weltlage-Quellen stehen nicht in ALLE, aber in der KI-Ausgabe."""
+    catalog = Catalog.load(ROOT / "sources.yaml")
+    assert {s.id for s in catalog.all() if not s.in_edition} == {"focus", "heisesec", "kiosk"}
+    assert {s.id for s in catalog.all() if s.in_edition and not s.in_all} == WELTLAGE
+
+
+@pytest.mark.parametrize("sid,short,country", [
+    ("unnews", "UN NEWS", "UN"), ("reliefweb", "RELIEFWEB", "UN"), ("thehindu", "THE HINDU", "IN"),
+    ("africanews", "AFRICANEWS", "AFR"), ("guardiandev", "GUARDIAN DEV", "GB"),
+    ("carbonbrief", "CARBON BRIEF", "GB"), ("dabanga", "DABANGA", "SD"),
+])
+def test_weltlage_sources(sid, short, country):
+    src = Catalog.load(ROOT / "sources.yaml").get(sid)
+    assert (src.short, src.country, src.lang) == (short, country, "en")
+    assert len(src.short) <= SHORT_MAX
+    assert src.in_all is False and src.in_edition is True and src.default_enabled is True
+    assert not src.generated and src.category == "general"
+    assert src.feed.startswith("https://") and src.homepage.startswith("https://")
+    assert "nicht in alle" in src.note.lower() and "KI-Ausgabe" in src.note
+
+
+@pytest.mark.parametrize("url,wanted", [
+    ("https://www.thehindu.com/news/international/iran-executes-man/article71536001.ece", True),
+    ("https://www.thehindu.com/business/markets/x/article1.ece", True),
+    ("https://www.thehindu.com/videos/trump-says-iran-link-possible/article71536084.ece", False),
+    ("https://www.thehindu.com/podcast/us-china-detente-podcast/article71536787.ece", False),
+])
+def test_the_hindu_videos_and_podcasts_are_excluded(url, wanted):
+    assert Catalog.load(ROOT / "sources.yaml").get("thehindu").wants_url(url) is wanted
+
+
+@pytest.mark.parametrize("url,wanted", [
+    ("https://www.theguardian.com/global-development/2026/oct/02/row-erupts-over-cairo-mural", True),
+    ("https://www.theguardian.com/world/2026/oct/02/some-story", True),
+    ("https://www.theguardian.com/world/video/2026/aug/23/ebola-day-100-explainer", False),
+    # Newsletter- und Hinweisseiten, die der Feed seit Jahren mitführt
+    ("https://www.theguardian.com/info/2017/jun/08/global-dispatch-sign-up-for-our-newsletter", False),
+    ("https://www.theguardian.com/global/2022/sep/20/sign-up-for-the-her-stage-newsletter", False),
+    ("https://www.theguardian.com/global-development/audio/2026/oct/01/some-podcast", False),
+])
+def test_guardian_development_videos_are_excluded(url, wanted):
+    assert Catalog.load(ROOT / "sources.yaml").get("guardiandev").wants_url(url) is wanted
+
+
+def test_guardian_development_is_the_guardian_in_stories():
+    """Dieselbe Meldung kann in beiden Guardian-Feeds stehen; in Geschichten zählen sie als eine Zeitung."""
+    from app.stories import publisher
+    assert publisher("guardiandev") == publisher("guardian") == "guardian"
+    assert publisher("unnews") == "unnews" and publisher("reliefweb") == "reliefweb"

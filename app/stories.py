@@ -1148,12 +1148,12 @@ def is_soft(row: Any) -> bool:
 
 # Verlage mit mehreren Quellen im Katalog: Ihre Ausgaben zählen als eine Zeitung.
 _PUBLISHER_PREFIXES = (("thelocal", "thelocal"),)
-_PUBLISHERS = {"heisesec": "heise"}
+_PUBLISHERS = {"heisesec": "heise", "guardiandev": "guardian"}
 
 
 def publisher(source_id: str) -> str:
     """Verlag einer Quelle: The Local Deutschland/Österreich/... sind eine Zeitung, heise Security
-    gehört zu heise; sonst die Quelle selbst."""
+    gehört zu heise, Guardian Global Development zum Guardian; sonst die Quelle selbst."""
     for prefix, name in _PUBLISHER_PREFIXES:
         if source_id.startswith(prefix):
             return name

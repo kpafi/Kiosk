@@ -83,7 +83,7 @@ Anfangsbuchstaben („Admin“). Der letzte aktive Admin lässt sich nicht lösc
 | POST | `/api/logout` | Abmelden; beendet alle Sitzungen dieses Benutzers auf allen Geräten |
 | GET | `/api/session` | Ohne Login: `{authenticated, user}`, `user` ist `{id, username, display_name, is_admin}` oder `null` |
 | GET | `/api/me` | Der angemeldete Benutzer `{id, username, display_name, is_admin}` |
-| GET | `/api/sources` | Alle Quellen mit Status und Zählern, Kurzname `short`, `is_favorite`, `generated` (KI-Ausgabe, kein Feed) |
+| GET | `/api/sources` | Alle Quellen mit Status und Zählern, Kurzname `short`, `is_favorite`, `in_all` (je Benutzer), `in_edition` (liest die KI-Ausgabe), `generated` (KI-Ausgabe, kein Feed) |
 | PATCH | `/api/sources/{id}` `{enabled}` | Quelle ein-/ausschalten (nur Admin, sonst 403) |
 | POST | `/api/sources/bulk` `{enabled:[], disabled:[]}` | Mehrere Quellen umschalten (nur Admin) |
 | GET | `/api/articles?source=&country=&profile=&q=&unread=&starred=&later=&free=&days=&before=&offset=&limit=` | Artikelliste, siehe Blättern und Filter |
@@ -144,7 +144,7 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
   Artikel“, `read-all` ohne Quelle, Suche ohne Quelle, `country` ohne Quelle, Profile mit
   `sources: null`, der ALLE-Zähler in `/api/bar` und `unread` in `/api/counts`): die aktivierten Quellen
   ohne die mit `in_all: false` in `sources.yaml` (heise Security, deren Meldungen auch bei heise online
-  stehen, und FOCUS online). Ausdrücklich genannt zählen sie: `source=heisesec`, Profile mit Quellenliste, die
+  stehen, FOCUS online und die Weltlage-Quellen für die KI-Ausgabe wie UN News und ReliefWeb). Ausdrücklich genannt zählen sie: `source=heisesec`, Profile mit Quellenliste, die
   Zähler in `/api/sources`, Lieblingszeitungen und ihre Chips in der Leiste. Gemerkt
   (`starred`/`later`) zeigt wie bisher alles Gemerkte. Das vorgegebene Profil Deutschland lässt solche
   Quellen beim Anlegen weg.
@@ -295,8 +295,11 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
   20:10 geholt wird, steht in der Morgenausgabe, ebenso Feeds mit bloßem Tagesdatum. Zusätzlich darf ein Artikel
   höchstens 48 Stunden vor dem Zeitraum erschienen sein (keine alten Artikel einer neu eingeschalteten Quelle).
   Im Artikelblock steht weiter das Erscheinungsdatum. Eingabe sind die Artikel ohne Paywall
-  aus den Quellen, die für „alle Quellen“ zählen (aktiviert, `in_all: true`, nicht generiert; unabhängig von
-  `all_extra_sources`): nach Geschichte gruppiert, Gruppen nach Zahl der Zeitungen, dann der neueste Artikel;
+  aus allen aktivierten Quellen mit `in_edition: true` (Standard ist der Wert von `in_all`; nicht generiert;
+  unabhängig von `all_extra_sources`). So liest die KI-Ausgabe auch die Weltlage-Quellen, die nicht in ALLE
+  stehen (UN News, ReliefWeb, The Hindu, Africanews, Guardian Global Development, Carbon Brief, Radio Dabanga:
+  `in_all: false, in_edition: true`), FOCUS online und heise Security aber weiter nicht. Die Artikel werden
+  nach Geschichte gruppiert, Gruppen nach Zahl der Zeitungen, dann der neueste Artikel;
   je Gruppe ein Vertreter mit Titel und Anreißer (220 Zeichen), die übrigen mit Titel (120 Zeichen, höchstens
   6, dann „… und N weitere“). Je Quelle höchstens 40 Artikel (die einer Geschichte zuerst, dann die neuesten),
   höchstens 600 Gruppen und 160 000 Zeichen. Kein Volltext. Blockkopf und Zeile unter dem Titel nennen nur
@@ -410,6 +413,11 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
   `tagesthema` und die Ratgeber `gesundheit`, `familie`, `panorama/oktoberfest`, `reisen/fernreisen`,
   `finanzen/altersvorsorge`, `finanzen/karriere`, `immobilien/kaufen`, `auto/fahrberichte`). Hat der Filter alles verworfen, gilt der Abruf als erfolgreich (0 neue), ebenso
   eine leere Sitemap.
+- `in_all` (optional, Standard `true`): `false` nimmt die Quelle aus „alle Quellen“ (siehe Filter).
+  `in_edition` (optional, Standard der Wert von `in_all`): ob die KI-Ausgabe die Quelle liest; generierte
+  Quellen nie. Beide nur `true` oder `false`, sonst startet die App nicht.
+- `country`: ISO-Ländercode, dazu `EU` (europaweit), `UN` (Vereinte Nationen), `AFR` (ganz Afrika) und `KI`
+  (die KI-Ausgabe); die Namen dazu stehen in `static/js/format.js` (`COUNTRIES`).
 - `guid_pattern` (optional): regulärer Ausdruck mit genau einer Gruppe, auf die Eintrags-URL angewandt;
   die Gruppe ist die GUID (GEA: `_arid,(\d+)`, die Artikelnummer), passt er nicht, bleibt die übliche.
 - Private, lokale und Metadaten-Adressen werden bei jedem Hop abgelehnt. Gegen DNS-Rebinding löst

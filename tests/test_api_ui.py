@@ -701,7 +701,9 @@ def test_in_all_false_source_is_visible_when_named(sec_client):
     assert _sources_of(c.get("/api/articles", params={"source": "sec,alpha"}).json()) == ["alpha", "sec"]
     sec = next(s for s in c.get("/api/sources").json() if s["id"] == "sec")
     assert sec["in_all"] is False and sec["unread"] == 1 and sec["enabled"] is True
-    assert next(s for s in c.get("/api/sources").json() if s["id"] == "alpha")["in_all"] is True
+    assert sec["in_edition"] is False                                   # Standard wie in_all
+    alpha = next(s for s in c.get("/api/sources").json() if s["id"] == "alpha")
+    assert alpha["in_all"] is True and alpha["in_edition"] is True
     # Lieblingszeitung mit Chip in der Leiste: eigener Zähler
     assert c.put("/api/favorites/sources/sec", json={"in_bar": True}).status_code == 200
     chip = next(it for it in c.get("/api/bar").json()["items"] if it["key"] == "source:sec")

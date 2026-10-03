@@ -31,6 +31,7 @@ console.log(JSON.stringify({
   ago: [fmt.ago(at(26, 11, 59, 30), now), fmt.ago(at(26, 11, 48), now), fmt.ago(at(26, 9), now), fmt.ago(at(24, 12), now)],
   cleanText: [fmt.cleanText(' None '), fmt.cleanText('null'), fmt.cleanText('Titel', ' titel '),
               fmt.cleanText('  Echter Text '), fmt.cleanText(undefined)],
+  countries: ['UN', 'afr', 'SD', 'KI', 'DE', 'XX', ''].map(fmt.countryName),
   routes: ['', '#/', '#/?p=4', '#/a/12', '#/a/x', '#/s/taz', '#/gemerkt?tab=favoriten',
            '#/profile', '#/profile/neu', '#/profile#zeitungen', '#/quatsch', '#/titelseite'].map(route),
 }));
@@ -60,6 +61,11 @@ def test_article_time_and_ago(out):
 
 def test_clean_text(out):
     assert out["cleanText"] == ["", "", "", "Echter Text", ""]
+
+
+def test_country_names(out):
+    """Auch die Nicht-ISO-Codes des Katalogs haben Namen (UN, AFR, KI); unbekannte bleiben als Code."""
+    assert out["countries"] == ["Vereinte Nationen", "Afrika", "Sudan", "KI-Ausgabe", "Deutschland", "XX", "?"]
 
 
 def test_parse_hash(out):

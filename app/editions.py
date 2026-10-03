@@ -296,10 +296,10 @@ def _cut(text: str, limit: int) -> str:
 
 
 def edition_sources(db: Database, catalog: Catalog) -> list[str]:
-    """Quellen, die für „alle Quellen“ zählen, unabhängig vom Benutzer (also ohne all_extra_sources):
-    aktiviert, in_all: true, nicht generiert."""
+    """Quellen, die die KI-Ausgabe liest, unabhängig vom Benutzer (also ohne all_extra_sources):
+    aktiviert, in_edition: true (ohne Angabe wie in_all), nicht generiert."""
     enabled = set(db.enabled_source_ids())
-    return [s.id for s in catalog.all() if s.id in enabled and s.in_all and not s.generated]
+    return [s.id for s in catalog.all() if s.id in enabled and s.in_edition and not s.generated]
 
 
 def _group_text(group: dict[str, Any], tz) -> str:
@@ -316,6 +316,31 @@ def _group_text(group: dict[str, Any], tz) -> str:
             parts.append(f"… und {len(others) - MEMBERS_MAX} weitere")
         lines.append("  dazu: " + " · ".join(parts))
     return "\n".join(lines)
+
+
+def _url_key(url: str | None) -> str:
+    """URL ohne Query, Fragment und Schema, Host klein: dieselbe Seite in zwei Feeds."""
+    raw = (url or "").strip()
+    raw = re.sub(r"^https?://", "", raw, flags=re.I)
+    raw = raw.split("#", 1)[0].split("?", 1)[0].rstrip("/")
+    host, _, path = raw.partition("/")
+    return host.lower() + "/" + path
+
+
+def _without_url_copies(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Dieselbe Seite aus zwei Feeds (Guardian World und Guardian Global Development) nur einmal: Die Datenbank
+    hält sie je Quelle, das Modell soll sie aber nicht doppelt sehen. Behalten wird der Artikel der Quelle in
+    ALLE (in_all), sonst der zuerst gesehene (die neueste Zeile)."""
+    by_key: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        key = _url_key(r.get("url"))
+        if not key.strip("/"):
+            by_key[f"id:{r['id']}"] = r
+            continue
+        kept = by_key.get(key)
+        if kept is None or (r.get("in_all") and not kept.get("in_all")):
+            by_key[key] = r
+    return list(by_key.values())
 
 
 def collect(db: Database, catalog: Catalog, since: datetime | str, until: datetime | str | None = None,
@@ -340,7 +365,9 @@ def collect(db: Database, catalog: Catalog, since: datetime | str, until: dateti
             continue
         rows.append({"id": int(r["id"]), "source_id": r["source_id"], "title": _plain(r["title"]) or "(ohne Titel)",
                      "summary": _plain(r["summary"]), "published_at": r["published_at"], "story_id": r["story_id"],
-                     "short": src.short, "name": src.name, "country": src.country, "lang": src.lang})
+                     "short": src.short, "name": src.name, "country": src.country, "lang": src.lang,
+                     "url": r["url"], "in_all": src.in_all})
+    rows = _without_url_copies(rows)
     # Je Quelle höchstens PER_SOURCE_MAX: Feeds mit sehr vielen Meldungen (heise, taz) sollen den Block nicht
     # füllen. Artikel einer Geschichte gehen vor, dann die neuesten; die übrigen zählen nur in `stats`.
     per_source: dict[str, list[dict[str, Any]]] = {}

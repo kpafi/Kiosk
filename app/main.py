@@ -526,6 +526,8 @@ def _source_view(s, st, counts, favorites: set[str], in_all: set[str]) -> dict[s
         "category": s.category, "homepage": s.homepage, "note": s.note, "tags": list(s.tags),
         # false: nicht in ALLE und Profilen ohne Quellenliste; je Benutzer (all_extra_sources)
         "in_all": s.id in in_all,
+        # true: Die KI-Ausgabe liest die Quelle (sources.yaml in_edition, Standard in_all; für alle gleich)
+        "in_edition": s.in_edition,
         # true: Artikel entstehen in der App (KI-Ausgabe), kein Feed
         "generated": s.generated,
         "enabled": bool(st["enabled"]) if st else s.default_enabled,

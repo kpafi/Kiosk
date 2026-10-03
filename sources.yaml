@@ -6,6 +6,8 @@
 # einen davon passt (Python re.search), werden angelegt, z. B. nur die Lokalressorts einer Regionalzeitung.
 # in_all: false holt die Quelle weiter und zeigt sie in ihrer eigenen Ansicht und in Profilen, die sie
 # ausdrücklich nennen, aber nicht in ALLE, in Profilen ohne Quellenliste und in der Suche ohne Quelle.
+# in_edition: ob die KI-Ausgabe (app/editions.py) die Quelle liest; ohne Angabe wie in_all. So liest sie
+# Quellen, die nicht in ALLE stehen (in_all: false, in_edition: true), oder lässt welche aus ALLE weg.
 # guid_pattern: optionaler regulärer Ausdruck mit genau einer Gruppe, auf die URL angewandt; die Gruppe
 # ist die GUID (z. B. die Artikelnummer, damit ein geänderter Titel im URL-Slug kein Duplikat erzeugt).
 # generated: true heißt, die Artikel entstehen in der App selbst (KI-Ausgabe, app/editions.py); feed darf dann
@@ -165,6 +167,32 @@ sources:
   - {id: mailguardian, name: Mail & Guardian,         short: "M&G",           country: ZA, lang: en, feed: "https://mg.co.za/feed/",                                homepage: "https://mg.co.za",             default_enabled: false}
   - {id: premiumtimes, name: Premium Times,           short: "PREMIUM T.",    country: NG, lang: en, feed: "https://www.premiumtimesng.com/feed",                   homepage: "https://www.premiumtimesng.com", default_enabled: false, note: "Investigativ, Nigeria"}
   - {id: standardke,   name: The Standard,            short: "STANDARD KE",   country: KE, lang: en, feed: "https://www.standardmedia.co.ke/rss/headlines.php",     homepage: "https://www.standardmedia.co.ke", default_enabled: false}
+
+  # ---------------- Weltlage für die KI-Ausgabe ----------------
+  # Nicht in ALLE (in_all: false), aber Lesestoff der KI-Ausgabe (in_edition: true): UN, humanitäre Lage,
+  # Indien, Afrika, Entwicklung und Klima, Sudan. Sichtbar in der eigenen Ansicht und in Profilen, die sie
+  # ausdrücklich nennen. Geprüft am 03.10.2026 (Feed + Volltext-Extraktion).
+  # UN News antwortet auf den Chrome-User-Agent mit 406; der Sammler holt dann mit dem zweiten User-Agent.
+  # UN und AFR sind keine ISO-Codes (Vereinte Nationen, Afrika mehrerer Länder); Namen in static/js/format.js.
+  - {id: unnews,       name: UN News,                 short: "UN NEWS",       country: UN, lang: en, feed: "https://news.un.org/feed/subscribe/en/news/all/rss.xml", homepage: "https://news.un.org/en/",
+     in_all: false, in_edition: true, note: "Nicht in ALLE; eigene Ansicht, Profil und KI-Ausgabe"}
+  - {id: reliefweb,    name: ReliefWeb,               short: "RELIEFWEB",     country: UN, lang: en, feed: "https://reliefweb.int/updates/rss.xml?view=headlines", homepage: "https://reliefweb.int",
+     in_all: false, in_edition: true, note: "UN-Dienst für humanitäre Lageberichte; nicht in ALLE; eigene Ansicht, Profil und KI-Ausgabe"}
+  # The Hindu: ohne Videos (/videos/) und Podcasts (/podcast/), kein Artikeltext.
+  - {id: thehindu,     name: The Hindu,               short: "THE HINDU",     country: IN, lang: en, feed: "https://www.thehindu.com/news/international/feeder/default.rss", homepage: "https://www.thehindu.com",
+     in_all: false, in_edition: true, note: "Internationales Ressort; nicht in ALLE; eigene Ansicht, Profil und KI-Ausgabe",
+     include_paths: ['^/(?!videos/|podcast/)']}
+  - {id: africanews,   name: Africanews,              short: "AFRICANEWS",    country: AFR, lang: en, feed: "https://www.africanews.com/feed/rss", homepage: "https://www.africanews.com",
+     in_all: false, in_edition: true, note: "Ganz Afrika; nicht in ALLE; eigene Ansicht, Profil und KI-Ausgabe"}
+  # Guardian Global Development: überschneidet sich mit dem World-Feed von guardian; in Geschichten zählen
+  # beide als eine Zeitung (stories.publisher). Ohne Videos (/world/video/…, nur eine kurze Beschreibung).
+  - {id: guardiandev,  name: Guardian Global Development, short: "GUARDIAN DEV", country: GB, lang: en, feed: "https://www.theguardian.com/global-development/rss", homepage: "https://www.theguardian.com/global-development",
+     in_all: false, in_edition: true, note: "Entwicklung und globale Ungleichheit; nicht in ALLE; eigene Ansicht, Profil und KI-Ausgabe",
+     include_paths: ['^/(?!info/|global/)(?![^/]+/(?:video|audio|gallery)/)']}
+  - {id: carbonbrief,  name: Carbon Brief,            short: "CARBON BRIEF",  country: GB, lang: en, feed: "https://www.carbonbrief.org/feed/", homepage: "https://www.carbonbrief.org",
+     in_all: false, in_edition: true, note: "Klima und Energie; nicht in ALLE; eigene Ansicht, Profil und KI-Ausgabe"}
+  - {id: dabanga,      name: Radio Dabanga,           short: "DABANGA",       country: SD, lang: en, feed: "https://www.dabangasudan.org/en/feed", homepage: "https://www.dabangasudan.org/en",
+     in_all: false, in_edition: true, note: "Sudan, Redaktion in Amsterdam; nicht in ALLE; eigene Ansicht, Profil und KI-Ausgabe"}
 
   # ---------------- Kiosk selbst ----------------
   # Die KI-Ausgabe: zweimal täglich ein zusammenfassender Artikel aus den Artikeln aller Zeitungen (app/editions.py).

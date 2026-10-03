@@ -33,10 +33,18 @@ class Source:
     # ausdrücklich nennen, zählt aber nicht zu „alle Quellen“ (ALLE, Profile ohne Quellenliste, Suche
     # ohne Quelle). Regel an einer Stelle: api_ui.implicit_sources().
     in_all: bool = True
+    # True: Die KI-Ausgabe (editions.edition_sources) liest die Quelle, wenn sie aktiviert ist. None
+    # (ohne Angabe) heißt wie in_all; bei generierten Quellen immer False (siehe __post_init__).
+    in_edition: bool | None = None
     # True: Die Artikel entstehen in der App selbst (KI-Ausgabe, app/editions.py), es gibt keinen Feed.
     # Der Sammler überspringt die Quelle; Geschichten, Titelseiten-Rubriken und die rechte Seite lassen
     # sie aus (main.story_scope).
     generated: bool = False
+
+    def __post_init__(self) -> None:
+        # Standard für in_edition hier statt im Loader: gilt auch für direkt gebaute Quellen (Tests).
+        in_edition = self.in_all if self.in_edition is None else self.in_edition
+        object.__setattr__(self, "in_edition", bool(in_edition) and not self.generated)
 
     def wants_url(self, url: str) -> bool:
         """True, wenn die Einträge dieser URL angelegt werden sollen (siehe include_paths)."""
@@ -112,6 +120,14 @@ def _in_all(sid: str, raw) -> bool:
     return _bool_field(sid, "in_all", raw, True)
 
 
+def _in_edition(sid: str, raw) -> bool | None:
+    """in_edition aus sources.yaml: nur true oder false; ohne Angabe None, dann gilt in_all
+    (Source.__post_init__, dort auch: generierte Quellen nie)."""
+    if raw is None:
+        return None
+    return _bool_field(sid, "in_edition", raw, False)
+
+
 def _generated(sid: str, raw) -> bool:
     """generated aus sources.yaml: nur true oder false; Standard false."""
     return _bool_field(sid, "generated", raw, False)
@@ -167,6 +183,7 @@ class Catalog:
                     include_paths=_include_paths(sid, item.get("include_paths")),
                     guid_pattern=_guid_pattern(sid, item.get("guid_pattern")),
                     in_all=_in_all(sid, item.get("in_all")),
+                    in_edition=_in_edition(sid, item.get("in_edition")),
                     generated=generated,
                 )
             )

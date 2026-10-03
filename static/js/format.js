@@ -108,7 +108,8 @@ const COUNTRIES = {
   HK: 'Hongkong', TW: 'Taiwan', JP: 'Japan', KR: 'Südkorea', SG: 'Singapur', MY: 'Malaysia',
   ID: 'Indonesien', PH: 'Philippinen', TH: 'Thailand', VN: 'Vietnam', MX: 'Mexiko', BR: 'Brasilien',
   AR: 'Argentinien', CL: 'Chile', CO: 'Kolumbien', PE: 'Peru', VE: 'Venezuela', CU: 'Kuba',
-  INT: 'International', EU: 'Europa',
+  INT: 'International', EU: 'Europa', SD: 'Sudan',
+  UN: 'Vereinte Nationen', AFR: 'Afrika',   // keine ISO-Codes: UN-Dienste, Medien für ganz Afrika
   KI: 'KI-Ausgabe',   // die Zeitung Kiosk selbst (sources.yaml: kiosk, generated)
 };
 export function countryName(code) {

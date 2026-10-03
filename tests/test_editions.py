@@ -170,7 +170,8 @@ def test_collect_groups_sorts_picks_and_filters(edb):
     since = ago(hours=10)
     # Geschichte mit drei Zeitungen: der deutsche Artikel mit Anreißer ist Vertreter, obwohl älter
     big_de = add(edb, "alpha", 1, ago(hours=5), title="Haushalt beschlossen", summary="Nach elf Stunden Debatte.")
-    big_en = add(edb, "beta", 1, ago(hours=1), title="Budget passed", summary="After eleven hours.")
+    big_en = add(edb, "beta", 1, ago(hours=1), title="Budget passed", summary="After eleven hours.",
+                 image_url="https://b.example/budget.jpg")
     big_d2 = add(edb, "delta", 1, ago(hours=2), title="Etat steht", summary="")
     link(edb, [big_de, big_en, big_d2])
     # Geschichte mit zwei Zeitungen; deutscher Artikel ohne Anreißer verliert gegen den mit Anreißer
@@ -195,7 +196,10 @@ def test_collect_groups_sorts_picks_and_filters(edb):
     assert stats["sources"] == ["ALPHA", "BETA", "DELTA"]                        # nach Zahl der Artikel
     known, info = ed.references(groups)
     assert known == {big_de, big_en, big_d2, two_a, two_d, solo_old, solo_new}
-    assert info[big_en] == ("BETA", "Beta")
+    # je ID Kurzname, Name und Bild des Artikels (für Links, Titelbild und Bilder im Text)
+    assert info[big_en] == ("BETA", "Beta", "https://b.example/budget.jpg")
+    assert info[big_de] == ("ALPHA", "Alpha", None)
+    assert groups[0]["others"][0]["image_url"] == "https://b.example/budget.jpg"
     when = datetime.fromisoformat(edb.get_article(big_de)["published_at"]).astimezone(BERLIN).strftime("%d.%m. %H:%M")
     assert groups[0]["text"] == (
         f"[{big_de}] ALPHA (DE), {when}: Haushalt beschlossen\n"
@@ -300,7 +304,7 @@ def test_preview_builds_everything_without_network(edb, settings):
     a = add(edb, "alpha", 1, ago(minutes=20), title="Etwas")
     out = ed.preview(edb, CATALOG, settings, "morning")
     assert set(out) == {"messages", "known_ids", "stats", "refs_info", "since", "now"}
-    assert out["known_ids"] == [a] and out["refs_info"][a] == ("ALPHA", "Alpha")
+    assert out["known_ids"] == [a] and out["refs_info"][a] == ("ALPHA", "Alpha", None)
     assert out["stats"]["since_text"].endswith("20 Uhr") and out["stats"]["articles"] == 1
     json.dumps({k: v for k, v in out.items() if k != "refs_info"})      # für Vergleichsskripte serialisierbar
     with pytest.raises(ValueError):
@@ -366,7 +370,7 @@ def test_parse_edition_refs_are_filtered():
     json.dumps(edition_json(sections=[{"heading": "x" * 121, "paragraphs": ["p"]}])),
     json.dumps(edition_json(sections=[{"heading": "H", "paragraphs": []}])),
     json.dumps(edition_json(sections=[{"heading": "H", "paragraphs": "p"}])),
-    json.dumps(edition_json(sections=[{"heading": "H", "paragraphs": ["p"] * 7}])),
+    json.dumps(edition_json(sections=[{"heading": "H", "paragraphs": ["p"] * 21}])),
     json.dumps(edition_json(sections=[{"heading": "H", "paragraphs": [""]}])),
     json.dumps(edition_json(sections=[{"heading": "H", "paragraphs": ["x" * 2001]}])),
     json.dumps(edition_json(sections=[{"heading": "H", "paragraphs": [3]}])),
@@ -391,7 +395,8 @@ REFS_INFO = {11: ("SPIEGEL", "Der Spiegel"), 12: ("FAZ", "FAZ"), 13: ("TAZ", "ta
 
 def test_render_builds_the_article():
     data = ed.parse_edition(json.dumps(edition_json()), KNOWN)
-    title, lead, author, body, text = ed.render(data, "morning", REFS_INFO, STATS)
+    title, lead, author, body, text, image = ed.render(data, "morning", REFS_INFO, STATS)
+    assert image is None                                   # ältere refs_info ohne Bild: kein Titelbild
     assert title == "Haushalt steht, Bahn streikt" and lead.startswith("Der Bundestag")
     # geschützte Leerzeichen: „Uhr“ und „Artikeln“ brechen nicht allein um
     assert author == "Morgenausgabe · von einer KI aus 212\u00a0Artikeln von 38\u00a0Zeitungen seit gestern 20\u00a0Uhr"
@@ -403,7 +408,7 @@ def test_render_builds_the_article():
         '<h2>Heute wichtig</h2><ul><li>10 Uhr: Kabinett (<a href="#/a/13">TAZ</a>)</li></ul>'
         "<h2>Quellen</h2><p>" + "\u00a0· ".join(f"Z{i}" for i in range(12)) + "\u00a0· 3\u00a0weitere</p>")
     assert text.startswith("Der Bundestag hat") and "Quellen" in text and "<" not in text
-    _, _, author, body, _ = ed.render(data, "evening", REFS_INFO,
+    _, _, author, body, _, _ = ed.render(data, "evening", REFS_INFO,
                                       {"articles": 1, "papers": 1, "sources": ["A"], "since_text": "heute 6 Uhr"})
     assert author == "Abendausgabe · von einer KI aus 1\u00a0Artikel von 1\u00a0Zeitung seit heute 6\u00a0Uhr"
     assert "<h2>Heute Nacht und morgen früh</h2>" in body and body.endswith("<h2>Quellen</h2><p>A</p>")
@@ -421,7 +426,7 @@ def test_render_escapes_everything_from_the_model():
         sections=[{"heading": "<h1>Kopf</h1>", "paragraphs": ['<a href="javascript:alert(1)">klick</a> & <b>fett</b>',
                                                                "<img src=x onerror=alert(2)>"], "refs": [11]}],
         agenda=[{"text": '<script src="https://evil.example/x.js"></script>'}])
-    title, lead, author, body, text = ed.finish(json.dumps(evil), "morning", KNOWN, REFS_INFO, STATS)
+    title, lead, author, body, text, _ = ed.finish(json.dumps(evil), "morning", KNOWN, REFS_INFO, STATS)
     assert title == "<script>alert(1)</script>"            # reiner Text (die Oberfläche setzt textContent)
     tags = Tags()
     tags.feed(body)
@@ -1435,7 +1440,7 @@ def test_byline_and_block_head_name_what_the_model_saw(edb, settings, monkeypatc
         got["messages"][1]["content"]
     assert len(st["sources"]) == 2 and "… und 1 weitere" in got["messages"][1]["content"]
     content = json.dumps(edition_json(sections=[{"heading": "H", "paragraphs": ["p"], "refs": [ids[0]]}]))
-    _, _, author, body, _ = ed.finish(content, "morning", got["known_ids"], got["refs_info"], st)
+    _, _, author, body, _, _ = ed.finish(content, "morning", got["known_ids"], got["refs_info"], st)
     assert "aus 2\u00a0Artikeln von 2\u00a0Zeitungen" in author
     assert body.endswith("<h2>Quellen</h2><p>" + "\u00a0· ".join(st["sources"]) + "</p>")
     # ohne Kürzung kein „von insgesamt“
@@ -1523,3 +1528,173 @@ def test_collect_drops_the_same_page_from_two_feeds(edb):
     assert a in ids and z not in ids
     assert d1 in ids and e1 in ids and e2 in ids
     assert stats["shown_articles"] == 4
+
+
+# ---- Runde 3: kürzere Absätze, Rubrikname, Bilder ---------------------------------------------
+
+def test_prompts_ask_for_short_paragraphs():
+    """Absätze höchstens etwa 50 Wörter, lieber mehrere kurze (Nutzerwunsch nach dem ersten Artikel)."""
+    rule = ("kurze Absätze; ein Absatz hat höchstens etwa 50 Wörter (drei bis vier Sätze), lieber mehrere kurze "
+            "Absätze als einen langen.")
+    assert f"je 1 bis 3 {rule}" in ed.USER_PROMPTS["morning"]
+    assert f"je 2 bis 4 {rule}" in ed.USER_PROMPTS["evening"]
+    for prompt in ed.USER_PROMPTS.values():
+        assert "Wörtern." not in prompt.split("Gesamtlänge")[0]
+    assert "Gesamtlänge 500 bis 800 Wörter." in ed.USER_PROMPTS["morning"]
+    assert "Gesamtlänge 700 bis 1100 Wörter." in ed.USER_PROMPTS["evening"]
+    # Absätze je Abschnitt: nur die Schutzgrenze PARAGRAPHS_MAX (20) weist ab
+    data = ed.parse_edition(json.dumps(edition_json(sections=[{"heading": "H", "paragraphs": ["p"] * 8}])), KNOWN)
+    assert len(data["sections"][0]["paragraphs"]) == 8
+
+
+def test_system_prompt_names_the_section_off_the_headlines():
+    assert ("fasse sie in einem eigenen Abschnitt mit dem Zwischentitel „Abseits der Schlagzeilen“ zusammen."
+            in ed.SYSTEM_PROMPT)
+    assert "Wenig beachtet" not in ed.SYSTEM_PROMPT
+
+
+IMG = {11: "https://s.example/11.jpg", 12: "https://f.example/12.jpg", 13: "https://t.example/13.jpg",
+       14: "https://s.example/14.jpg", 15: "https://s.example/15.jpg"}
+
+
+def refs_with_images(**images) -> dict:
+    """REFS_INFO als 3-Tupel; images: id (als „i11“) -> Adresse oder None."""
+    names = {**REFS_INFO, 15: ("ZEIT", "Die Zeit"), 16: ("NZZ", "NZZ")}
+    pick = {int(k[1:]): v for k, v in images.items()}
+    return {rid: (*names[rid], pick.get(rid)) for rid in names}
+
+
+def render_with(sections, info, agenda=None):
+    data = ed.parse_edition(json.dumps(edition_json(sections=sections, agenda=agenda or [])), KNOWN)
+    return ed.render(data, "morning", info, STATS)
+
+
+def test_render_picks_the_hero_and_one_image_per_section():
+    """Titelbild: Bild des ersten Belegs mit Bild im ersten Abschnitt, der eines hat (Belege ohne Bild werden
+    übersprungen). Je Abschnitt höchstens ein Bild direkt nach dem Zwischentitel, nie das Titelbild noch
+    einmal und kein Bild zweimal; keins im Vorspann, in der Agenda und bei den Quellen."""
+    info = refs_with_images(i12=IMG[12], i13=IMG[13], i14=IMG[14], i15=IMG[15])
+    sections = [
+        {"heading": "Ohne Bild", "paragraphs": ["Nur Text."], "refs": [11, 16]},             # 11, 16: kein Bild
+        {"heading": "Haushalt", "paragraphs": ["Eins.", "Zwei."], "refs": [11, 12, 13]},     # Titelbild: 12
+        {"heading": "Bahn", "paragraphs": ["Streik."], "refs": [13, 14]},                    # 13 schon im Text: 14
+        {"heading": "Wetter", "paragraphs": ["Regen."], "refs": [12, 14]},                   # beide vergeben
+    ]
+    title, lead, author, body, text, image = render_with(sections, info,
+                                                         agenda=[{"text": "10 Uhr: Kabinett", "refs": [15]}])
+    assert image == IMG[12]
+    assert "<h2>Ohne Bild</h2><p>Nur Text." in body
+    assert f'<h2>Haushalt</h2><img src="{IMG[13]}" alt="" loading="lazy"><p>Eins.</p>' in body
+    assert f'<h2>Bahn</h2><img src="{IMG[14]}" alt="" loading="lazy"><p>Streik.' in body
+    assert "<h2>Wetter</h2><p>Regen." in body
+    assert body.count("<img") == 2 and IMG[12] not in body and IMG[15] not in body
+    assert body.startswith("<p><strong>")                         # Vorspann bleibt der erste Absatz (art-lead)
+    agenda_and_sources = body.split("<h2>Heute wichtig</h2>")[1]
+    assert "<img" not in agenda_and_sources and "Quellen" in agenda_and_sources
+    assert "<" not in text and text.startswith("Der Bundestag")
+    # der erste Abschnitt hat nur ein Bild: Titelbild, im Text keins
+    one = render_with([{"heading": "A", "paragraphs": ["x"], "refs": [12]},
+                       {"heading": "B", "paragraphs": ["y"], "refs": [13]}], info)
+    assert one[5] == IMG[12] and f'<h2>B</h2><img src="{IMG[13]}"' in one[3] and one[3].count("<img") == 1
+
+
+def test_render_without_images_and_with_bad_image_urls():
+    """Kein Bild in den Belegen: kein Titelbild (None), kein <img>. Nur absolute http(s)-Adressen
+    (extract.safe_http_url): javascript:, data:, relative und schemalose fallen weg."""
+    data_info = refs_with_images()
+    _, _, _, body, _, image = render_with([{"heading": "H", "paragraphs": ["p"], "refs": [11, 12]}], data_info)
+    assert image is None and "<img" not in body
+    bad = refs_with_images(i11="javascript:alert(1)", i12="data:image/png;base64,AAAA", i13="/bild.jpg",
+                           i14="//evil.example/x.jpg", i15="https://ok.example/a.jpg?x=1&y=2")
+    _, _, _, body, _, image = render_with([{"heading": "H", "paragraphs": ["p"], "refs": [11, 12, 13, 14]},
+                                           {"heading": "I", "paragraphs": ["q"], "refs": [11, 15]}], bad)
+    assert image == "https://ok.example/a.jpg?x=1&y=2" and "<img" not in body
+    _, _, _, body, _, image = render_with([{"heading": "H", "paragraphs": ["p"], "refs": [16]},
+                                           {"heading": "I", "paragraphs": ["q"], "refs": [11, 15, 16]}],
+                                          refs_with_images(i15="https://ok.example/a.jpg?x=1&y=2",
+                                                           i16="https://ok.example/b.jpg"))
+    assert image == "https://ok.example/b.jpg"
+    assert '<h2>I</h2><img src="https://ok.example/a.jpg?x=1&amp;y=2" alt="" loading="lazy">' in body
+    # gemischte refs_info (2- und 3-Tupel): Links wie bisher, Bild nur aus 3-Tupeln
+    mixed = {11: ("SPIEGEL", "Der Spiegel"), 12: ("FAZ", "FAZ", IMG[12]), 13: ("TAZ", "taz", IMG[13])}
+    _, _, _, body, _, image = render_with([{"heading": "H", "paragraphs": ["p"], "refs": [11, 12, 13]}], mixed)
+    assert image == IMG[12] and f'<h2>H</h2><img src="{IMG[13]}"' in body
+    assert '(<a href="#/a/11">SPIEGEL</a>, <a href="#/a/12">FAZ</a>, <a href="#/a/13">TAZ</a>)' in body
+
+
+def test_render_sets_no_image_before_a_caption_like_paragraph():
+    """Die Leseansicht setzt kurze Absätze mit Bildquelle nach einem Bild als Bildzeile (article.js
+    markCaption) bzw. nimmt sie mit dem Bild weg: Vor solchen Absätzen steht kein Bild."""
+    info = refs_with_images(i12=IMG[12], i13=IMG[13])
+    for paras in (["Quelle: Statistisches Bundesamt, mehr dazu unten."], ["Foto: Reuters"],
+                  ["Kurz gemeldet, Bild: dpa"], ["Kurz.", "© AP"]):
+        _, _, _, body, _, image = render_with([{"heading": "A", "paragraphs": ["x"], "refs": [12]},
+                                               {"heading": "B", "paragraphs": paras, "refs": [13]}], info)
+        assert image == IMG[12] and "<img" not in body, paras
+    # gewöhnliche kurze Absätze: Bild bleibt
+    _, _, _, body, _, _ = render_with([{"heading": "A", "paragraphs": ["x"], "refs": [12]},
+                                       {"heading": "B", "paragraphs": ["Die Bahn streikt.", "Bis Freitag."],
+                                        "refs": [13]}], info)
+    assert f'<h2>B</h2><img src="{IMG[13]}"' in body
+
+
+def test_sanitize_fragment_keeps_absolute_http_images_only():
+    from app.extract import sanitize_fragment
+    assert sanitize_fragment('<img src="https://x.example/a.jpg" alt="">')[0] == \
+        '<img src="https://x.example/a.jpg" alt="" loading="lazy">'
+    assert sanitize_fragment('<img src="http://x.example/a.jpg?w=1&amp;h=2" alt="">')[0] == \
+        '<img src="http://x.example/a.jpg?w=1&amp;h=2" alt="" loading="lazy">'
+    for src in ("javascript:alert(1)", "data:image/png;base64,AAAA", "/rel.jpg", "#/a/12", ""):
+        assert "<img" not in sanitize_fragment(f'<p><img src="{src}" alt="">x</p>')[0], src
+
+
+async def test_writer_stores_the_hero_image_and_force_replaces_it(edb, ai_settings):
+    a = add(edb, "alpha", 1, ago(minutes=30), title="Ereignis A", image_url="https://a.example/a.jpg")
+    b = add(edb, "beta", 1, ago(minutes=40), title="Event B", image_url="https://b.example/b.jpg")
+    first = json.dumps(edition_json(sections=[{"heading": "Lage", "paragraphs": ["Text."], "refs": [a, b]}],
+                                    agenda=[]))
+    second = json.dumps(edition_json(sections=[{"heading": "Lage", "paragraphs": ["Text."], "refs": [b]}],
+                                     agenda=[]))
+    model = Model(answer(first), answer(second))
+    w = await make_writer(edb, ai_settings, model)
+    try:
+        res = await w.run("morning")
+        row = edb.get_article(res["id"])
+        assert row["image_url"] == "https://a.example/a.jpg"
+        assert '<img src="https://b.example/b.jpg" alt="" loading="lazy">' in row["body_html"]
+        assert (await w.run("morning", force=True))["id"] == res["id"]
+        row = edb.get_article(res["id"])
+        assert row["image_url"] == "https://b.example/b.jpg" and "<img" not in row["body_html"]
+    finally:
+        await w.close()
+    # ohne Bild: force setzt das Bild zurück
+    edb.store_edition(edition_row(guid=row["guid"], image_url=None), force=True)
+    assert edb.get_article(res["id"])["image_url"] is None
+
+
+def test_store_edition_keeps_the_image(edb):
+    aid = edb.store_edition(edition_row(image_url="https://x.example/t.jpg"))
+    assert edb.get_article(aid)["image_url"] == "https://x.example/t.jpg"
+    # ohne force bleibt alles, auch das Bild
+    edb.store_edition(edition_row(image_url="https://x.example/neu.jpg"))
+    assert edb.get_article(aid)["image_url"] == "https://x.example/t.jpg"
+
+
+def test_render_treats_size_variants_as_the_same_image_and_skips_small_ones():
+    """Dasselbe Bild in anderer Größe (?width=…, _w960) gilt als Wiederholung des Titelbilds (die Leseansicht
+    vergleicht ebenso unscharf und machte sonst einen Textabsatz zur Bildzeile); Klein-/Vorschau-URLs werden
+    nie Titelbild oder Abschnittsbild."""
+    big, variant = "https://cdn.example/a/x.jpg?width=1200", "https://cdn.example/a/x.jpg?width=800"
+    other, small = "https://cdn.example/b/y_w960.jpg", "https://cdn.example/c/z.jpg?width=140"
+    info = refs_with_images(i12=big, i13=variant, i14=other, i15=small)
+    body_sections = [
+        {"heading": "A", "paragraphs": ["Eins."], "refs": [12]},            # Titelbild big
+        {"heading": "B", "paragraphs": ["Zwei."], "refs": [13, 14]},        # variant = Titelbild → other
+        {"heading": "C", "paragraphs": ["Drei."], "refs": [15, 13]},        # small nie, variant vergeben → keins
+    ]
+    _, _, _, body, _, image = render_with(body_sections, info)
+    assert image == big
+    assert f'<h2>B</h2><img src="{other}"' in body and body.count("<img") == 1
+    assert small not in body and variant not in body
+    # nur ein kleines Bild: kein Titelbild
+    assert render_with([{"heading": "A", "paragraphs": ["x"], "refs": [15]}], info)[5] is None

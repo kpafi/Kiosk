@@ -1772,6 +1772,42 @@ console.log(JSON.stringify({ root: cls(root), other: cls(other), body: [root.cla
     assert got["body"] == ["is-edition", "is-edition"]          # nur in Ausgaben sind Belege blau
 
 
+def test_edition_images_are_no_captions_and_keep_the_lead():
+    """KI-Ausgabe mit Bild nach dem Zwischentitel: buildBody setzt die gewöhnlichen kurzen Absätze danach nicht
+    als Bildzeile (markCaption greift nur bei Bildquellen wie „Foto: dpa“, Gegenprobe), und markEdition macht
+    weiter den Vorspann (erster Absatz) zu art-lead. Der Fake-DOM parst kein HTML: Der Inhalt des <template>
+    wird von Hand gebaut, so wie render ihn setzt."""
+    script = """
+const tagged = FakeEl.prototype.querySelectorAll;
+FakeEl.prototype.querySelectorAll = function (sel) {
+  return /^[a-z0-9]+$/.test(sel) ? this.all().filter((e) => e.tagName === sel.toUpperCase()) : tagged.call(this, sel);
+};
+const el = (tag, ...kids) => { const e = document.createElement(tag); e.append(...kids); return e; };
+const img = (src) => { const e = el('img'); e.setAttribute('src', src); e.setAttribute('alt', ''); return e; };
+const link = (id, name) => { const a = el('a', name); a.setAttribute('href', `#/a/${id}`); return a; };
+const build = () => el('div', el('p', el('strong', 'Vorspann.')), el('h2', 'Haushalt'), img('https://a.example/1.jpg'),
+  el('p', 'Die Bahn streikt.'), el('p', 'Bis Freitag. (', link(11, 'SPIEGEL'), ')'), el('h2', 'Lage'),
+  img('https://b.example/2.jpg'), el('p', 'Kurz gemeldet. (', link(12, 'FAZ'), ')'), el('h2', 'Gegenprobe'),
+  img('https://c.example/3.jpg'), el('p', 'Foto: dpa'), el('h2', 'Quellen'), el('p', 'SPIEGEL · FAZ'));
+const content = build();
+const mk = document.createElement;
+document.createElement = (t) => t === 'template' ? { set innerHTML(v) {}, content } : mk(t);
+const { state } = await import(process.argv[1] + '/store.js');
+state.settings.show_images = true;
+const { buildBody, markEdition } = await import(process.argv[1] + '/views/article.js');
+buildBody('', 'Titel', '', true);
+const cls = (r) => r.children.map((c) => c.className);
+const root = build();
+markEdition(root);
+console.log(JSON.stringify({ built: cls(content), imgs: content.children.filter((c) => c.tagName === 'IMG').length,
+  marked: cls(root) }));
+"""
+    got = _run_fake_dom(script)
+    assert got["built"] == ["", "", "", "", "", "", "", "", "", "", "art-caption", "", ""]
+    assert got["imgs"] == 3
+    assert got["marked"] == ["art-lead", "", "", "", "", "", "", "", "", "", "", "art-sources-h", "art-sources"]
+
+
 def test_edition_css_rules():
     """KI-Ausgabe im Stylesheet: Belege blau mit Unterstrich, Vorspann, Quellen-Block, zwei Spalten."""
     css = (JS.parent / "css" / "app.css").read_text(encoding="utf-8")

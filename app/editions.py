@@ -29,7 +29,7 @@ import httpx
 from .config import DEFAULT_AI_EVENING, DEFAULT_AI_MORNING, Settings
 from . import db as db_mod
 from .db import Database, _iso, utcnow
-from .extract import html_to_text, sanitize_fragment
+from .extract import CAPTION_RE, html_to_text, image_key, is_small_image_url, safe_http_url, sanitize_fragment
 from .sources import Catalog
 from .stories import publisher
 
@@ -74,6 +74,8 @@ ERROR_BODY_MAX = 300                # so viel vom Rumpf einer Fehlerantwort komm
 # Prüfung der Antwort
 ANSWER_MAX = 200_000                # Zeichen der Antwort höchstens
 REFS_MAX = 4                        # Belege je Abschnitt bzw. Agenda-Punkt
+PARAGRAPHS_MAX = 20                 # Absätze je Abschnitt: nur eine Schutzgrenze (der Prompt verlangt kurze, dafür
+                                    # mehrere Absätze; IT-Sicherheit kann an Patch-Tagen viele haben)
 SOURCES_SHOWN = 12                  # Zeitungen in der Zeile „Quellen“, danach „N weitere“
 
 WEEKDAYS = ("Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag")
@@ -124,7 +126,7 @@ SYSTEM_PROMPT = """Du bist die Redaktion der Zeitung „Kiosk“. Kiosk sammelt 
 Grundsätze:
 - Nur, was in den gelieferten Artikeln steht. Nichts erfinden, nichts aus eigenem Wissen ergänzen; keine Zahlen, Zitate oder Namen, die nicht in den Vorlagen stehen. Widersprechen sich Zeitungen, sag das.
 - Gewichte nach tatsächlicher Bedeutung, nicht nach Aufmerksamkeit: Wie viele Menschen betrifft es, wie schwer und wie dauerhaft sind die Folgen, was ändert sich dadurch? Die Zahl der Zeitungen zu einem Ereignis ist ein Hinweis, kein Maßstab, und die Reihenfolge der Artikel sagt nichts über ihre Bedeutung. Ein spektakuläres Ereignis mit wenigen Betroffenen bekommt wenig Platz, auch wenn viele Zeitungen es groß bringen. Kriege, Krisen, Katastrophen, politische und wirtschaftliche Entscheidungen mit vielen Betroffenen bekommen Platz, auch wenn nur eine Zeitung berichtet oder sie weit weg geschehen. Beschönige nichts und dramatisiere nichts; nenne Zahlen zu Toten, Betroffenen und Größenordnungen, wo die Artikel sie liefern.
-- Gibt es Ereignisse mit großen Folgen, die nur eine oder zwei Zeitungen bringen, fasse sie in einem eigenen Abschnitt mit dem Zwischentitel „Wenig beachtet“ zusammen.
+- Gibt es Ereignisse mit großen Folgen, die nur eine oder zwei Zeitungen bringen, fasse sie in einem eigenen Abschnitt mit dem Zwischentitel „Abseits der Schlagzeilen“ zusammen.
 - Nüchtern, präzise, knapp. Keine Floskeln, keine Wertungen, keine Anrede, keine Emojis. Regionales, Sport, Prominente und Ratgeber nur, wenn es wirklich wichtig ist.
 - Zusätzlich zu den Abschnitten oben gibt es immer einen eigenen Abschnitt mit dem Zwischentitel „IT-Sicherheit“: alle wichtigen Meldungen zur IT-Sicherheit aus dem Zeitraum (Sicherheitslücken, Angriffe, Datenpannen, Schadsoftware, Patches, Regulierung), je Meldung ein bis zwei Sätze, nichts Wichtiges weglassen. Gibt es keine, entfällt der Abschnitt.
 - Fremdsprachige Artikel fasst du auf Deutsch zusammen.
@@ -152,7 +154,7 @@ Zeitraum: Die Artikel stammen aus der Zeit seit {since} (Abendausgabe) bis jetzt
 
 Aufbau:
 1. Vorspann: Was ist seit gestern Abend passiert, was steht heute an.
-2. 4 bis 7 Abschnitte zu den wichtigsten Ereignissen der Nacht und des späten Abends, je 1 bis 2 Absätze von 60 bis 120 Wörtern. Ist über Nacht wenig passiert, darf die Ausgabe kürzer sein; nichts aufblasen.
+2. 4 bis 7 Abschnitte zu den wichtigsten Ereignissen der Nacht und des späten Abends, je 1 bis 3 kurze Absätze; ein Absatz hat höchstens etwa 50 Wörter (drei bis vier Sätze), lieber mehrere kurze Absätze als einen langen. Ist über Nacht wenig passiert, darf die Ausgabe kürzer sein; nichts aufblasen.
 3. "agenda": Was heute ansteht (Gipfel, Abstimmungen, Urteile, Zinsentscheide, Wahlen, Streiks, Fristen), soweit die Artikel es ankündigen, mit Uhrzeit, wenn genannt. Leer lassen, wenn nichts angekündigt ist.
 
 Gesamtlänge 500 bis 800 Wörter.""",
@@ -162,7 +164,7 @@ Zeitraum: Die Artikel stammen aus der Zeit seit {since} (Morgenausgabe) bis jetz
 
 Aufbau:
 1. Vorspann: Der Tag in 2 bis 3 Sätzen.
-2. 5 bis 8 Abschnitte zu den wichtigsten Ereignissen des Tages, Wichtigstes zuerst, je 1 bis 3 Absätze von 80 bis 150 Wörtern. Bei Themen, die den Tag über liefen, erzähl den Verlauf und den Stand jetzt, nicht die Einzelmeldungen.
+2. 5 bis 8 Abschnitte zu den wichtigsten Ereignissen des Tages, Wichtigstes zuerst, je 2 bis 4 kurze Absätze; ein Absatz hat höchstens etwa 50 Wörter (drei bis vier Sätze), lieber mehrere kurze Absätze als einen langen. Bei Themen, die den Tag über liefen, erzähl den Verlauf und den Stand jetzt, nicht die Einzelmeldungen.
 3. "agenda": Was heute Nacht oder morgen früh ansteht (Abstimmungen in Übersee, Verhandlungen, Urteile, Wahlergebnisse, Fristen), soweit die Artikel es ankündigen. Leer lassen, wenn nichts angekündigt ist.
 
 Gesamtlänge 700 bis 1100 Wörter.""",
@@ -344,6 +346,14 @@ def _without_url_copies(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(by_key.values())
 
 
+def _image_of(row: Any) -> str | None:
+    """image_url einer Zeile aus edition_window (ältere Zeilen ohne die Spalte: None)."""
+    try:
+        return row["image_url"] or None
+    except (KeyError, IndexError):
+        return None
+
+
 def collect(db: Database, catalog: Catalog, since: datetime | str, until: datetime | str | None = None,
             column: str = "fetched_at") -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Artikel ohne Paywall aus edition_sources, deren `column` (fetched_at: im Betrieb, so fehlt kein
@@ -353,7 +363,8 @@ def collect(db: Database, catalog: Catalog, since: datetime | str, until: dateti
     unter „dazu“. Je Quelle höchstens PER_SOURCE_MAX Artikel (die einer Geschichte zuerst, dann die neuesten),
     höchstens GROUPS_MAX Gruppen und BLOCK_MAX Zeichen; was wegfällt, zählt nur in `stats`.
 
-    Gibt (gezeigte Gruppen mit fertigem Text unter "text", stats) zurück; stats: articles (alle Artikel
+    Gibt (gezeigte Gruppen mit fertigem Text unter "text", stats) zurück; die Zeilen tragen auch image_url
+    (Bild des Artikels, ungeprüft: render lässt nur http(s) durch). stats: articles (alle Artikel
     des Zeitraums), papers (deren Zeitungen), groups, shown_groups, shown_articles und shown_papers (Artikel
     mit ID im Block und deren Zeitungen: nur die kennt das Modell), sources (Kurznamen der Artikel im Block
     nach deren Zahl)."""
@@ -367,7 +378,7 @@ def collect(db: Database, catalog: Catalog, since: datetime | str, until: dateti
         rows.append({"id": int(r["id"]), "source_id": r["source_id"], "title": _plain(r["title"]) or "(ohne Titel)",
                      "summary": _plain(r["summary"]), "published_at": r["published_at"], "story_id": r["story_id"],
                      "short": src.short, "name": src.name, "country": src.country, "lang": src.lang,
-                     "url": r["url"], "in_all": src.in_all})
+                     "url": r["url"], "in_all": src.in_all, "image_url": _image_of(r)})
     rows = _without_url_copies(rows)
     # Je Quelle höchstens PER_SOURCE_MAX: Feeds mit sehr vielen Meldungen (heise, taz) sollen den Block nicht
     # füllen. Artikel einer Geschichte gehen vor, dann die neuesten; die übrigen zählen nur in `stats`.
@@ -411,13 +422,13 @@ def collect(db: Database, catalog: Catalog, since: datetime | str, until: dateti
     return shown, stats
 
 
-def references(groups: list[dict[str, Any]]) -> tuple[set[int], dict[int, tuple[str, str]]]:
+def references(groups: list[dict[str, Any]]) -> tuple[set[int], dict[int, tuple[str, str, str | None]]]:
     """IDs, die im Artikelblock stehen (nur auf die darf eine Antwort verweisen), und je ID
-    (Kurzname, Name) der Zeitung für die Links."""
-    info: dict[int, tuple[str, str]] = {}
+    (Kurzname, Name, image_url) der Zeitung bzw. des Artikels für Links und Bilder."""
+    info: dict[int, tuple[str, str, str | None]] = {}
     for g in groups:
         for m in [g["rep"], *g["others"][:MEMBERS_MAX]]:
-            info[m["id"]] = (m["short"], m["name"])
+            info[m["id"]] = (m["short"], m["name"], m.get("image_url"))
     return set(info), info
 
 
@@ -636,8 +647,8 @@ def parse_edition(text: str, known_ids: Collection[int]) -> dict[str, Any]:
             raise _unreadable(f"Abschnitt {i} ist kein Objekt")
         heading = _text(sec.get("heading"), 120, f"Abschnitt {i}: heading")
         paras_raw = sec.get("paragraphs")
-        if not isinstance(paras_raw, list) or not 1 <= len(paras_raw) <= 6:
-            raise _unreadable(f"Abschnitt {i}: paragraphs muss 1 bis 6 Absätze haben")
+        if not isinstance(paras_raw, list) or not 1 <= len(paras_raw) <= PARAGRAPHS_MAX:
+            raise _unreadable(f"Abschnitt {i}: paragraphs muss 1 bis {PARAGRAPHS_MAX} Absätze haben")
         paras = [p for p in (_text(p, 2000, f"Abschnitt {i}: Absatz", empty_ok=True) for p in paras_raw) if p]
         if not paras:
             raise _unreadable(f"Abschnitt {i}: alle Absätze leer")
@@ -670,8 +681,9 @@ def _bind(text: str) -> str:
     return text.replace(" ", NBSP)
 
 
-def _links(refs: list[int], refs_info: dict[int, tuple[str, str]]) -> str:
-    """„ (SPIEGEL, FAZ)“ mit Links auf die Kiosk-Artikel, je Zeitung einer; leer ohne bekannte Belege."""
+def _links(refs: list[int], refs_info: Mapping[int, tuple]) -> str:
+    """„ (SPIEGEL, FAZ)“ mit Links auf die Kiosk-Artikel, je Zeitung einer; leer ohne bekannte Belege.
+    refs_info: je ID (Kurzname, Name[, image_url])."""
     seen: set[str] = set()
     out = []
     for rid in refs:
@@ -688,22 +700,82 @@ def _plural(n: int, one: str, many: str) -> str:
     return f"{n}{NBSP}{one if n == 1 else many}"
 
 
-def render(edition: dict[str, Any], slot: str, refs_info: dict[int, tuple[str, str]],
-           stats: dict[str, Any]) -> tuple[str, str, str, str, str]:
-    """Fertiger Artikel aus einer geprüften Antwort: (title, lead, author, body_html, body_text). title,
-    lead und author sind reiner Text; body_html entsteht nur aus escapten Texten und Links auf bekannte
-    Artikel-IDs und läuft zusätzlich durch die HTML-Whitelist (extract.sanitize_fragment, ohne die
-    Heuristiken für Verlagsseiten). stats: shown_articles und shown_papers (sonst articles, papers), sources,
-    since_text."""
+# Wie CREDIT_END_RE und PHOTO_CREDIT_RE in article.js (markCaption): Absätze, die die Leseansicht nach einem
+# Bild als Bildzeile setzen würde.
+_CREDIT_END_RE = re.compile(r"(?:Fotos?|Bild(?:er)?)\s*:\s*[^:]{1,80}$", re.I)
+_PHOTO_CREDIT_RE = re.compile(r"^\s*(?:\(\s*)?(?:(?:Fotos?|Bild(?:er)?|Photo|Image)\s*:|©)", re.I)
+CAPTION_MAX = 160                   # wie in article.js: kürzere Absätze nach einem Bild prüft markCaption
+CREDIT_MAX = 80
+
+
+def _image(rid: int, refs_info: Mapping[int, tuple]) -> str | None:
+    """Bild des Belegs `rid` (drittes Feld von refs_info), nur absolute http(s)-Adressen; ältere 2-Tupel: None."""
+    info = refs_info.get(rid)
+    if not info or len(info) < 3 or not isinstance(info[2], str):
+        return None
+    url = safe_http_url(info[2])
+    # Vorschau- und Klein-URLs (?width=140, _w120 …) nicht: Als Titelbild fielen sie in der Leseansicht
+    # weg (HERO_MIN_WIDTH), im Text stünden sie winzig in der Spalte.
+    return None if not url or is_small_image_url(url) else url
+
+
+def _image_id(url: str) -> str:
+    """Dasselbe Bild in anderer Größe (?width=…, _w960) zählt als dasselbe, wie sameImage in der Leseansicht."""
+    return image_key(url, strict=False)[0] or url
+
+
+def hero_image(sections: list[dict[str, Any]], refs_info: Mapping[int, tuple]) -> str | None:
+    """Titelbild der Ausgabe: Bild des ersten Belegs (in Reihenfolge der refs) des ersten Abschnitts, der
+    eines hat; sonst None."""
+    for sec in sections:
+        for rid in sec["refs"]:
+            url = _image(rid, refs_info)
+            if url:
+                return url
+    return None
+
+
+def _looks_like_caption(texts: list[str]) -> bool:
+    """Würde die Leseansicht (article.js markCaption, captionAfter) die Absätze nach einem Bild als Bildzeile
+    setzen oder mit dem Bild entfernen? `texts`: die ersten Absätze des Abschnitts als reiner Text, wie sie
+    im Browser stehen. Dann kein Bild davor (eher keins als ein verschwundener Absatz)."""
+    first = texts[0].strip() if texts else ""
+    if CAPTION_RE.match(first):
+        return True
+    if len(first) < CAPTION_MAX and _CREDIT_END_RE.search(first):
+        return True
+    second = texts[1].strip() if len(texts) > 1 else ""
+    return len(first) < CAPTION_MAX and len(second) < CREDIT_MAX and bool(_PHOTO_CREDIT_RE.match(second))
+
+
+def render(edition: dict[str, Any], slot: str, refs_info: Mapping[int, tuple],
+           stats: dict[str, Any]) -> tuple[str, str, str, str, str, str | None]:
+    """Fertiger Artikel aus einer geprüften Antwort: (title, lead, author, body_html, body_text, image_url).
+    title, lead und author sind reiner Text; body_html entsteht nur aus escapten Texten, Links auf bekannte
+    Artikel-IDs und Bildern der Belege und läuft zusätzlich durch die HTML-Whitelist
+    (extract.sanitize_fragment, ohne die Heuristiken für Verlagsseiten). refs_info: je ID (Kurzname, Name,
+    image_url); ältere 2-Tupel ohne Bild gehen auch. image_url ist das Titelbild (hero_image, None ohne Bild);
+    je Abschnitt steht direkt nach dem Zwischentitel höchstens ein Bild: das des ersten Belegs mit Bild, das
+    weder Titelbild noch schon im Text ist (keins im Vorspann, in der Agenda und bei den Quellen). stats:
+    shown_articles und shown_papers (sonst articles, papers), sources, since_text."""
     s = SLOTS[slot]
+    hero = hero_image(edition["sections"], refs_info)
+    used = {_image_id(hero)} if hero else set()      # Bildschlüssel, nicht URL-Text (Größenvarianten)
     parts = []
     if edition["lead"]:
         parts.append(f"<p><strong>{_esc(edition['lead'])}</strong></p>")
     for sec in edition["sections"]:
         parts.append(f"<h2>{_esc(sec['heading'])}</h2>")
         last = len(sec["paragraphs"]) - 1
-        for i, para in enumerate(sec["paragraphs"]):
-            parts.append(f"<p>{_esc(para)}{_links(sec['refs'], refs_info) if i == last else ''}</p>")
+        paras = [f"{_esc(para)}{_links(sec['refs'], refs_info) if i == last else ''}"
+                 for i, para in enumerate(sec["paragraphs"])]
+        img = next((u for u in (_image(rid, refs_info) for rid in sec["refs"]) if u and _image_id(u) not in used),
+                   None)
+        if img and not _looks_like_caption([html.unescape(re.sub(r"<[^>]+>", "", p)).replace(NBSP, " ")
+                                            for p in paras[:2]]):
+            used.add(_image_id(img))
+            parts.append(f'<img src="{_esc(img)}" alt="">')
+        parts.extend(f"<p>{p}</p>" for p in paras)
     if edition["agenda"]:
         items = "".join(f"<li>{_esc(a['text'])}{_links(a['refs'], refs_info)}</li>" for a in edition["agenda"])
         parts.append(f"<h2>{_esc(s.agenda_heading)}</h2><ul>{items}</ul>")
@@ -721,13 +793,13 @@ def render(edition: dict[str, Any], slot: str, refs_info: dict[int, tuple[str, s
               f"von {_plural(m, 'Zeitung', 'Zeitungen')}")
     if stats.get("since_text"):
         author += f" seit {str(stats['since_text']).replace(' Uhr', NBSP + 'Uhr')}"
-    return edition["title"], edition["lead"], author, body_html, body_text
+    return edition["title"], edition["lead"], author, body_html, body_text, hero
 
 
-def finish(text: str, slot: str, known_ids: Collection[int], refs_info: dict[int, tuple[str, str]],
-           stats: dict[str, Any]) -> tuple[str, str, str, str, str]:
-    """Antwort des Modells -> (title, lead, author, body_html, body_text): parse_edition und render. Für
-    Vergleichsskripte zusammen mit preview()."""
+def finish(text: str, slot: str, known_ids: Collection[int], refs_info: Mapping[int, tuple],
+           stats: dict[str, Any]) -> tuple[str, str, str, str, str, str | None]:
+    """Antwort des Modells -> (title, lead, author, body_html, body_text, image_url): parse_edition und
+    render. Für Vergleichsskripte zusammen mit preview()."""
     return render(parse_edition(text, known_ids), slot, refs_info, stats)
 
 
@@ -898,11 +970,11 @@ class EditionWriter:
             log.info("KI-Ausgabe %s: %d Artikel von %d Zeitungen (%d von %d Gruppen im Prompt), Modell %s",
                      slot, stats["articles"], stats["papers"], stats["shown_groups"], stats["groups"],
                      self.settings.ai_model)
-            title, lead, author, body_html, body_text = await self._ask(slot, prep)
+            title, lead, author, body_html, body_text, image_url = await self._ask(slot, prep)
             aid = self.db.store_edition({
                 "source_id": SOURCE_ID, "guid": guid, "url": edition_url(edition_day, slot), "title": title,
                 "summary": lead, "author": author, "body_html": body_html, "body_text": body_text,
-                "published_at": _iso(now),
+                "image_url": image_url, "published_at": _iso(now),
             }, force=force)
             self.db.record_fetch(SOURCE_ID, ok=True, new_count=1)
             if self.on_stored is not None:
@@ -923,7 +995,7 @@ class EditionWriter:
         finally:
             self.state.update(running=False, last_finished=utcnow())
 
-    async def _ask(self, slot: str, prep: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    async def _ask(self, slot: str, prep: dict[str, Any]) -> tuple[str, str, str, str, str, str | None]:
         """Modell fragen und Antwort setzen; bis zu 1 + len(retry_pauses) Versuche bei Netz-, 5xx-, 429-
         Fehlern und kaputtem JSON, eine Zeitüberschreitung (Lese-Limit oder Gesamtfrist) nur TIMEOUT_RETRIES
         mal, eine Antwort außerhalb des Schemas nur SCHEMA_RETRIES mal; sofort Schluss bei anderen (401/403:

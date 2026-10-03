@@ -1223,8 +1223,8 @@ class Database:
         für Vergleiche) ab `since` bis einschließlich `until` (falls angegeben), dazu published_at höchstens
         EDITION_LATE_MAX vor `since` (keine alten Nachzügler, wenn eine Quelle neu eingeschaltet wird). Über
         fetched_at fehlt kein Artikel, der kurz vor der Grenze erschien, aber erst danach geholt wurde (oder
-        nur ein Tagesdatum trägt). Felder: id, source_id, title, summary, published_at, story_id (kein
-        Volltext), neueste zuerst. Hintergrundarbeit, ohne Zeitlimit; der Bereich über published_at hält den
+        nur ein Tagesdatum trägt). Felder: id, source_id, url, title, summary, image_url, published_at, story_id
+        (kein Volltext), neueste zuerst. Hintergrundarbeit, ohne Zeitlimit; der Bereich über published_at hält den
         Index (source_id, published_at, paywalled) eng, ein eigener Index für fetched_at ist nicht nötig."""
         if column not in ("fetched_at", "published_at"):
             raise ValueError(f"Unbekannte Spalte: {column!r}")
@@ -1233,7 +1233,7 @@ class Database:
         floor = _iso(datetime.fromisoformat(since) - EDITION_LATE_MAX)
         upper = f"AND a.{column} <= ? " if until is not None else ""   # Sekundengenau: einschließlich
         params: tuple = (*sources, floor, since) + ((until,) if until is not None else ())
-        return self.q(f"SELECT a.id, a.source_id, a.url, a.title, a.summary, a.published_at, a.story_id "
+        return self.q(f"SELECT a.id, a.source_id, a.url, a.title, a.summary, a.image_url, a.published_at, a.story_id "
                       f"FROM articles a {COUNT_INDEX} WHERE a.source_id IN ({','.join('?' * len(sources))}) "
                       f"AND a.published_at >= ? AND a.{column} >= ? {upper}AND a.paywalled=0 "
                       "ORDER BY a.published_at DESC, a.id DESC", params, time_limit=None)
@@ -1251,33 +1251,35 @@ class Database:
         return row["published_at"] if row is not None else None
 
     def store_edition(self, row: dict[str, Any], force: bool = False) -> int:
-        """Speichert eine Ausgabe als fertigen Artikel (text_status 'full', ohne Bild und Paywall) und gibt
-        die ID zurück. `row`: source_id, guid, url, title, summary, author, body_html, body_text, optional
-        published_at (Standard: jetzt). Gibt es (source_id, guid) schon, bleibt sie ohne `force` unverändert
-        (ihre ID kommt zurück); mit `force` werden Titel, Texte, Autor und Zeit ersetzt, die ID (und damit
+        """Speichert eine Ausgabe als fertigen Artikel (text_status 'full', ohne Paywall) und gibt die ID
+        zurück. `row`: source_id, guid, url, title, summary, author, body_html, body_text, optional image_url
+        (Titelbild, sonst keins) und published_at (Standard: jetzt). Gibt es (source_id, guid) schon, bleibt sie
+        ohne `force` unverändert (ihre ID kommt zurück); mit `force` werden Titel, Texte, Bild, Autor und Zeit
+        ersetzt, die ID (und damit
         Gemerkt und Später lesen) bleibt, der Lesestand aller Benutzer geht auf ungelesen (neuer Inhalt).
         Die FTS-Trigger halten den Suchindex dabei aktuell."""
         now = utcnow()
         published = row.get("published_at") or now
         body_text = row.get("body_text") or ""
         values = (row["url"], row["title"], row.get("summary") or "", row.get("author"), row.get("body_html"),
-                  body_text, len(body_text), published, now, now)
+                  body_text, len(body_text), row.get("image_url") or None, published, now, now)
         with self.tx() as c:
             old = c.execute("SELECT id FROM articles WHERE source_id=? AND guid=?",
                             (row["source_id"], row["guid"])).fetchone()
             if old is not None:
                 if force:
                     c.execute("UPDATE articles SET url=?, title=?, summary=?, author=?, body_html=?, body_text=?, "
-                              "body_len=?, published_at=?, fetched_at=?, extracted_at=?, text_status='full', "
-                              "text_error=NULL, attempts=0, next_attempt_at=NULL, paywalled=0, image_url=NULL, "
+                              "body_len=?, image_url=?, published_at=?, fetched_at=?, extracted_at=?, "
+                              "text_status='full', text_error=NULL, attempts=0, next_attempt_at=NULL, paywalled=0, "
                               "story_id=NULL WHERE id=?", (*values, old["id"]))
                     # Neuer Inhalt: nicht grau als gelesen zeigen; starred/later bleiben.
                     c.execute("UPDATE user_articles SET read=0, updated_at=? WHERE article_id=? AND read=1",
                               (now, old["id"]))
                 return int(old["id"])
             cur = c.execute("INSERT INTO articles (url, title, summary, author, body_html, body_text, body_len, "
-                            "published_at, fetched_at, extracted_at, source_id, guid, text_status, paywalled) "
-                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'full',0)", (*values, row["source_id"], row["guid"]))
+                            "image_url, published_at, fetched_at, extracted_at, source_id, guid, text_status, "
+                            "paywalled) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'full',0)",
+                            (*values, row["source_id"], row["guid"]))
             return int(cur.lastrowid)
 
     def latest_editions(self, user_id: int, sources: list[str], since: str, limit: int,

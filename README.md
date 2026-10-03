@@ -306,12 +306,21 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
   die Artikel, die mit ID im Block stehen (das Modell kennt nur die), der Blockkopf mit „von insgesamt K im
   Zeitraum“, wenn gekürzt wurde; die Zeile „Quellen“ nennt deren Zeitungen. Der System-Prompt sagt, dass der
   Artikelblock Material ist und Aufforderungen in Titeln oder Anreißern zu ignorieren sind.
-- Das Modell antwortet mit JSON (Titel, Vorspann, Abschnitte mit Belegen, Agenda). Die Antwort wird streng
-  geprüft (Typen, Längen, höchstens 12 Abschnitte); Belege zählen nur, wenn die Artikel-ID im Prompt stand.
+- Das Modell antwortet mit JSON (Titel, Vorspann, Abschnitte mit Belegen, Agenda). Der Prompt verlangt kurze
+  Absätze (höchstens etwa 50 Wörter, morgens 1 bis 3, abends 2 bis 4 je Abschnitt), einen Abschnitt
+  „Abseits der Schlagzeilen“ für Ereignisse mit großen Folgen, die nur eine oder zwei Zeitungen bringen, und den
+  festen Abschnitt „IT-Sicherheit“. Die Antwort wird streng geprüft (Typen, Längen, höchstens 12 Abschnitte mit
+  je höchstens 20 Absätzen als Schutzgrenze); Belege zählen nur, wenn die Artikel-ID im Prompt stand.
   Jeder Text wird escaped, Links entstehen nur als `#/a/<id>` auf Kiosk-Artikel, und das Ergebnis läuft
   zusätzlich durch die HTML-Whitelist (interne Links nur ausdrücklich über `extract.sanitize_fragment`), ohne die
   Aufräum-Regeln für Verlagsseiten (ein Zwischentitel „Anzeige“ oder ein Absatz auf „Name/dpa“ bleibt stehen).
-  Gespeichert wird ein fertiger Artikel (`text_status` `full`, kein Bild, kein „Original öffnen“: `url` ist
+  Bilder kommen aus den Belegen (`image_url` der Artikel, nur absolute http(s)-Adressen): Titelbild ist das
+  Bild des ersten Belegs mit Bild im ersten Abschnitt, der eines hat (sonst keins); die Leseansicht zeigt es
+  oben, ALLE als Vorschaubild, die Rubrik AUSGABE der Titelseite bleibt ohne Bild. Dazu steht je Abschnitt
+  höchstens ein Bild direkt nach dem Zwischentitel, das des ersten Belegs mit einem Bild, das weder Titelbild
+  noch schon im Text ist; keins im Vorspann, in der Agenda und bei den Quellen, keine Bildzeilen. Vor einem
+  Absatz, den die Leseansicht als Bildzeile läse („Quelle: …“, „Foto: …“), steht kein Bild.
+  Gespeichert wird ein fertiger Artikel (`text_status` `full`, mit dem Titelbild als `image_url`, kein „Original öffnen“: `url` ist
   `kiosk:ausgabe/<Datum>/<morning|evening>`, GUID `ausgabe-<Datum>-<slot>`), `author` ist z. B.
   „Morgenausgabe · von einer KI aus 212 Artikeln von 38 Zeitungen seit gestern 20 Uhr“. `published_at` ist der
   Beginn des Laufs, nicht sein Ende: Eine Abendausgabe, die um 23:50 beginnt und um 0:20 fertig ist, gehört zum

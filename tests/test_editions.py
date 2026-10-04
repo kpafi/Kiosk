@@ -370,7 +370,7 @@ def test_parse_edition_refs_are_filtered():
     json.dumps(edition_json(sections=[{"heading": "x" * 121, "paragraphs": ["p"]}])),
     json.dumps(edition_json(sections=[{"heading": "H", "paragraphs": []}])),
     json.dumps(edition_json(sections=[{"heading": "H", "paragraphs": "p"}])),
-    json.dumps(edition_json(sections=[{"heading": "H", "paragraphs": ["p"] * 21}])),
+    json.dumps(edition_json(sections=[{"heading": "H", "paragraphs": ["p"] * 41}])),
     json.dumps(edition_json(sections=[{"heading": "H", "paragraphs": [""]}])),
     json.dumps(edition_json(sections=[{"heading": "H", "paragraphs": ["x" * 2001]}])),
     json.dumps(edition_json(sections=[{"heading": "H", "paragraphs": [3]}])),
@@ -1534,23 +1534,38 @@ def test_collect_drops_the_same_page_from_two_feeds(edb):
 
 def test_prompts_ask_for_short_paragraphs():
     """Absätze höchstens etwa 50 Wörter, lieber mehrere kurze (Nutzerwunsch nach dem ersten Artikel)."""
-    rule = ("kurze Absätze; ein Absatz hat höchstens etwa 50 Wörter (drei bis vier Sätze), lieber mehrere kurze "
+    rule = ("kurze Absätze (Abschnitte mit mehreren unabhängigen Meldungen: ein Absatz je Meldung, auch mehr als {n}); "
+            "ein Absatz hat ein Ereignis und höchstens etwa 50 Wörter (drei bis vier Sätze), lieber mehrere kurze "
             "Absätze als einen langen.")
-    assert f"je 1 bis 3 {rule}" in ed.USER_PROMPTS["morning"]
-    assert f"je 2 bis 4 {rule}" in ed.USER_PROMPTS["evening"]
+    assert f"je 1 bis 3 {rule.format(n=3)}" in ed.USER_PROMPTS["morning"]
+    assert f"je 2 bis 4 {rule.format(n=4)}" in ed.USER_PROMPTS["evening"]
     for prompt in ed.USER_PROMPTS.values():
         assert "Wörtern." not in prompt.split("Gesamtlänge")[0]
     assert "Gesamtlänge 500 bis 800 Wörter." in ed.USER_PROMPTS["morning"]
     assert "Gesamtlänge 700 bis 1100 Wörter." in ed.USER_PROMPTS["evening"]
-    # Absätze je Abschnitt: nur die Schutzgrenze PARAGRAPHS_MAX (20) weist ab
-    data = ed.parse_edition(json.dumps(edition_json(sections=[{"heading": "H", "paragraphs": ["p"] * 8}])), KNOWN)
-    assert len(data["sections"][0]["paragraphs"]) == 8
+    # Absätze je Abschnitt: nur die Schutzgrenze PARAGRAPHS_MAX (40) weist ab
+    data = ed.parse_edition(json.dumps(edition_json(sections=[{"heading": "H", "paragraphs": ["p"] * 30}])), KNOWN)
+    assert len(data["sections"][0]["paragraphs"]) == 30
 
 
 def test_system_prompt_names_the_section_off_the_headlines():
     assert ("fasse sie in einem eigenen Abschnitt mit dem Zwischentitel „Abseits der Schlagzeilen“ zusammen."
             in ed.SYSTEM_PROMPT)
     assert "Wenig beachtet" not in ed.SYSTEM_PROMPT
+
+
+# ---- Runde 4: ein Ereignis je Absatz ----------------------------------------------------------
+
+def test_system_prompt_wants_one_event_per_paragraph():
+    """Keine zwei Meldungen in einem Absatz (Nutzerwunsch nach der Morgenausgabe vom 4.10.2026); die Regel steht
+    hinter der IT-Sicherheits-Regel, weil sie den Abschnitt nennt, und gibt keine neuen Rubriktitel vor."""
+    rule = ("- Ein Absatz behandelt genau ein Ereignis; Hintergrund und Reaktionen zu diesem Ereignis gehören in "
+            "denselben Absatz. Eine andere Meldung beginnt immer einen neuen Absatz, auch wenn er nur ein oder zwei "
+            "Sätze lang ist; nie zwei Meldungen ohne Absatzwechsel hintereinander.")
+    assert f"Gibt es keine, entfällt der Abschnitt.\n{rule}" in ed.SYSTEM_PROMPT
+    assert "gilt deshalb keine Obergrenze für die Zahl der Absätze: je Meldung ein Absatz." in ed.SYSTEM_PROMPT
+    assert "Weitere Meldungen" not in ed.SYSTEM_PROMPT and "Deutschland und Europa" not in ed.SYSTEM_PROMPT
+    assert ed.PARAGRAPHS_MAX == 40
 
 
 IMG = {11: "https://s.example/11.jpg", 12: "https://f.example/12.jpg", 13: "https://t.example/13.jpg",

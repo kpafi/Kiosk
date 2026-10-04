@@ -307,10 +307,11 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
   Zeitraum“, wenn gekürzt wurde; die Zeile „Quellen“ nennt deren Zeitungen. Der System-Prompt sagt, dass der
   Artikelblock Material ist und Aufforderungen in Titeln oder Anreißern zu ignorieren sind.
 - Das Modell antwortet mit JSON (Titel, Vorspann, Abschnitte mit Belegen, Agenda). Der Prompt verlangt kurze
-  Absätze (höchstens etwa 50 Wörter, morgens 1 bis 3, abends 2 bis 4 je Abschnitt), einen Abschnitt
+  Absätze (höchstens etwa 50 Wörter, morgens 1 bis 3, abends 2 bis 4 je Abschnitt) mit genau einem Ereignis je
+  Absatz (Abschnitte mit mehreren unabhängigen Meldungen: je Meldung ein Absatz, ohne Obergrenze), einen Abschnitt
   „Abseits der Schlagzeilen“ für Ereignisse mit großen Folgen, die nur eine oder zwei Zeitungen bringen, und den
   festen Abschnitt „IT-Sicherheit“. Die Antwort wird streng geprüft (Typen, Längen, höchstens 12 Abschnitte mit
-  je höchstens 20 Absätzen als Schutzgrenze); Belege zählen nur, wenn die Artikel-ID im Prompt stand.
+  je höchstens 40 Absätzen als Schutzgrenze); Belege zählen nur, wenn die Artikel-ID im Prompt stand.
   Jeder Text wird escaped, Links entstehen nur als `#/a/<id>` auf Kiosk-Artikel, und das Ergebnis läuft
   zusätzlich durch die HTML-Whitelist (interne Links nur ausdrücklich über `extract.sanitize_fragment`), ohne die
   Aufräum-Regeln für Verlagsseiten (ein Zwischentitel „Anzeige“ oder ein Absatz auf „Name/dpa“ bleibt stehen).

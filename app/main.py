@@ -137,6 +137,11 @@ async def _running(app: FastAPI):
         log.info("KI-Ausgabe an: Modell %s, %s und %s Uhr (%s), Denkbudget %s", state.settings.ai_model,
                  state.settings.ai_morning, state.settings.ai_evening, state.settings.tz,
                  state.settings.ai_reasoning)
+    if state.settings.mail_enabled:
+        log.info("KI-Ausgabe per Mail: %d Empfänger über %s:%d als %s", len(state.settings.mail_to),
+                 state.settings.mail_host, state.settings.mail_port, state.settings.mail_from)
+    elif state.settings.mail_host:
+        log.warning("KIOSK_MAIL_HOST gesetzt, aber KIOSK_MAIL_TO leer: kein Versand der KI-Ausgabe")
     log.info("Kiosk gestartet: %d Quellen im Katalog, Datenbank %s",
              len(state.catalog.all()), state.settings.db_path)
     try:
@@ -1219,6 +1224,11 @@ async def refresh():
 class EditionRunBody(BaseModel):
     slot: Literal["morning", "evening"]
     force: StrictBool = False          # nur true/false, kein "yes" oder 1
+    mail: StrictBool = False           # die neue Ausgabe danach verschicken wie der Zeitplan (KIOSK_MAIL_*)
+
+
+class EditionMailBody(BaseModel):
+    id: int | None = Field(default=None, ge=1, le=MAX_ID)    # Ausgabe; ohne: die neueste
 
 
 @app.post("/api/editions/run", status_code=202, dependencies=[Depends(admin_user)])
@@ -1233,11 +1243,31 @@ async def run_edition(body: EditionRunBody):
         raise HTTPException(503, "Die Quelle Kiosk ist ausgeschaltet")
     if not body.force and state.editions.exists_today(body.slot):
         raise HTTPException(409, "Ausgabe gibt es schon; force: true ersetzt sie")
+    if body.mail and not state.settings.mail_enabled:
+        raise HTTPException(503, "Versand aus: KIOSK_MAIL_HOST oder KIOSK_MAIL_TO fehlt")
     try:
-        await state.editions.launch(body.slot, body.force)
+        await state.editions.launch(body.slot, body.force, body.mail)
     except EditionBusy:
         raise HTTPException(409, "Eine Ausgabe wird gerade geschrieben") from None
     return {"started": True}
+
+
+@app.post("/api/editions/mail", status_code=202, dependencies=[Depends(admin_user)])
+async def mail_edition(body: EditionMailBody):
+    """Eine gespeicherte Ausgabe (`id`, sonst die neueste) per Mail an die Empfänger aus KIOSK_MAIL_TO schicken
+    (nur Admin), im Hintergrund; Ergebnis in Log und /api/status (editions.mail). Zum Prüfen des Versands und
+    zum Nachschicken; der Zeitplan verschickt jede neue Ausgabe von selbst."""
+    if not state.settings.mail_enabled:
+        raise HTTPException(503, "Versand aus: KIOSK_MAIL_HOST oder KIOSK_MAIL_TO fehlt")
+    aid = body.id if body.id is not None else state.db.latest_edition_id()
+    row = state.db.get_article(aid) if aid is not None else None
+    if row is None or row["source_id"] != "kiosk":
+        raise HTTPException(404, "Keine solche Ausgabe")
+    try:
+        state.editions.launch_mail(int(aid))
+    except EditionBusy:
+        raise HTTPException(409, "Ein Versand läuft gerade") from None
+    return {"started": True, "id": int(aid)}
 
 
 def _editions_status(admin: bool) -> dict[str, Any]:

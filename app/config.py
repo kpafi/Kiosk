@@ -32,6 +32,12 @@ DEFAULT_AI_EVENING = "20:00"
 # Denkbudget (OpenRouter `reasoning.effort`): none = nichts senden (Standard des Modells).
 AI_REASONING_LEVELS = ("none", "low", "medium", "high")
 _HHMM_RE = re.compile(r"([01]?[0-9]|2[0-3]):([0-5][0-9])")
+# Versand der KI-Ausgabe per Mail (app/mail.py): SMTP mit TLS, Standardport 465 (SMTPS); 587 = STARTTLS.
+DEFAULT_MAIL_PORT = 465
+MAIL_TO_MAX = 50
+# Mailadresse: ein lokaler Teil ohne Leerzeichen, Klammern oder Anführungszeichen und ein Hostname mit Punkt.
+_MAIL_ADDR_RE = re.compile(r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]{1,64}@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+                           r"[A-Za-z]{2,63}")
 
 
 @dataclass(frozen=True)
@@ -62,6 +68,21 @@ class Settings:
     ai_morning: str = DEFAULT_AI_MORNING
     ai_evening: str = DEFAULT_AI_EVENING
     ai_reasoning: str = "none"
+    # Versand der KI-Ausgabe per Mail: KIOSK_MAIL_HOST ("" = aus), KIOSK_MAIL_PORT (465 TLS, 587 STARTTLS),
+    # KIOSK_MAIL_USER/KIOSK_MAIL_PASSWORD (Anmeldung, Passwort nie in repr oder Log), KIOSK_MAIL_FROM
+    # (Absender, Standard der Benutzer), KIOSK_MAIL_TO (Empfänger, kommagetrennt), KIOSK_PUBLIC_URL (Adresse
+    # der App für Links in der Mail, "" = Links als Text).
+    mail_host: str = ""
+    mail_port: int = DEFAULT_MAIL_PORT
+    mail_user: str = ""
+    mail_password: str = field(default="", repr=False)
+    mail_from: str = ""
+    mail_to: tuple[str, ...] = ()
+    public_url: str = ""
+
+    @property
+    def mail_enabled(self) -> bool:
+        return bool(self.mail_host and self.mail_to)
 
 
 def _int(name: str, default: int, lo: int | None = None, hi: int | None = None) -> int:
@@ -139,6 +160,53 @@ def _ai_settings() -> dict:
         raise RuntimeError(f"KIOSK_AI_REASONING muss {', '.join(AI_REASONING_LEVELS)} sein, ist {reasoning!r}")
     return {"ai_api_key": key, "ai_model": model, "ai_base_url": base, "ai_morning": morning,
             "ai_evening": evening, "ai_reasoning": reasoning}
+
+
+def mail_addresses(raw: str, name: str = "KIOSK_MAIL_TO") -> tuple[str, ...]:
+    """Kommagetrennte Mailadressen (ohne Namen, nur adresse@host), doppelte entfernt (Groß/Klein egal);
+    ungültig oder mehr als MAIL_TO_MAX: RuntimeError."""
+    out: list[str] = []
+    for part in raw.replace(";", ",").split(","):
+        addr = part.strip()
+        if not addr:
+            continue
+        if not _MAIL_ADDR_RE.fullmatch(addr):
+            raise RuntimeError(f"{name}: keine gültige Mailadresse: {addr!r}")
+        if addr.lower() not in {a.lower() for a in out}:
+            out.append(addr)
+    if len(out) > MAIL_TO_MAX:
+        raise RuntimeError(f"{name}: höchstens {MAIL_TO_MAX} Empfänger")
+    return tuple(out)
+
+
+def _mail_settings() -> dict:
+    """Einstellungen des Mailversands aus der Umgebung, geprüft (RuntimeError bei Unsinn). Ohne
+    KIOSK_MAIL_HOST ist der Versand aus; die anderen Werte werden dann nicht verlangt. Fehlermeldungen nennen nie
+    das Passwort."""
+    host = os.environ.get("KIOSK_MAIL_HOST", "").strip()
+    password = os.environ.get("KIOSK_MAIL_PASSWORD", "")
+    public = os.environ.get("KIOSK_PUBLIC_URL", "").strip().rstrip("/")
+    if public and not re.fullmatch(r"https://[^\s/?#]+(/[^\s?#]*)?", public):
+        raise RuntimeError(f"KIOSK_PUBLIC_URL muss eine https-Adresse sein, ist {public!r}")
+    if not host:
+        return {"mail_host": "", "mail_port": DEFAULT_MAIL_PORT, "mail_user": "", "mail_password": "",
+                "mail_from": "", "mail_to": (), "public_url": public}
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?", host):
+        raise RuntimeError(f"KIOSK_MAIL_HOST ist kein Hostname: {host!r}")
+    port = _int("KIOSK_MAIL_PORT", DEFAULT_MAIL_PORT, lo=1, hi=65535)
+    user = os.environ.get("KIOSK_MAIL_USER", "").strip()
+    if not user or not password:
+        raise RuntimeError("KIOSK_MAIL_HOST gesetzt, aber KIOSK_MAIL_USER oder KIOSK_MAIL_PASSWORD fehlt")
+    if any(c.isspace() for c in user) or not user.isprintable() or not user.isascii() or len(user) > 254:
+        raise RuntimeError(f"KIOSK_MAIL_USER enthält Leerzeichen, Steuerzeichen oder Nicht-ASCII: {user!r}")
+    if any(c in "\r\n\0" for c in password) or not password.isascii():
+        raise RuntimeError("KIOSK_MAIL_PASSWORD enthält Zeilenumbrüche oder Zeichen außerhalb von ASCII")
+    sender = os.environ.get("KIOSK_MAIL_FROM", "").strip() or user
+    if not _MAIL_ADDR_RE.fullmatch(sender):
+        raise RuntimeError(f"KIOSK_MAIL_FROM (bzw. KIOSK_MAIL_USER als Absender) ist keine Mailadresse: {sender!r}")
+    to = mail_addresses(os.environ.get("KIOSK_MAIL_TO", ""))
+    return {"mail_host": host, "mail_port": port, "mail_user": user, "mail_password": password,
+            "mail_from": sender, "mail_to": to, "public_url": public}
 
 
 def fetch_deny_networks(name: str = "KIOSK_FETCH_DENY_IPS") -> tuple:
@@ -270,4 +338,5 @@ def load_settings() -> Settings:
         tz=_tz("KIOSK_TZ", DEFAULT_TZ),
         fetch_deny_ips=fetch_deny_networks(),
         **_ai_settings(),
+        **_mail_settings(),
     )

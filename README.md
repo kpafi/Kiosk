@@ -111,7 +111,8 @@ Anfangsbuchstaben („Admin“). Der letzte aktive Admin lässt sich nicht lösc
 | PATCH | `/api/settings` (Teilfelder) | Einstellungen ändern (validiert); liefert alle |
 | GET | `/api/counts` | `{unread, later, starred, profiles, favorites, sources_enabled, sources_total, sources_failing}` |
 | POST | `/api/refresh` | Sammellauf sofort starten (nur Admin) |
-| POST | `/api/editions/run` `{slot: morning\|evening, force}` | KI-Ausgabe im Hintergrund schreiben (nur Admin): 202 `{started: true}`; 503 ohne Schlüssel oder bei ausgeschalteter Quelle `kiosk`, 409 während eines Laufs oder wenn es die Ausgabe heute schon gibt und `force` fehlt, 422 bei anderem `slot` oder `force`, das nicht `true`/`false` ist |
+| POST | `/api/editions/run` `{slot: morning\|evening, force, mail}` | KI-Ausgabe im Hintergrund schreiben (nur Admin): 202 `{started: true}`; 503 ohne Schlüssel, bei ausgeschalteter Quelle `kiosk` oder mit `mail` ohne Versand-Einstellungen, 409 während eines Laufs oder wenn es die Ausgabe heute schon gibt und `force` fehlt, 422 bei anderem `slot` oder `force`/`mail`, das nicht `true`/`false` ist. `mail: true` verschickt die neue Ausgabe danach wie der Zeitplan |
+| POST | `/api/editions/mail` `{id}` | Gespeicherte Ausgabe (`id`, ohne: die neueste) per Mail an `KIOSK_MAIL_TO` schicken (nur Admin), im Hintergrund: 202 `{started: true, id}`; 503 ohne Versand-Einstellungen, 404 wenn `id` keine Ausgabe ist oder es keine gibt, 409 während eines Versands, 422 bei `id` außerhalb von 1 bis 2⁶³−1 |
 | GET | `/api/status` | Admin: Build-Zeitstempel (`build`), Sammler-Status (`fetcher`), KI-Ausgabe (`editions`), Datenbank (`db`), Einstellungen (`settings`); andere Benutzer nur `{build, fetcher, editions: {enabled, running}}` |
 | GET | `/api/build` | Ohne Login: `{build}` (Version des Service Workers) |
 | GET | `/favicon.ico` | Ohne Login: Icon |
@@ -369,6 +370,26 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
   verbrauchen ohne Begrenzung das ganze Token-Budget mit Denken und brechen mit `finish_reason` `length` ab
   („Antwort abgeschnitten“); mit `low` sind sie brauchbar. Mit Denkbudget geht die Anfrage ohne eigene
   `temperature` hinaus (Claude-Modelle lehnen die Kombination sonst ab).
+- Versand per Mail (`app/mail.py`): Mit `KIOSK_MAIL_HOST`, `KIOSK_MAIL_USER`, `KIOSK_MAIL_PASSWORD` und
+  Empfängern in `KIOSK_MAIL_TO` (kommagetrennt, höchstens 50) schickt der Zeitplan jede Ausgabe, die er schreibt
+  (auch nachgeholte), nach dem Speichern als Mail: eine Mail je Empfänger (keiner sieht die anderen), Absender
+  „Kiosk <KIOSK_MAIL_FROM>“ (Standard: der Benutzer), Betreff „Kiosk · Morgenausgabe, 6. Oktober 2026 · Titel“,
+  Textteil und HTML-Teil mit Titelbild und den Bildern der Belege; die Quellen-Links (`#/a/<id>`) zeigen auf die App
+  unter `KIOSK_PUBLIC_URL` (ohne: nur die Namen). SMTP mit TLS: Port 465 (Standard) TLS von Anfang an, 587 oder 25
+  STARTTLS (jeder andere Port: TLS von Anfang an), Zertifikat wird geprüft; 30 s Zeitlimit je Schritt, der
+  Versand läuft in einem Thread und als eigener Hintergrund-Task (der Zeitplan wartet nicht auf ihn), einer zur
+  Zeit. Scheitert er, bis zu 3 Versuche (Pausen 60 s und 300 s), jeweils nur an die Empfänger, die noch keine
+  Mail haben (wer vor einem Abbruch beliefert war, bekommt keine zweite); nicht wiederholt wird, was zwecklos
+  ist: abgelehnte Anmeldung, 5xx-Antworten, vom Server endgültig abgelehnte Empfänger (sonst sperrte fail2ban
+  des Mailservers den Kiosk nach wenigen Fehlversuchen). Die Ausgabe selbst ist unabhängig davon gespeichert,
+  der Zeitplan läuft weiter; Fehler stehen im Log und in `/api/status` (`editions.mail`: `enabled`,
+  `recipients` als Zahl, `sending`, `last_sent`, `last_error`; nie Adressen oder das Passwort, Antworten des
+  Servers werden zitiert). Nicht nachgeholt wird ein Versand, der alle Versuche verliert oder den ein Neustart
+  während der Pausen abbricht (nichts merkt sich „verschickt“): dann `POST /api/editions/mail` (ohne `id`: die
+  neueste Ausgabe) von Hand, auch zum Prüfen der Einstellungen. Handläufe verschicken nur mit `mail: true`; eine
+  so verschickte Vorschau (Handlauf vor der Zeit des Slots) geht noch einmal hinaus, wenn der Zeitplan sie zur
+  Zeit ersetzt. Ohne `KIOSK_MAIL_HOST` ist der Versand aus; mit Host, aber ohne `KIOSK_MAIL_TO`, startet die
+  App mit Warnung ohne Versand.
 - Handlauf nach Mitternacht: Die Abendausgabe des Vortags holt der Zeitplan selbst nach (bis 6 Stunden
   nach ihrer Zeit); ein Handlauf `evening` zwischen 0 und 6 Uhr erzeugt dagegen eine Vorschau für den
   neuen Tag.
@@ -520,10 +541,16 @@ Suche, Zähler, Artikel per ID).
 | `KIOSK_AI_BASE_URL` | `https://openrouter.ai/api/v1` | Endpunkt (OpenAI-kompatibel, `/chat/completions` wird angehängt) |
 | `KIOSK_AI_MORNING` / `KIOSK_AI_EVENING` | `06:00` / `20:00` | Uhrzeiten der Ausgaben (HH:MM, Ortszeit `KIOSK_TZ`); der Morgen muss vor dem Abend liegen |
 | `KIOSK_AI_REASONING` | `none` | Denkbudget (`none`, `low`, `medium`, `high`); außer `none` als `reasoning.effort` an OpenRouter. Für „denkende“ Modelle (DeepSeek v4 flash, Qwen, GLM) `low`, sonst verbrauchen sie das Token-Budget mit Denken |
+| `KIOSK_MAIL_HOST` | – | SMTP-Server für den Versand der KI-Ausgabe; leer: Versand aus |
+| `KIOSK_MAIL_PORT` | `465` | 587 oder 25: STARTTLS; jeder andere Port: TLS von Anfang an |
+| `KIOSK_MAIL_USER` / `KIOSK_MAIL_PASSWORD` | – | Anmeldung am SMTP-Server (Pflicht mit Host, nur ASCII); das Passwort erscheint nie in Log, Status oder Fehlertexten. In der `.env` in einfache Anführungszeichen setzen (Docker Compose v2 entfernt sie; `$` und `#` bleiben so erhalten); ein Passwort mit `'` lässt sich so nicht schreiben, dann eines ohne wählen |
+| `KIOSK_MAIL_FROM` | `KIOSK_MAIL_USER` | Absenderadresse (nur die Adresse, der Name „Kiosk“ kommt dazu) |
+| `KIOSK_MAIL_TO` | – | Empfänger, kommagetrennt (nur Adressen, höchstens 50); leer: kein Versand |
+| `KIOSK_PUBLIC_URL` | – | https-Adresse der App für die Links in der Mail („Im Kiosk lesen“, Quellen); leer: Links als Text |
 | `KIOSK_FETCH_DENY_IPS` | – | Zusätzlich gesperrte Ziele für Feed- und Artikelabrufe: IPs oder Netze (CIDR), kommagetrennt, z. B. die Adressen des eigenen Servers `203.0.113.10,2001:db8:1234:5678::/64` (kein ganzes Provider-Netz wie `2a01:4f8::/32`, das sperrte auch dort gehostete Nachrichtenseiten); `deploy.sh` trägt diesen Wert ein, wenn er in der `.env` fehlt |
 
 Werte außerhalb der Grenzen, unbekannte Zeitzonen, ungültige Einträge in `KIOSK_FETCH_DENY_IPS`, ungültige
-Uhrzeiten oder Adressen der KI-Ausgabe und ein
+Uhrzeiten oder Adressen der KI-Ausgabe, unvollständige oder ungültige Mail-Einstellungen und ein
 Secret unter 32 Zeichen (auch eine leere oder zu kurze `secret.key`) brechen den Start mit einer klaren
 Fehlermeldung ab. Die App legt Dateien nur für den eigenen Benutzer lesbar an (umask 077).
 

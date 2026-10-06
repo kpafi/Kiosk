@@ -28,6 +28,11 @@ Gleicher Server wie secure-chat und MailDigest (203.0.113.10, SSH-Alias `kiosk-s
   oder ein Deploy. deploy.sh trägt den Schlüssel nie ein (an der `.env` ergänzt es nur ein fehlendes
   `KIOSK_FETCH_DENY_IPS` und hält sie bei root, Modus 600). Ohne Schlüssel ist die KI-Ausgabe aus (Hinweis im Log). Prüfen: `/api/status`
   als Admin (`editions.enabled`), sofort eine Ausgabe schreiben: `POST /api/editions/run {"slot": "morning"}`.
+- Versand der KI-Ausgabe per Mail: `KIOSK_MAIL_HOST`, `KIOSK_MAIL_USER`, `KIOSK_MAIL_PASSWORD`, `KIOSK_MAIL_TO`
+  und `KIOSK_PUBLIC_URL` ebenso von Hand in `/opt/kiosk/.env` (siehe `.env.example`); das Passwort gehört in
+  einfache Anführungszeichen. Auf der Box läuft der Mailserver `mailserver` (/opt/mailserver, mail.example.org,
+  Konto kiosk@example.org); der Kiosk-Container erreicht ihn über die öffentliche Adresse auf 465. Prüfen:
+  `/api/status` als Admin (`editions.mail`), Probeversand der neuesten Ausgabe: `POST /api/editions/mail {}`.
 - Container `kiosk` lauscht nur auf `127.0.0.1:8100`. Caddy terminiert HTTPS unter `kiosk.example.org`.
 - Deploy: `bash deploy/deploy.sh` aus dem Repo-Root. Beim ersten Lauf wird ein Passwort erzeugt und in
   `/opt/kiosk/.env` abgelegt (nicht im Terminal ausgegeben). Fehlt `KIOSK_FETCH_DENY_IPS` in der `.env`,

@@ -27,6 +27,8 @@ from typing import Any, Callable, Collection, Iterable, Mapping
 import httpx
 
 from .config import DEFAULT_AI_EVENING, DEFAULT_AI_MORNING, Settings
+from . import mail as mail_mod
+from .mail import MailError
 from . import db as db_mod
 from .db import Database, _iso, utcnow
 from .extract import CAPTION_RE, html_to_text, image_key, is_small_image_url, safe_http_url, sanitize_fragment
@@ -48,6 +50,9 @@ SCHEDULE_RETRY_PAUSE = timedelta(minutes=30)
 BUSY_RETRY = timedelta(seconds=60)  # ein Admin-Lauf läuft gerade: so bald wieder nachsehen
 FIRST_FETCH_WAIT = timedelta(minutes=15)    # beim Start höchstens so lange auf den ersten Sammellauf warten
 FIRST_FETCH_POLL = 10               # dabei alle so viele Sekunden nachsehen
+# Versand per Mail (KIOSK_MAIL_*): so viele Versuche je Ausgabe, Pausen dazwischen
+MAIL_ATTEMPTS = 3
+MAIL_RETRY_PAUSES = (60, 300)
 # Artikelblock für das Modell
 TITLE_MAX = 200                     # Titel des Vertreters einer Gruppe
 TEASER_MAX = 220                    # Anreißer des Vertreters
@@ -280,6 +285,21 @@ def since_text(since: datetime, now: datetime) -> str:
 
 def german_date(d: date) -> str:
     return f"{d.day}. {MONTHS[d.month - 1]} {d.year}"
+
+
+def mail_subject(guid: str, title: str) -> str:
+    """Betreff der Mail: „Kiosk · Morgenausgabe, 6. Oktober 2026 · <Titel>“ aus der GUID (edition_guid);
+    passt die GUID nicht (ältere Daten), nur „Kiosk · <Titel>“."""
+    m = re.fullmatch(r"ausgabe-(\d{4}-\d{2}-\d{2})-(morning|evening)", guid or "")
+    head = "Kiosk"
+    if m:
+        try:
+            day = date.fromisoformat(m.group(1))
+        except ValueError:
+            day = None
+        if day is not None:
+            head = f"Kiosk · {SLOTS[m.group(2)].label}, {german_date(day)}"
+    return f"{head} · {title}" if title else head
 
 
 # ---- Artikel sammeln -------------------------------------------------------------------------
@@ -834,8 +854,11 @@ class EditionWriter:
 
     def __init__(self, db: Database, catalog: Catalog, settings: Settings, *,
                  retry_pauses: tuple[float, ...] = RETRY_PAUSES, transport: httpx.AsyncBaseTransport | None = None,
-                 total_timeout: float = TOTAL_TIMEOUT, on_stored: Callable[[], None] | None = None):
+                 total_timeout: float = TOTAL_TIMEOUT, on_stored: Callable[[], None] | None = None,
+                 sender: Callable[..., mail_mod.SendResult] | None = None):
         self.db, self.catalog, self.settings = db, catalog, settings
+        # Versand (mail.send, blockierend, läuft in einem Thread); in Tests ersetzbar
+        self.send = sender if sender is not None else mail_mod.send
         self.retry_pauses = tuple(retry_pauses)
         self.total_timeout = total_timeout      # Gesamtfrist je Anfrage (in Tests klein)
         # Nach dem Speichern (main: api_ui.invalidate_unread, damit Profil-Zähler die Ausgabe sofort zählen)
@@ -844,6 +867,10 @@ class EditionWriter:
         self._client: httpx.AsyncClient | None = None
         self._lock = asyncio.Lock()
         self._tasks: set[asyncio.Task] = set()
+        # Versand: einer zur Zeit (Zeitplan und Admin warten aufeinander); _mail_queued zählt Tasks aus
+        # launch_mail/_spawn_mail, die die Sperre noch nicht halten (für mail_busy ohne Lücke)
+        self._mail_lock = asyncio.Lock()
+        self._mail_queued = 0
         # Zeitplan: GUID -> (Zahl der Läufe, nächster Versuch in UTC oder None = erledigt). Nur im Speicher:
         # Nach einem Neustart beginnt die Zählung neu (bekannte Grenze, siehe README).
         self._attempts: dict[str, tuple[int, datetime | None]] = {}
@@ -853,6 +880,10 @@ class EditionWriter:
         self.state: dict[str, Any] = {
             "enabled": bool(settings.ai_api_key), "model": settings.ai_model, "running": False,
             "last_started": None, "last_finished": None, "last_slot": None, "last_error": None, "last_usage": None,
+            # Versand per Mail: an (Server und Empfänger gesetzt), Zahl der Empfänger, letzter Versand
+            # (UTC-ISO), letzter Fehler; nie Adressen oder Passwort.
+            "mail": {"enabled": settings.mail_enabled, "recipients": len(settings.mail_to), "sending": False,
+                     "last_sent": None, "last_error": None},
         }
 
     @property
@@ -901,15 +932,16 @@ class EditionWriter:
         async with self._lock:
             return await self._run_locked(slot, force, day)
 
-    async def launch(self, slot: str, force: bool = False) -> None:
+    async def launch(self, slot: str, force: bool = False, mail: bool = False) -> None:
         """Startet run im Hintergrund (für den Admin-Endpunkt): Ergebnis nur in Log und Status.
-        EditionBusy, wenn schon ein Lauf läuft. Die Sperre gilt ab sofort, nicht erst im Task."""
+        EditionBusy, wenn schon ein Lauf läuft. Die Sperre gilt ab sofort, nicht erst im Task. `mail`: die
+        neue Ausgabe danach wie der Zeitplan verschicken (mail_edition)."""
         if self._lock.locked():
             raise EditionBusy("Es läuft schon eine Ausgabe")
         await self._lock.acquire()          # frei: kehrt ohne Warten zurück
         self.state["running"] = True
         try:
-            task = asyncio.create_task(self._background(slot, force))
+            task = asyncio.create_task(self._background(slot, force, mail))
         except BaseException:
             self.state["running"] = False
             self._lock.release()
@@ -917,12 +949,44 @@ class EditionWriter:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def _background(self, slot: str, force: bool) -> None:
+    @property
+    def mail_busy(self) -> bool:
+        """Läuft oder wartet gerade ein Versand (Admin-Endpunkt: 409)?"""
+        return self._mail_lock.locked() or self._mail_queued > 0
+
+    def launch_mail(self, article_id: int) -> None:
+        """Verschickt die Ausgabe `article_id` im Hintergrund (Admin-Endpunkt); Ergebnis in Log und
+        state["mail"]. EditionBusy, wenn schon ein Versand läuft oder wartet (sofort, ohne Lücke bis zum Task:
+        zwei Anfragen hintereinander lösen nur einen Versand aus). Der Aufrufer prüft vorher, dass es eine
+        Ausgabe ist und der Versand an ist."""
+        if self.mail_busy:
+            raise EditionBusy("Ein Versand läuft gerade")
+        self._spawn_mail(article_id, "Handversand")
+
+    def _spawn_mail(self, article_id: int, what: str) -> None:
+        self._mail_queued += 1
+        try:
+            task = asyncio.create_task(self._mail_task(article_id, what))
+        except BaseException:
+            self._mail_queued -= 1
+            raise
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _mail_task(self, article_id: int, what: str) -> None:
+        db_mod.request_time_limit.set(None)     # vom Admin-Endpunkt geerbte Abfragefrist gilt hier nicht
+        try:
+            await self._mail_quietly(article_id, what)
+        finally:
+            self._mail_queued -= 1
+
+    async def _background(self, slot: str, force: bool, mail: bool = False) -> None:
         # Der Task erbt den Kontext der API-Anfrage samt Abfragefrist (db.request_time_limit); die gilt für
         # Hintergrundarbeit nicht (der Kontext ist eine Kopie, die Anfrage bleibt unberührt).
         db_mod.request_time_limit.set(None)
+        res: dict[str, Any] | None = None
         try:
-            await self._run_locked(slot, force)
+            res = await self._run_locked(slot, force)
         except EditionUnavailable as e:
             log.info("KI-Ausgabe %s nicht gestartet: %s", slot, e)
         except EditionError:
@@ -934,6 +998,89 @@ class EditionWriter:
             # vor seinem eigenen finally zurück. Hier immer zurücksetzen.
             self.state["running"] = False
             self._lock.release()
+        # Nach der Sperre: Der Versand (mit Pausen bei Wiederholungen) hält keinen anderen Lauf auf.
+        if mail and res is not None and res.get("status") == "created":
+            self._spawn_mail(res["id"], slot)
+
+    # ---- Versand per Mail ---------------------------------------------------------------------
+
+    async def _mail_quietly(self, article_id: int, what: str) -> None:
+        """mail_edition ohne Ausnahme nach außen (Zeitplan und Hintergrund-Tasks): Fehler stehen im Log und in
+        state["mail"]; die Ausgabe selbst ist gespeichert und bleibt es."""
+        try:
+            await self.mail_edition(article_id)
+        except asyncio.CancelledError:
+            raise
+        except MailError:
+            pass                            # schon protokolliert (mail_edition)
+        except Exception as e:  # noqa: BLE001
+            log.exception("KI-Ausgabe (%s): Versand der Ausgabe %d unerwartet gescheitert", what, article_id)
+            self.state["mail"]["last_error"] = f"Ausgabe {article_id}: Interner Fehler ({type(e).__name__})"
+
+    async def mail_edition(self, article_id: int) -> dict[str, Any]:
+        """Verschickt die gespeicherte Ausgabe `article_id` an alle Empfänger aus KIOSK_MAIL_TO, eine Mail je
+        Empfänger (keiner sieht die anderen), ein Versand zur Zeit (_mail_lock). Bis zu MAIL_ATTEMPTS Versuche mit
+        MAIL_RETRY_PAUSES, jeweils nur an die Empfänger, die noch nicht beliefert sind: Wer vor einem Abbruch
+        schon seine Mail hat, bekommt keine zweite. Nicht wiederholt wird, was zwecklos ist (Anmeldung abgelehnt,
+        5xx, vom Server endgültig abgelehnte Empfänger). Gibt {"sent": n, "unreached": [...]} zurück; MailError,
+        wenn am Ende niemand beliefert ist oder der Versand aus ist; ValueError, wenn `article_id` keine Ausgabe
+        ist. Adressen stehen nie im Zustand; im Log nur Zahlen (Antworten des Servers werden zitiert)."""
+        st = self.state["mail"]
+        if not self.settings.mail_enabled:
+            raise MailError("Versand aus: KIOSK_MAIL_HOST oder KIOSK_MAIL_TO fehlt")
+        row = self.db.get_article(int(article_id))
+        if row is None or row["source_id"] != SOURCE_ID:
+            raise ValueError(f"Artikel {article_id} ist keine Ausgabe")
+        row = dict(row)                     # sqlite3.Row kennt kein get
+        subject = mail_subject(row["guid"], row["title"])
+        pending = list(self.settings.mail_to)
+        total = len(pending)
+        sent, failed, error = 0, 0, ""
+        async with self._mail_lock:
+            st["sending"] = True
+            try:
+                for attempt in range(MAIL_ATTEMPTS):
+                    messages = [mail_mod.build_message(row, subject=subject, sender=self.settings.mail_from,
+                                                       recipient=to, public_url=self.settings.public_url)
+                                for to in pending]
+                    permanent = False
+                    try:
+                        res = await asyncio.to_thread(self.send, self.settings, messages)
+                    except MailError as e:
+                        error, permanent = str(e), e.permanent
+                        delivered, done = set(e.delivered), set(e.delivered) | set(e.failed)
+                        failed += len(e.failed)
+                        retry = [to for to in pending if to not in done]
+                    else:
+                        delivered, retry = set(res.delivered), list(res.retry)
+                        failed += len(res.failed)
+                        if res.retry or res.failed:     # sonst bleibt der Grund des vorigen Versuchs stehen
+                            error = f"{len(res.retry) + len(res.failed)} von {len(pending)} Empfängern abgelehnt"
+                    sent += len(delivered)
+                    pending = retry
+                    if not pending or permanent or attempt == MAIL_ATTEMPTS - 1:
+                        break
+                    pause = MAIL_RETRY_PAUSES[min(attempt, len(MAIL_RETRY_PAUSES) - 1)]
+                    log.warning("Mail der Ausgabe %d, Versuch %d von %d: %s; nächster in %g s an %d Empfänger",
+                                article_id, attempt + 1, MAIL_ATTEMPTS, error, pause, len(pending))
+                    await self.sleep(pause)
+            finally:
+                st["sending"] = False
+        if sent:
+            st["last_sent"] = utcnow()
+        unreached = total - sent
+        if unreached:
+            if failed:
+                error = f"{failed} endgültig abgelehnt" + (f"; {error}" if error else "")
+            st["last_error"] = f"Ausgabe {article_id}: {unreached} von {total} Empfängern nicht erreicht: {error}"[:500]
+            log.warning("Mail der Ausgabe %d: %d von %d Empfängern nicht erreicht%s: %s", article_id, unreached,
+                        total, " (Wiederholen zwecklos)" if permanent or (failed and not pending) else "", error)
+            if not sent:
+                raise MailError(error, permanent=permanent)
+        else:
+            st["last_error"] = None
+            log.info("Mail der Ausgabe %d an %d Empfänger verschickt", article_id, sent)
+        return {"sent": sent, "unreached": unreached}
 
     def _fail(self, slot: str, message: str) -> None:
         msg = _scrub(message, self.settings.ai_api_key)[:500]
@@ -1100,8 +1247,10 @@ class EditionWriter:
             if next_try is None or _utc(self.clock()) < next_try:
                 continue                        # erledigt bzw. noch nicht wieder dran
             try:
-                await self.run(slot, force=guid in existing, day=day)
+                res = await self.run(slot, force=guid in existing, day=day)
                 self._attempts[guid] = (count + 1, None)
+                if self.settings.mail_enabled and res.get("status") == "created":
+                    self._spawn_mail(res["id"], slot)       # im Hintergrund: Wiederholungen halten den Plan nicht auf
             except EditionBusy:
                 log.info("KI-Ausgabe %s: läuft schon (vom Admin gestartet), neuer Versuch in %d s", slot,
                          BUSY_RETRY.total_seconds())

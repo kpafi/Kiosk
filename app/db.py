@@ -1250,6 +1250,12 @@ class Database:
                        time_limit=None)
         return row["published_at"] if row is not None else None
 
+    def latest_edition_id(self, source_id: str = "kiosk") -> int | None:
+        """ID der neuesten Ausgabe (nach published_at), None ohne Ausgaben (Admin-Endpunkt Versand)."""
+        row = self.one("SELECT id FROM articles WHERE source_id=? ORDER BY published_at DESC, id DESC LIMIT 1",
+                       (source_id,))
+        return int(row["id"]) if row is not None else None
+
     def store_edition(self, row: dict[str, Any], force: bool = False) -> int:
         """Speichert eine Ausgabe als fertigen Artikel (text_status 'full', ohne Paywall) und gibt die ID
         zurück. `row`: source_id, guid, url, title, summary, author, body_html, body_text, optional image_url

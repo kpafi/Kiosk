@@ -350,7 +350,7 @@ echo "== Prüfung: Login über Caddy"
 #     falschem Passwort antwortet 401 (Origin-/CSRF-Prüfung, Login-Pfad, Datenbank). 403 hieße: Origin
 #     abgelehnt, 429: Login-Bremse.
 # Kein echtes Konto wird belastet (die Bremse je Benutzername trifft nur den Zufallsnamen); der
-# Fehlversuch zählt aber gegen die IP der Box (8 pro 15 Minuten, siehe README).
+# Fehlversuch zählt aber gegen die IP der Box (8 pro 15 Minuten, siehe docs/REFERENZ.md).
 if ! ssh "$BOX" bash -s -- "$HOST" <<'REMOTE'
 set -euo pipefail
 host=$1

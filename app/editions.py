@@ -872,7 +872,7 @@ class EditionWriter:
         self._mail_lock = asyncio.Lock()
         self._mail_queued = 0
         # Zeitplan: GUID -> (Zahl der Läufe, nächster Versuch in UTC oder None = erledigt). Nur im Speicher:
-        # Nach einem Neustart beginnt die Zählung neu (bekannte Grenze, siehe README).
+        # Nach einem Neustart beginnt die Zählung neu (bekannte Grenze, siehe docs/REFERENZ.md).
         self._attempts: dict[str, tuple[int, datetime | None]] = {}
         self.clock = lambda: datetime.now(timezone.utc)      # in Tests ersetzbar
         self.sleep = asyncio.sleep                           # ebenso (Pausen und Zeitplan)

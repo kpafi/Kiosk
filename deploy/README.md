@@ -94,7 +94,7 @@ Gleicher Server wie secure-chat und MailDigest (203.0.113.10, SSH-Alias `kiosk-s
   (Ältere Sicherungen ohne `.gz` direkt kopieren.)
 - Benutzer verwalten vom Laptop aus: `bash deploy/user.sh <befehl> ...` führt per SSH
   `docker compose exec -T kiosk python -m app.users <befehl> ...` im laufenden Container aus
-  (Befehle siehe README, Abschnitt Benutzer), z. B. `bash deploy/user.sh add anna --name "Anna"`,
+  (Befehle siehe docs/REFERENZ.md, Abschnitt Benutzer), z. B. `bash deploy/user.sh add anna --name "Anna"`,
   `bash deploy/user.sh passwd anna`, `bash deploy/user.sh list`. Bei `add` und `passwd` fragt das Skript das
   Passwort lokal zweimal verdeckt ab und reicht es über stdin (`--password-stdin`) durch; es steht nie in
   einer Kommandozeile oder Shell-History. `remove` fragt lokal nach und ruft dann mit `--yes` auf.

@@ -11,8 +11,6 @@
 # `python -m app.users ... --password-stdin` durchgereicht: Sie stehen nie in einer
 # Kommandozeile, Prozessliste oder Shell-History.
 set -euo pipefail
-BOX="${BOX:-kiosk-server}"
-DEST=/opt/kiosk
 
 usage() {
   sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//' >&2
@@ -26,6 +24,24 @@ case "$cmd" in
   -h|--help|help) usage ;;
   *) echo "Unbekannter Befehl: $cmd" >&2; usage ;;
 esac
+
+# SSH-Ziel der Box aus deploy/deploy.env (git-ignoriert, Vorlage deploy/deploy.env.example), wie
+# deploy.sh; eine Umgebungsvariable BOX geht vor. Geprüft, bevor ein Passwort abgefragt wird.
+env_box=${BOX-}
+conf="$(dirname "$0")/deploy.env"
+if [ -f "$conf" ]; then
+  # shellcheck source=/dev/null
+  . "$conf"
+fi
+BOX=${env_box:-${BOX:-}}
+# Erst nach dem Einlesen: deploy.env legt nur BOX fest.
+DEST=/opt/kiosk
+alnum=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
+if [ -z "$BOX" ] || ! [[ "$BOX" =~ ^[${alnum}_][${alnum}._@:-]*$ ]]; then
+  echo "BOX fehlt oder ist ungültig: '$BOX' (SSH-Alias oder root@host, ohne Leerzeichen)." >&2
+  echo "In deploy/deploy.env eintragen (Vorlage: deploy/deploy.env.example) oder BOX=... setzen." >&2
+  exit 2
+fi
 
 args=("$@")
 password=""

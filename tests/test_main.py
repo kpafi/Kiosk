@@ -408,6 +408,17 @@ def test_config_accepts_bounds(app_env, monkeypatch):
     assert (s.fetch_interval, s.extract_concurrency, s.retention_days, s.session_max_age) == (60, 32, 3650, 365 * 86400)
 
 
+@pytest.mark.parametrize("value,expected", [(None, "default"), ("", "default"), ("  ", "default"),
+                                            ("Eigener/2.0", "Eigener/2.0")])
+def test_config_user_agent(app_env, monkeypatch, value, expected):
+    from app.config import DEFAULT_UA, load_settings
+    if value is None:
+        monkeypatch.delenv("KIOSK_USER_AGENT", raising=False)
+    else:
+        monkeypatch.setenv("KIOSK_USER_AGENT", value)
+    assert load_settings().user_agent == (DEFAULT_UA if expected == "default" else expected)
+
+
 @pytest.mark.parametrize("value", ["Mars/Olympus", "Europe", "../etc/passwd", "/etc/localtime", "Europe/Berlin x"])
 def test_config_rejects_unknown_time_zone(app_env, monkeypatch, value):
     from app.config import load_settings
@@ -464,7 +475,7 @@ def test_admin_user_from_env(app_env, monkeypatch):
 # ---- CSRF -----------------------------------------------------------------
 
 def test_csrf_foreign_origin_rejected(authed):
-    r = authed.post("/api/refresh", headers={"Origin": "https://evil.203-0-113-10.sslip.io"})
+    r = authed.post("/api/refresh", headers={"Origin": "https://evil.kiosk.example.org"})
     assert r.status_code == 403
     assert authed.post("/api/articles/read-all", headers={"Origin": "http://testserver"}).status_code == 403
     assert authed.post("/api/articles/read-all", headers={"Origin": "null"}).status_code == 403

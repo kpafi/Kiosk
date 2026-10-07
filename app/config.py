@@ -9,10 +9,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-DEFAULT_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
-)
+# Ehrlich als Reader erkennbar, kein Browser. Ohne URL: CBC beantwortet Agents mit URL gar nicht.
+DEFAULT_UA = "KioskReader/1.0 (private RSS reader)"
 
 # Passwort aus .env.example: darf nie produktiv laufen.
 EXAMPLE_PASSWORD = "bitte-aendern"
@@ -328,7 +326,7 @@ def load_settings() -> Settings:
         fetch_interval=_int("KIOSK_FETCH_INTERVAL", 900, lo=60),
         retention_days=_int("KIOSK_RETENTION_DAYS", 90, lo=1, hi=3650),
         extract_concurrency=_int("KIOSK_EXTRACT_CONCURRENCY", 6, lo=1, hi=32),
-        user_agent=os.environ.get("KIOSK_USER_AGENT", DEFAULT_UA),
+        user_agent=os.environ.get("KIOSK_USER_AGENT", "").strip() or DEFAULT_UA,
         session_max_age=_int("KIOSK_SESSION_DAYS", 30, lo=1, hi=365) * 86400,
         # Nur für lokale Entwicklung über http auf false setzen.
         cookie_secure=_bool("KIOSK_COOKIE_SECURE", True),

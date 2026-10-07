@@ -558,7 +558,7 @@ async def test_writer_success_stores_and_reports(edb, ai_settings, caplog):
     req = model.requests[0]
     assert str(req.url) == "https://openrouter.example/api/v1/chat/completions" and req.method == "POST"
     assert req.headers["authorization"] == f"Bearer {KEY}"
-    assert req.headers["http-referer"] == "https://kiosk.example.org" and req.headers["x-title"] == "Kiosk"
+    assert req.headers["http-referer"] == "https://github.com/kpafi/Kiosk" and req.headers["x-title"] == "Kiosk"
     body = json.loads(req.content)
     assert set(body) == {"model", "messages", "temperature", "max_tokens"}
     assert (body["model"], body["temperature"], body["max_tokens"]) == ("test/model", 0.3, 16000)

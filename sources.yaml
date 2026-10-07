@@ -1,6 +1,7 @@
 # Quellenkatalog für Kiosk.
-# Alle Feeds wurden am 25.09.2026 vom Hetzner-Server aus getestet (Feed + Volltext-Extraktion),
-# heise Security und GEA am 26.09.2026, FOCUS online am 28.09.2026.
+# Alle Feeds wurden am 25.09.2026 vom Server aus getestet (Feed + Volltext-Extraktion, damals mit Browser-Agent),
+# heise Security und GEA am 26.09.2026, FOCUS online am 28.09.2026. Am 07.10.2026 mit dem heutigen Agent
+# KioskReader/1.0 vom Laptop aus nachgeprüft: nur ZEIT liefert damit keine Artikelseiten mehr.
 # feed: RSS/Atom oder eine Google-News-Sitemap (urlset) bzw. ein Sitemap-Index, am Inhalt erkannt (GEA).
 # include_paths: optionale Liste regulärer Ausdrücke; nur Einträge, deren URL-Pfad (ohne Query) auf
 # einen davon passt (Python re.search), werden angelegt, z. B. nur die Lokalressorts einer Regionalzeitung.
@@ -21,7 +22,8 @@
 sources:
   # ---------------- Deutschland ----------------
   - {id: spiegel,      name: Der Spiegel,             short: "SPIEGEL",       country: DE, lang: de, feed: "https://www.spiegel.de/schlagzeilen/index.rss",        homepage: "https://www.spiegel.de",       note: "SPIEGEL+ Artikel werden als Paywall markiert"}
-  - {id: zeit,         name: Die Zeit,                short: "ZEIT",          country: DE, lang: de, feed: "https://newsfeed.zeit.de/index",                        homepage: "https://www.zeit.de",          note: "Z+ Artikel werden als Paywall markiert"}
+  - {id: zeit,         name: Die Zeit,                short: "ZEIT",          country: DE, lang: de, feed: "https://newsfeed.zeit.de/index",                        homepage: "https://www.zeit.de",          default_enabled: false,
+     note: "Sperrt die Artikelseiten für den Agent von Kiosk (HTTP 403): nur Überschrift und Anreißer, Z+ Artikel nicht erkennbar"}
   # WELT: ohne Videos (/…/video6abc…/, nur eine kurze Beschreibung zum Video, rund ein Viertel des Feeds).
   - {id: welt,         name: Die Welt,                short: "WELT",          country: DE, lang: de, feed: "https://www.welt.de/feeds/latest.rss",                  homepage: "https://www.welt.de",          note: "Viele WELTplus-Artikel, dann nur Anfang",
      include_paths: ['^/(?!(?:[^/]+/)*video[0-9a-f]{8,}/)']}
@@ -172,16 +174,16 @@ sources:
   # Nicht in ALLE (in_all: false), aber Lesestoff der KI-Ausgabe (in_edition: true): UN, humanitäre Lage,
   # Indien, Afrika, Entwicklung und Klima, Sudan. Sichtbar in der eigenen Ansicht und in Profilen, die sie
   # ausdrücklich nennen. Geprüft am 03.10.2026 (Feed + Volltext-Extraktion).
-  # UN News antwortet auf den Chrome-User-Agent mit 406; der Sammler holt dann mit dem zweiten User-Agent.
+  # UN News antwortete auf einen Chrome-User-Agent mit 406; mit KioskReader/1.0 kommt der Artikel.
   # UN und AFR sind keine ISO-Codes (Vereinte Nationen, Afrika mehrerer Länder); Namen in static/js/format.js.
   - {id: unnews,       name: UN News,                 short: "UN NEWS",       country: UN, lang: en, feed: "https://news.un.org/feed/subscribe/en/news/all/rss.xml", homepage: "https://news.un.org/en/",
      in_all: false, in_edition: true, note: "Nicht in ALLE; eigene Ansicht, Profil und KI-Ausgabe"}
-  # ReliefWeb: vom Laptop aus geht der Feed, vom Hetzner-Server antwortet er dem Sammler mit HTTP 202 und leerem Rumpf
+  # ReliefWeb: vom Laptop aus geht der Feed, vom Server antwortet er dem Sammler mit HTTP 202 und leerem Rumpf
   # (Bot-Schutz gegen HTTP/1.1-Clients aus Rechenzentren; curl mit HTTP/2 bekommt 200; 03.10.2026): deshalb aus.
   - {id: reliefweb,    name: ReliefWeb,               short: "RELIEFWEB",     country: UN, lang: en, feed: "https://reliefweb.int/updates/rss.xml?view=headlines", homepage: "https://reliefweb.int",
      in_all: false, in_edition: true, default_enabled: false, note: "UN-Dienst für humanitäre Lageberichte; nicht in ALLE; eigene Ansicht, Profil und KI-Ausgabe; der Feed sperrt den Server (HTTP 202 ohne Inhalt)"}
   # The Hindu: ohne Videos (/videos/) und Podcasts (/podcast/), kein Artikeltext. Vom Laptop aus geht der Feed,
-  # vom Hetzner-Server antwortet er mit einer Cloudflare-Prüfseite (HTTP 403, 03.10.2026): deshalb aus.
+  # vom Server antwortet er mit einer Cloudflare-Prüfseite (HTTP 403, 03.10.2026): deshalb aus.
   - {id: thehindu,     name: The Hindu,               short: "THE HINDU",     country: IN, lang: en, feed: "https://www.thehindu.com/news/international/feeder/default.rss", homepage: "https://www.thehindu.com",
      in_all: false, in_edition: true, default_enabled: false,
      note: "Internationales Ressort; nicht in ALLE; eigene Ansicht, Profil und KI-Ausgabe; die Seite sperrt Server-Zugriffe (Cloudflare)",

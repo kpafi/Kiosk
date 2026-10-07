@@ -1,5 +1,5 @@
-"""Prüft das Python-Stück aus deploy/deploy.sh, das den Kiosk-Block in der Caddyfile ersetzt, und
-die gepinnten Abhängigkeiten des Images."""
+"""Prüft das Python-Stück aus deploy/deploy.sh, das den Kiosk-Block in der Caddyfile ersetzt, das
+Einlesen der Serverwerte aus deploy/deploy.env und die gepinnten Abhängigkeiten des Images."""
 from __future__ import annotations
 
 import re
@@ -11,7 +11,10 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 HOST = "kiosk.example.org"
+PLACEHOLDER = "@KIOSK_HOST@"
 BLOCK = (ROOT / "deploy" / "Caddyfile.kiosk").read_text(encoding="utf-8")
+# So landet der Block auf der Box: Platzhalter durch den Host ersetzt.
+BLOCK_LIVE = BLOCK.replace(PLACEHOLDER, HOST)
 OTHER = "chat.example.org {\n\treverse_proxy 127.0.0.1:9000\n\theader {\n\t\tX-Foo bar\n\t}\n}\n"
 OLD_UNMARKED = f"\n{HOST} {{\n\tencode zstd gzip\n\treverse_proxy 127.0.0.1:8100\n\theader {{\n\t\tX-Frame-Options DENY\n\t}}\n}}\n"
 
@@ -23,12 +26,13 @@ def _snippet() -> str:
     return m.group(1)
 
 
-def run(tmp_path, live_text: str) -> subprocess.CompletedProcess:
+def run(tmp_path, live_text: str, block=ROOT / "deploy" / "Caddyfile.kiosk",
+        host=HOST) -> subprocess.CompletedProcess:
     live = tmp_path / "Caddyfile"
     live.write_text(live_text, encoding="utf-8")
     out = tmp_path / "candidate"
     return subprocess.run(
-        [sys.executable, "-", str(live), str(ROOT / "deploy" / "Caddyfile.kiosk"), HOST, str(out)],
+        [sys.executable, "-", str(live), str(block), host, str(out)],
         input=_snippet(), text=True, capture_output=True,
     )
 
@@ -43,12 +47,35 @@ def test_block_file_has_markers_and_headers():
     assert 'Strict-Transport-Security "max-age=31536000"' in BLOCK
     assert "script-src 'self'" in BLOCK and "frame-ancestors 'none'" in BLOCK
     assert BLOCK.count("{") == BLOCK.count("}")
+    # Der Host steht nicht im Repo, nur der Platzhalter (genau einmal, als Site-Adresse).
+    assert BLOCK.count(PLACEHOLDER) == 1 and f"\n{PLACEHOLDER} {{\n" in BLOCK
 
 
 def test_append_when_absent(tmp_path):
     r = run(tmp_path, OTHER)
     assert r.returncode == 0, r.stderr
-    assert candidate(tmp_path) == OTHER + "\n" + BLOCK.strip("\n") + "\n"
+    assert candidate(tmp_path) == OTHER + "\n" + BLOCK_LIVE.strip("\n") + "\n"
+    assert PLACEHOLDER not in candidate(tmp_path) and f"\n{HOST} {{\n" in candidate(tmp_path)
+
+
+@pytest.mark.parametrize("template", [
+    "# >>> kiosk (managed by deploy.sh)\nkiosk.example.org {\n}\n# <<< kiosk\n",            # Platzhalter fehlt
+    "# >>> kiosk (managed by deploy.sh)\n@KIOSK_HOST@ {\n}\n@KIOSK_HOST@ {\n}\n# <<< kiosk\n",  # doppelt
+])
+def test_refuses_block_without_single_placeholder(tmp_path, template):
+    block = tmp_path / "Caddyfile.kiosk"
+    block.write_text(template, encoding="utf-8")
+    r = run(tmp_path, OTHER, block=block)
+    assert r.returncode != 0 and PLACEHOLDER in r.stderr
+    assert not (tmp_path / "candidate").exists()
+
+
+@pytest.mark.parametrize("host", ["", "kiosk.example.org {\n}\nevil.example.org", "Kiosk.Example.org",
+                                  "kiosk.example.org/pfad"])
+def test_refuses_invalid_host(tmp_path, host):
+    r = run(tmp_path, OTHER, host=host)
+    assert r.returncode != 0 and "Ungültiger Kiosk-Host" in r.stderr
+    assert not (tmp_path / "candidate").exists()
 
 
 def test_migrates_unmarked_block_at_end(tmp_path):
@@ -56,7 +83,8 @@ def test_migrates_unmarked_block_at_end(tmp_path):
     assert r.returncode == 0, r.stderr
     out = candidate(tmp_path)
     assert out.startswith(OTHER)
-    assert out.count(HOST + " {") == 1
+    assert out.count(HOST + " {") == 1 and PLACEHOLDER not in out
+    assert "encode zstd gzip\n\treverse_proxy" not in out      # alter Block weg, neuer drin
     assert "# >>> kiosk (managed by deploy.sh)" in out
     # Zweiter Lauf auf dem Ergebnis ändert nichts mehr (idempotent).
     r2 = run(tmp_path, out)
@@ -69,7 +97,7 @@ def test_replaces_marked_block_in_middle(tmp_path):
     r = run(tmp_path, live)
     assert r.returncode == 0, r.stderr
     out = candidate(tmp_path)
-    assert "alt {" not in out
+    assert "alt {" not in out and f"\n{HOST} {{\n" in out
     assert out.startswith(OTHER) and out.endswith(OTHER.replace("chat", "mail"))
     assert out.count("# >>> kiosk") == 1
 
@@ -768,10 +796,134 @@ def test_env_step_adds_deny_list_once_and_keeps_existing_value(tmp_path):
     assert "geheim" not in r.stdout
 
 
-def test_deny_list_value_defined_once_at_top():
+def test_deny_list_comes_from_config():
     script = (ROOT / "deploy" / "deploy.sh").read_text(encoding="utf-8")
-    assert script.count(DENY) == 1 and script.index(f'FETCH_DENY_IPS="{DENY}"') < script.index("== Code nach")
+    assert 'FETCH_DENY_IPS=${env_deny:-${FETCH_DENY_IPS:-}}' in script
+    assert script.index("FETCH_DENY_IPS=${env_deny") < script.index("== Code nach")
     assert 'bash -s -- "$DEST" "$FETCH_DENY_IPS" <<\'ENV\'' in script
+
+
+# ---- Serverwerte aus deploy/deploy.env ------------------------------------------------------
+
+EXAMPLE = (ROOT / "deploy" / "deploy.env.example").read_text(encoding="utf-8")
+CONF_KEYS = ("BOX", "KIOSK_HOST", "FETCH_DENY_IPS")
+
+
+def test_no_server_values_in_tracked_deploy_files():
+    """Host, Adressen und SSH-Ziel stehen nur in deploy/deploy.env, nicht in Skripten und Caddy-Block."""
+    for name in ("deploy.sh", "user.sh", "backup.sh", "Caddyfile.kiosk", "deploy.env.example"):
+        text = (ROOT / "deploy" / name).read_text(encoding="utf-8")
+        ipv4 = set(re.findall(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", text)) - {"127.0.0.1"}
+        assert all(ip.startswith("203.0.113.") for ip in ipv4), (name, ipv4)   # nur Dokumentationsbereich
+        assert "${BOX:-" not in text.replace("${BOX:-}", ""), name                # kein fest eingebautes SSH-Ziel
+        hosts = set(re.findall(r"\bkiosk\.[a-z0-9.-]+\.[a-z]+\b", text))
+        assert hosts <= {"kiosk.example.org"}, (name, hosts)
+
+
+def test_deploy_env_is_ignored_and_example_has_placeholders():
+    r = subprocess.run(["git", "check-ignore", "-q", "deploy/deploy.env"], cwd=ROOT)
+    assert r.returncode == 0
+    values = dict(re.findall(r"^([A-Z_]+)=(\S*)", EXAMPLE, re.M))
+    assert values == {"BOX": "kiosk-server", "KIOSK_HOST": "kiosk.example.org",
+                      "FETCH_DENY_IPS": "203.0.113.10,2001:db8:1234:5678::/64"}
+    assert "Provider-Netz" in EXAMPLE      # Begründung aus deploy.sh bleibt erhalten
+
+
+def _fake_box(tmp_path, script: str, conf: str | None, **env_vars):
+    """Kopie von deploy/<script> in einem leeren Verzeichnis, ssh, git und rsync als Attrappen: ssh
+    schreibt Ziel und Befehl mit und scheitert, git scheitert ebenfalls (deploy.sh endet dann
+    spätestens beim Prüfen des Arbeitsverzeichnisses)."""
+    import os
+    import shutil
+    repo = tmp_path / "repo"
+    (repo / "deploy").mkdir(parents=True)
+    shutil.copy(ROOT / "deploy" / script, repo / "deploy" / script)
+    if conf is not None:
+        (repo / "deploy" / "deploy.env").write_text(conf, encoding="utf-8")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "ssh.log"
+    (bin_dir / "ssh").write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\nexit 1\n')
+    for tool in ("git", "rsync"):
+        (bin_dir / tool).write_text("#!/usr/bin/env bash\nexit 97\n")
+    for f in bin_dir.iterdir():
+        f.chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if k not in CONF_KEYS and not k.startswith("KIOSK_")}
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env.update(env_vars)
+    return repo, log, env
+
+
+def _run_deploy(tmp_path, conf: str | None, **env_vars):
+    repo, log, env = _fake_box(tmp_path, "deploy.sh", conf, **env_vars)
+    r = subprocess.run(["bash", str(repo / "deploy" / "deploy.sh")], cwd=tmp_path, env=env, text=True,
+                       capture_output=True, timeout=30)
+    return r, (log.read_text().splitlines() if log.exists() else [])
+
+
+def test_deploy_aborts_without_config_before_ssh(tmp_path):
+    r, calls = _run_deploy(tmp_path, None)
+    assert r.returncode == 2 and calls == []
+    assert "BOX fehlt" in r.stderr and "deploy/deploy.env.example" in r.stderr
+
+
+def test_deploy_reads_config_and_env_overrides(tmp_path):
+    r, calls = _run_deploy(tmp_path, EXAMPLE)
+    assert r.returncode != 0 and r.returncode != 2, r.stderr        # erst beim (falschen) git
+    assert calls and all(c.startswith("kiosk-server ") for c in calls), calls
+    other = tmp_path / "zwei"
+    other.mkdir()
+    r, calls = _run_deploy(other, EXAMPLE, BOX="andere-box")
+    assert calls and all(c.startswith("andere-box ") for c in calls), calls
+    # Ohne Datei reichen die Umgebungsvariablen.
+    third = tmp_path / "drei"
+    third.mkdir()
+    r, calls = _run_deploy(third, None, BOX="box", KIOSK_HOST=HOST, FETCH_DENY_IPS=DENY)
+    assert calls and calls[0].startswith("box "), r.stderr
+
+
+@pytest.mark.parametrize("override, message", [
+    ({"FILE_KIOSK_HOST": ""}, "KIOSK_HOST fehlt"),
+    ({"BOX": "-oProxyCommand=sh"}, "BOX ungültig"),
+    ({"BOX": "box name"}, "BOX ungültig"),
+    ({"KIOSK_HOST": "https://kiosk.example.org"}, "KIOSK_HOST ungültig"),
+    ({"KIOSK_HOST": "Kiosk.Example.org"}, "KIOSK_HOST ungültig"),
+    ({"KIOSK_HOST": "kiosk.example.org;reboot"}, "KIOSK_HOST ungültig"),
+    ({"KIOSK_HOST": "kiosk"}, "KIOSK_HOST ungültig"),
+    ({"KIOSK_HOST": "-kiosk.example.org"}, "KIOSK_HOST ungültig"),
+    ({"FETCH_DENY_IPS": "203.0.113.10, 2001:db8::/32"}, "FETCH_DENY_IPS ungültig"),
+    ({"FETCH_DENY_IPS": "203.0.113.10;reboot"}, "FETCH_DENY_IPS ungültig"),
+    ({"FETCH_DENY_IPS": "203.0.113.300"}, "FETCH_DENY_IPS ungültig"),
+    ({"FETCH_DENY_IPS": "203.0.113.10,"}, "FETCH_DENY_IPS ungültig"),
+])
+def test_deploy_rejects_bad_config_before_ssh(tmp_path, override, message):
+    conf = EXAMPLE
+    if "FILE_KIOSK_HOST" in override:   # leerer Wert in der Datei
+        conf = EXAMPLE.replace("KIOSK_HOST=kiosk.example.org", "KIOSK_HOST=" + override.pop("FILE_KIOSK_HOST"))
+    r, calls = _run_deploy(tmp_path, conf, **override)
+    assert r.returncode == 2 and calls == [], r.stderr
+    assert message in r.stderr and "deploy/deploy.env.example" in r.stderr
+
+
+def _run_user(tmp_path, conf: str | None, *args, **env_vars):
+    repo, log, env = _fake_box(tmp_path, "user.sh", conf, **env_vars)
+    r = subprocess.run(["bash", str(repo / "deploy" / "user.sh"), *args], cwd=tmp_path, env=env, text=True,
+                       capture_output=True, stdin=subprocess.DEVNULL, timeout=30)
+    return r, (log.read_text().splitlines() if log.exists() else [])
+
+
+def test_user_script_reads_box_from_config(tmp_path):
+    r, calls = _run_user(tmp_path, None, "list")
+    assert r.returncode == 2 and calls == [] and "deploy/deploy.env.example" in r.stderr
+    (tmp_path / "zwei").mkdir()
+    r, calls = _run_user(tmp_path / "zwei", EXAMPLE, "list")
+    assert len(calls) == 1 and calls[0].startswith("kiosk-server bash -c ") and "app.users list" in calls[0]
+    (tmp_path / "drei").mkdir()
+    r, calls = _run_user(tmp_path / "drei", EXAMPLE, "disable", "anna", BOX="andere-box")
+    assert len(calls) == 1 and calls[0].startswith("andere-box ")
+    (tmp_path / "vier").mkdir()
+    r, calls = _run_user(tmp_path / "vier", EXAMPLE, "list", BOX="-oProxyCommand=sh")
+    assert r.returncode == 2 and calls == []
 
 
 def test_rsync_uploads_allowlist_from_head(tmp_path):
@@ -896,7 +1048,9 @@ def test_deploy_refuses_untracked_files_under_deploy_paths(tmp_path):
     (repo / "app").mkdir()
     (repo / "static" / "js" / "app.js").write_text("import './neu.js';\n")
     (repo / "app" / "main.py").write_text("x = 1\n")
-    (repo / ".gitignore").write_text("*.pyc\n")
+    (repo / "deploy").mkdir()
+    (repo / "deploy" / "backup.sh").write_text("#\n")
+    (repo / ".gitignore").write_text((ROOT / ".gitignore").read_text(encoding="utf-8"))
     git = ["git", "-c", "user.email=t@example.org", "-c", "user.name=t"]
     subprocess.run(git + ["init", "-q"], cwd=repo, check=True)
     subprocess.run(git + ["add", "-A"], cwd=repo, check=True)
@@ -904,7 +1058,11 @@ def test_deploy_refuses_untracked_files_under_deploy_paths(tmp_path):
     assert "SAUBER" in _dirty_check(repo).stdout
     (repo / "app" / "cache.pyc").write_text("ignoriert")          # ignorierte Dateien stören nicht
     (repo / "notizen.txt").write_text("außerhalb der Pfade")      # nicht deploybar, stört nicht
+    (repo / "deploy" / "deploy.env").write_text("BOX=geheim\n")   # git-ignoriert: stört nicht
     assert "SAUBER" in _dirty_check(repo).stdout
+    archive = subprocess.run(["bash", "-c", "git archive --format=tar HEAD -- deploy app | tar -t"], cwd=repo,
+                             capture_output=True, text=True, check=True).stdout.split()
+    assert "deploy/backup.sh" in archive and "deploy/deploy.env" not in archive   # wird nie hochgeladen
     (repo / "static" / "js" / "neu.js").write_text("export {};\n")
     r = _dirty_check(repo)
     assert r.returncode == 2 and "?? static/js/neu.js" in r.stderr and "KIOSK_ALLOW_DIRTY" in r.stderr

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import re
 import socket
 import threading
@@ -16,6 +17,7 @@ import pytest
 
 import app.extract as extract_mod
 import app.fetcher as fetcher_mod
+from app.config import DEFAULT_UA
 from app.fetcher import Fetcher, parse_feed
 from app.netguard import BlockedURL, server_addr_blocked
 from app.sources import Catalog, Source
@@ -299,6 +301,31 @@ async def test_overall_deadline_covers_second_attempt(db, settings, monkeypatch)
     f = make_fetcher(db, settings, handler)
     with pytest.raises(TimeoutError):
         await f._get(f"{PUBLIC}/x", max_bytes=1000)
+
+
+async def test_custom_agent_retries_with_default_agent(db, settings):
+    agents = []
+
+    def handler(request):
+        agents.append(request.headers.get("user-agent"))
+        return httpx.Response(200, content=b"ok") if agents[-1] == DEFAULT_UA else httpx.Response(403)
+
+    f = make_fetcher(db, settings, handler)  # settings.user_agent ist "test-agent"
+    r = await f._get(f"{PUBLIC}/x", max_bytes=1000)
+    assert r.status_code == 200 and agents[-1] == DEFAULT_UA and len(agents) == 2
+
+
+async def test_default_agent_does_not_retry(db, settings):
+    calls = []
+
+    def handler(request):
+        calls.append(request.headers.get("user-agent"))
+        return httpx.Response(403)
+
+    f = make_fetcher(db, dataclasses.replace(settings, user_agent=DEFAULT_UA), handler)
+    f._client.headers["User-Agent"] = DEFAULT_UA
+    r = await f._get(f"{PUBLIC}/x", max_bytes=1000)
+    assert r.status_code == 403 and calls == [DEFAULT_UA]
 
 
 def test_domain_state_is_pruned(db, settings):

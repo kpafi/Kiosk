@@ -29,7 +29,7 @@ import feedparser
 import httpx
 import trafilatura.utils as trafilatura_utils
 
-from .config import Settings
+from .config import DEFAULT_UA, Settings
 from .db import Database, QueryTimeout, _iso, request_time_limit, utcnow
 from .extract import (clean_author, drop_title_echo, extract, is_placeholder, is_small_image_url,
                       is_text_card_image, safe_http_url, strip_html)
@@ -42,7 +42,6 @@ log = logging.getLogger("kiosk.fetcher")
 # Format der Protokollzeilen, in der App (app.main) und in den Worker-Prozessen (_job_logging).
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
-READER_UA = "Mozilla/5.0 (compatible; KioskReader/0.1; private RSS reader)"
 FEED_CONCURRENCY = 8
 EXTRACT_BATCH = 60
 EXTRACT_MAX_PER_CYCLE = 900
@@ -60,7 +59,7 @@ FEED_MAX_NEW = 150
 FEED_PARSE_TIMEOUT = 30     # Sekunden für feedparser bzw. das Sitemap-Parsing im Worker-Prozess
 FEED_ACCEPT = "application/rss+xml, application/atom+xml, application/xml;q=0.9, */*;q=0.8"
 TOTAL_TIMEOUT = 45          # Sekunden pro Abruf inkl. Umleitungen, unabhängig von httpx-Timeouts
-OVERALL_TIMEOUT = 60        # Sekunden für _get insgesamt, inkl. zweitem Versuch mit anderem User-Agent
+OVERALL_TIMEOUT = 60        # Sekunden für _get insgesamt, inkl. zweitem Versuch mit dem Standard-Agent
 PRIORITY_CONCURRENCY = 2    # gleichzeitige Extraktionen auf Anforderung (API)
 PRIORITY_QUEUE_MAX = 20     # höchstens so viele Extraktionen auf Anforderung laufen oder warten
 RETRY_MIN_INTERVAL = 120    # Sekunden: ?retry=true startet frühestens so lange nach dem letzten Versuch neu
@@ -1185,7 +1184,7 @@ class Fetcher:
             raise FetchError(f"Zu viele Umleitungen (> {MAX_REDIRECTS})")
 
     async def _get(self, url: str, *, headers: dict | None = None, max_bytes: int) -> Fetched:
-        """Abruf mit bis zu zwei Versuchen (zweiter mit anderem User-Agent), zusammen höchstens
+        """Abruf mit bis zu zwei Versuchen (zweiter mit dem Standard-Agent), zusammen höchstens
         OVERALL_TIMEOUT Sekunden, jeder einzelne höchstens TOTAL_TIMEOUT."""
         async with asyncio.timeout(OVERALL_TIMEOUT):
             return await self._get_inner(url, headers=headers, max_bytes=max_bytes)
@@ -1194,9 +1193,11 @@ class Fetcher:
         r = await self._fetch_once(url, headers=headers, max_bytes=max_bytes)
         if r.status_code == 429 and r.headers.get("retry-after"):
             return r  # Server nennt eine Wartezeit: respektieren statt mit anderem User-Agent nachzuhaken
-        if r.status_code in (403, 406, 429) or (r.status_code == 200 and not r.content):
+        # Zweiter Versuch nur mit einem eigenen KIOSK_USER_AGENT: dann mit dem Standard-Agent (nie umgekehrt)
+        if self.settings.user_agent != DEFAULT_UA and (
+                r.status_code in (403, 406, 429) or (r.status_code == 200 and not r.content)):
             alt = dict(headers or {})
-            alt["User-Agent"] = READER_UA
+            alt["User-Agent"] = DEFAULT_UA
             r2 = await self._fetch_once(url, headers=alt, max_bytes=max_bytes)
             if r2.status_code == 200 and r2.content:
                 r = r2

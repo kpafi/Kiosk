@@ -72,7 +72,7 @@ HTTP_TIMEOUT = httpx.Timeout(600, connect=20)
 # Gesamtfrist einer Anfrage: Das Lese-Limit greift nur, wenn gar nichts kommt; ein Server, der tröpfelnd
 # Leerzeichen schickt (OpenRouter hält so Verbindungen offen), hielte die Anfrage sonst unbegrenzt.
 TOTAL_TIMEOUT = 900
-REFERER = "https://kiosk.example.org"
+REFERER = "https://github.com/kpafi/Kiosk"
 APP_TITLE = "Kiosk"
 RESPONSE_MAX = 2_000_000            # Bytes einer Antwort höchstens
 ERROR_BODY_MAX = 300                # so viel vom Rumpf einer Fehlerantwort kommt in die Meldung

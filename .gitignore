@@ -7,6 +7,8 @@ __pycache__/
 venv/
 .pytest_cache/
 backups/
+# Serverwerte für deploy/deploy.sh und deploy/user.sh (Vorlage: deploy/deploy.env.example)
+deploy/deploy.env
 
 # Arbeitsordner von Claude Code (Worktrees, Scratch)
 .claude/

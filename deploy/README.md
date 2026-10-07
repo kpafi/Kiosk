@@ -1,6 +1,16 @@
-# Kiosk auf der Hetzner-Box
+# Kiosk auf der Box
 
-Gleicher Server wie secure-chat und MailDigest (203.0.113.10, SSH-Alias `kiosk-server`).
+Kiosk läuft auf einem Server, den es sich mit anderen Diensten teilt (Docker, Caddy als gemeinsamer
+HTTPS-Proxy). Die Serverwerte stehen nicht im Repo, sondern in `deploy/deploy.env` (git-ignoriert, wird
+nie hochgeladen); Vorlage: `cp deploy/deploy.env.example deploy/deploy.env`, dann anpassen:
+
+- `BOX`: SSH-Ziel der Box (Alias aus `~/.ssh/config` oder `user@host`).
+- `KIOSK_HOST`: Hostname, unter dem Caddy HTTPS terminiert (unten `kiosk.example.org`); deploy.sh setzt
+  ihn für den Platzhalter `@KIOSK_HOST@` in `deploy/Caddyfile.kiosk` ein und prüft über ihn den Login.
+- `FETCH_DENY_IPS`: öffentliche Adressen der Box für `KIOSK_FETCH_DENY_IPS` (siehe unten).
+
+Umgebungsvariablen gleichen Namens gehen vor (`BOX=... bash deploy/user.sh list`). Fehlt ein Wert oder ist
+er ungültig, brechen `deploy.sh` und `user.sh` vor dem ersten SSH-Aufruf mit einem Hinweis ab.
 
 - Code liegt unter `/opt/kiosk`, Daten (SQLite, Secret) unter `/opt/kiosk/data`, Passwort in `/opt/kiosk/.env`.
 - Besitzer und Rechte (setzt jeder Deploy idempotent): Code und Konfiguration gehören `root:root` und sind
@@ -9,7 +19,7 @@ Gleicher Server wie secure-chat und MailDigest (203.0.113.10, SSH-Alias `kiosk-s
   (dieses `chmod` läuft per `setpriv` als 10100, damit root keinem Symlink aus dem Container folgt). Die
   App selbst legt Dateien mit umask 077 an.
 - Eigene uid/gid 10100 (`kiosk`): `USER` im Dockerfile und `user: "10100:10100"` in `docker-compose.yml`.
-  Die uid 1000 gehört auf der Box `maildigest` (dessen Container läuft ebenfalls als 1000), frühere
+  Die uid 1000 gehört auf der Box einem anderen Dienst (dessen Container läuft ebenfalls als 1000), frühere
   Kiosk-Versionen liefen auch so. deploy.sh stellt `data/` idempotent erst direkt vor dem Start des neuen
   Containers auf `10100:10100` um (Schritt „Datenverzeichnis für uid 10100 und Container starten“, nach
   Bauen und Pre-Deploy-Backup; bis dahin läuft der alte Container unverändert weiter). Umstellen und
@@ -23,6 +33,10 @@ Gleicher Server wie secure-chat und MailDigest (203.0.113.10, SSH-Alias `kiosk-s
   `docker-compose.yml` den Benutzer setzt, läuft auch ein älteres Image (`kiosk:good`, `kiosk:previous`,
   gebaut noch mit uid 1000) als 10100 und kann `data/` schreiben; `data/` also nie auf 1000 zurückstellen.
   Nur wer von Hand ein Image ohne dieses Compose-File startet, muss `--user 10100:10100` angeben.
+- User-Agent: Seit Oktober 2026 ruft Kiosk als `KioskReader/1.0 (private RSS reader)` ab, vorher mit einem
+  Browser-Agent. Die ZEIT sperrt damit die Artikelseiten (403), Z+-Artikel sind dann nicht mehr als Paywall
+  erkennbar. `default_enabled: false` in `sources.yaml` wirkt nur bei neuen Datenbanken: Auf einer bestehenden
+  Instanz die ZEIT in der Zeitungsliste ausschalten oder in der `.env` einen eigenen `KIOSK_USER_AGENT` setzen.
 - KI-Ausgabe: `OPENROUTER_API_KEY` (und bei Bedarf `KIOSK_AI_MODEL`, `KIOSK_AI_MORNING`, `KIOSK_AI_EVENING`,
   siehe `.env.example`) von Hand in `/opt/kiosk/.env` eintragen, dann `docker compose up -d` in `/opt/kiosk`
   oder ein Deploy. deploy.sh trägt den Schlüssel nie ein (an der `.env` ergänzt es nur ein fehlendes
@@ -30,13 +44,13 @@ Gleicher Server wie secure-chat und MailDigest (203.0.113.10, SSH-Alias `kiosk-s
   als Admin (`editions.enabled`), sofort eine Ausgabe schreiben: `POST /api/editions/run {"slot": "morning"}`.
 - Versand der KI-Ausgabe per Mail: `KIOSK_MAIL_HOST`, `KIOSK_MAIL_USER`, `KIOSK_MAIL_PASSWORD`, `KIOSK_MAIL_TO`
   und `KIOSK_PUBLIC_URL` ebenso von Hand in `/opt/kiosk/.env` (siehe `.env.example`); das Passwort gehört in
-  einfache Anführungszeichen. Auf der Box läuft der Mailserver `mailserver` (/opt/mailserver, mail.example.org,
-  Konto kiosk@example.org); der Kiosk-Container erreicht ihn über die öffentliche Adresse auf 465. Prüfen:
+  einfache Anführungszeichen. Läuft der Mailserver auf derselben Box (z. B. mail.example.org,
+  Konto kiosk@example.org), erreicht ihn der Kiosk-Container über die öffentliche Adresse auf 465. Prüfen:
   `/api/status` als Admin (`editions.mail`), Probeversand der neuesten Ausgabe: `POST /api/editions/mail {}`.
-- Container `kiosk` lauscht nur auf `127.0.0.1:8100`. Caddy terminiert HTTPS unter `kiosk.example.org`.
+- Container `kiosk` lauscht nur auf `127.0.0.1:8100`. Caddy terminiert HTTPS unter `KIOSK_HOST` (z. B. `kiosk.example.org`).
 - Deploy: `bash deploy/deploy.sh` aus dem Repo-Root. Beim ersten Lauf wird ein Passwort erzeugt und in
   `/opt/kiosk/.env` abgelegt (nicht im Terminal ausgegeben). Fehlt `KIOSK_FETCH_DENY_IPS` in der `.env`,
-  trägt jeder Deploy den Wert von `FETCH_DENY_IPS` oben in `deploy.sh` ein (die Adressen der Box); ein
+  trägt jeder Deploy den Wert von `FETCH_DENY_IPS` aus `deploy/deploy.env` ein (die Adressen der Box); ein
   vorhandener Wert bleibt unverändert. Hochgeladen wird nur, was Build und Betrieb brauchen (Allowlist:
   Dockerfile, .dockerignore, docker-compose.yml, requirements.txt, app/, static/, sources.yaml, deploy/,
   README.md, .env.example), und zwar der committete Stand (`git archive HEAD`); mit nicht committeten
@@ -98,7 +112,7 @@ Gleicher Server wie secure-chat und MailDigest (203.0.113.10, SSH-Alias `kiosk-s
   `bash deploy/user.sh passwd anna`, `bash deploy/user.sh list`. Bei `add` und `passwd` fragt das Skript das
   Passwort lokal zweimal verdeckt ab und reicht es über stdin (`--password-stdin`) durch; es steht nie in
   einer Kommandozeile oder Shell-History. `remove` fragt lokal nach und ruft dann mit `--yes` auf.
-  Anderer SSH-Alias: `BOX=... bash deploy/user.sh ...`.
+  SSH-Ziel aus `deploy/deploy.env`, ein anderes: `BOX=... bash deploy/user.sh ...`.
   Quellen mit `in_all: false` für ein Konto in ALLE: `bash deploy/user.sh extra-sources reiner focus
   --profile-de` (ohne Quelle: keine mehr).
 - Passwörter ändern: `bash deploy/user.sh passwd <name>`. `KIOSK_PASSWORD` in der `.env` legt nur beim
@@ -157,6 +171,6 @@ Gleicher Server wie secure-chat und MailDigest (203.0.113.10, SSH-Alias `kiosk-s
   `/etc/caddy/Caddyfile.bak-<Zeitstempel>`), dann `systemctl reload caddy`. Scheitert das Reload, wird das
   Backup zurückverschoben und das Skript bricht ab. Ist die Kandidatendatei ungültig,
   bricht das Skript mit dem Fehler von Caddy ab und die laufende Konfiguration bleibt unverändert.
-- Einmalige Umstellung: Ein alter, ohne Marker angehängter Block (`kiosk.example.org {` bis zum
+- Einmalige Umstellung: Ein alter, ohne Marker angehängter Block (`<KIOSK_HOST> {` bis zum
   Dateiende) wird erkannt und durch den markierten Block ersetzt. Steht danach noch etwas anderes, bricht das
   Skript ab, statt zu raten.

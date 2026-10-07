@@ -1,6 +1,6 @@
 # Kiosk
 
-Privater Nachrichten-Aggregator: holt RSS-Feeds von über 90 seriösen Zeitungen aus aller Welt,
+Privater Nachrichten-Aggregator: holt RSS-Feeds von rund 100 Zeitungen aus aller Welt,
 extrahiert den Volltext der Artikel und stellt alles gebündelt hinter einer Anmeldung bereit.
 Mehrere Personen aus dem engsten Kreis teilen sich die gesammelten Artikel, jede mit eigenem
 Konto, Lesestand, Profilen, Lieblingszeitungen, Leiste und Einstellungen (siehe Benutzer).
@@ -18,7 +18,7 @@ Konto, Lesestand, Profilen, Lieblingszeitungen, Leiste und Einstellungen (siehe 
   - `auth.py` Passwort-Hashes (scrypt), signiertes Cookie pro Benutzer, Login-Bremse
   - `users.py` Konten verwalten auf der Kommandozeile (`python -m app.users`)
 - `static/` Web-Oberfläche (PWA ohne Build-Schritt: `index.html`, `js/`, `css/`, `sw.js`)
-- `deploy/` Caddy-Block und Deploy-Skript für die Hetzner-Box
+- `deploy/` Caddy-Block und Deploy-Skript für den Server (Serverwerte in der git-ignorierten `deploy/deploy.env`, Vorlage `deploy/deploy.env.example`)
 
 ## Lokal starten
 
@@ -425,8 +425,9 @@ gemachter Text"`). Absätze mit Blindtext („Lorem ipsum dolor sit amet …“)
   selbst und begrenzt entpackt (das Limit gilt für übertragene und entpackte Bytes); ein abgeschnittener
   komprimierter Datenstrom gilt als vorübergehender Fehler. `identity` und unbekannte Werte im Header
   gelten als unkomprimiert; br, zstd, compress und gestapelte Kodierungen gelten als endgültig `failed`. Ein Abrufversuch dauert höchstens 45 s inklusive
-  Umleitungen (maximal 5); bei 403/406/429 oder leerer Antwort folgt ein zweiter Versuch mit anderem
-  User-Agent, beide zusammen höchstens 60 s.
+  Umleitungen (maximal 5). Abgerufen wird als `KioskReader/1.0 (private RSS reader)`, kein Browser-Agent.
+  Nur mit eigenem `KIOSK_USER_AGENT` folgt bei 403/406/429 oder leerer Antwort ein zweiter Versuch mit diesem
+  Standard-Agent, beide zusammen höchstens 60 s.
 - `feed` in `sources.yaml` darf statt RSS/Atom auch eine Google-News-Sitemap (`urlset`) oder ein
   Sitemap-Index sein, erkannt am Wurzelelement im sitemaps.org-Namensraum (GEA). Aus einem Index wird
   die Sitemap mit dem jüngsten `lastmod` genommen (bei gleichem oder fehlendem Datum die mit der
@@ -536,6 +537,7 @@ Suche, Zähler, Artikel per ID).
 | `KIOSK_TZ` | `Europe/Berlin` | Zeitzone (IANA-Name), in der der Tag für die Ungelesen-Zähler um 00:00 beginnt |
 | `KIOSK_DOCS` | `0` | `1` schaltet die API-Doku unter `/docs` und `/openapi.json` ein (nach Login); in Produktion aus |
 | `KIOSK_SECRET` | – | Secret der Session-Cookies, mindestens 32 Zeichen; sonst wird `/data/secret.key` einmalig erzeugt |
+| `KIOSK_USER_AGENT` | `KioskReader/1.0 (private RSS reader)` | User-Agent für Feed- und Artikelabrufe; mit einem eigenen Wert wird bei 403/406/429 oder leerer Antwort einmal mit dem Standard nachgefragt |
 | `OPENROUTER_API_KEY` | – | Schlüssel für die KI-Ausgabe (OpenRouter); leer: KI-Ausgabe aus (Hinweis im Log). Nie in Log, Status oder Fehlertexten |
 | `KIOSK_AI_MODEL` | `anthropic/claude-sonnet-5.5` | Modell der KI-Ausgabe (OpenRouter-Name; Platzhalter, noch nicht endgültig gewählt) |
 | `KIOSK_AI_BASE_URL` | `https://openrouter.ai/api/v1` | Endpunkt (OpenAI-kompatibel, `/chat/completions` wird angehängt) |
@@ -547,7 +549,7 @@ Suche, Zähler, Artikel per ID).
 | `KIOSK_MAIL_FROM` | `KIOSK_MAIL_USER` | Absenderadresse (nur die Adresse, der Name „Kiosk“ kommt dazu) |
 | `KIOSK_MAIL_TO` | – | Empfänger, kommagetrennt (nur Adressen, höchstens 50); leer: kein Versand |
 | `KIOSK_PUBLIC_URL` | – | https-Adresse der App für die Links in der Mail („Im Kiosk lesen“, Quellen); leer: Links als Text |
-| `KIOSK_FETCH_DENY_IPS` | – | Zusätzlich gesperrte Ziele für Feed- und Artikelabrufe: IPs oder Netze (CIDR), kommagetrennt, z. B. die Adressen des eigenen Servers `203.0.113.10,2001:db8:1234:5678::/64` (kein ganzes Provider-Netz wie `2a01:4f8::/32`, das sperrte auch dort gehostete Nachrichtenseiten); `deploy.sh` trägt diesen Wert ein, wenn er in der `.env` fehlt |
+| `KIOSK_FETCH_DENY_IPS` | – | Zusätzlich gesperrte Ziele für Feed- und Artikelabrufe: IPs oder Netze (CIDR), kommagetrennt, z. B. die Adressen des eigenen Servers `203.0.113.10,2001:db8:1234:5678::/64` (kein ganzes Provider-Netz wie `2001:db8::/32`, das sperrte auch dort gehostete Nachrichtenseiten); `deploy.sh` trägt `FETCH_DENY_IPS` aus `deploy/deploy.env` ein, wenn der Schlüssel in der `.env` fehlt |
 
 Werte außerhalb der Grenzen, unbekannte Zeitzonen, ungültige Einträge in `KIOSK_FETCH_DENY_IPS`, ungültige
 Uhrzeiten oder Adressen der KI-Ausgabe, unvollständige oder ungültige Mail-Einstellungen und ein

@@ -30,8 +30,8 @@ services:
     # App selbst (uvicorn, SQLite-Cache, Geschichten) und der Forkserver der Worker (ca. 75 MB mit
     # vorgeladenem trafilatura/lxml/feedparser, ohne eigene Grenze): Reserve 320 MB = 1280 MB. So trifft der
     # OOM-Killer des Containers nie die App, bevor ein Worker an seiner eigenen Grenze scheitert.
-    # Üblich sind App ca. 200 MB und ein bis zwei Worker mit 100-200 MB; die Box (3,7 GB) teilen sich
-    # Kiosk, secure-chat und MailDigest.
+    # Üblich sind App ca. 200 MB und ein bis zwei Worker mit 100-200 MB; die Box (3,7 GB) teilt sich
+    # Kiosk mit anderen Diensten.
     mem_limit: 1280m
     pids_limit: 256
     cpus: "1.5"

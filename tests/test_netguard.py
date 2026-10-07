@@ -371,8 +371,8 @@ def test_fetcher_applies_deny_setting(deny, db, settings):
 def test_deny_setting_parsing(monkeypatch):
     import ipaddress
     from app.config import fetch_deny_networks
-    monkeypatch.setenv("KIOSK_FETCH_DENY_IPS", " 203.0.113.10 , 2a01:4f8::/32,,10.0.0.1/8 ")
-    assert fetch_deny_networks() == (ipaddress.ip_network("203.0.113.10/32"), ipaddress.ip_network("2a01:4f8::/32"),
+    monkeypatch.setenv("KIOSK_FETCH_DENY_IPS", " 203.0.113.10 , 2001:db8::/32,,10.0.0.1/8 ")
+    assert fetch_deny_networks() == (ipaddress.ip_network("203.0.113.10/32"), ipaddress.ip_network("2001:db8::/32"),
                                      ipaddress.ip_network("10.0.0.0/8"))
     monkeypatch.setenv("KIOSK_FETCH_DENY_IPS", "203.0.113.10,kein-netz")
     with pytest.raises(RuntimeError, match="KIOSK_FETCH_DENY_IPS.*kein-netz"):

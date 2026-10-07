@@ -1,15 +1,48 @@
 #!/usr/bin/env bash
-# Deployt Kiosk auf die gemeinsame Hetzner-Box. Aufruf aus dem Repo-Root: bash deploy/deploy.sh
+# Deployt Kiosk auf die gemeinsame Box. Aufruf aus dem Repo-Root: bash deploy/deploy.sh
 set -euo pipefail
-BOX="${BOX:-kiosk-server}"
-DEST=/opt/kiosk
-HOST=kiosk.example.org
-# Zusätzlich gesperrte Abrufziele (KIOSK_FETCH_DENY_IPS): die eigenen Adressen der Box, damit ein
-# Feed oder Artikel nicht auf Dienste des Servers selbst zeigen kann. Wird in eine bestehende .env
-# nur eingetragen, wenn der Schlüssel dort fehlt; ein vorhandener Wert bleibt. Kein ganzes
-# Provider-Netz eintragen (2a01:4f8::/32 sperrte auch dort gehostete Nachrichtenseiten).
-FETCH_DENY_IPS="203.0.113.10,2001:db8:1234:5678::/64"
 cd "$(dirname "$0")/.."
+
+# Serverwerte stehen nicht im Repo, sondern in deploy/deploy.env (git-ignoriert, nie hochgeladen;
+# Vorlage deploy/deploy.env.example): BOX (SSH-Ziel), KIOSK_HOST (Hostname für Caddy und die
+# Prüfung), FETCH_DENY_IPS (eigene Adressen der Box für KIOSK_FETCH_DENY_IPS). Umgebungsvariablen
+# gleichen Namens gehen vor. Geprüft wird vor dem ersten SSH-Aufruf; die Werte landen in
+# Befehlen auf der Box, deshalb nur ein enger Zeichenvorrat.
+env_box=${BOX-} env_host=${KIOSK_HOST-} env_deny=${FETCH_DENY_IPS-}
+if [ -f deploy/deploy.env ]; then
+  # shellcheck source=/dev/null
+  . ./deploy/deploy.env
+fi
+BOX=${env_box:-${BOX:-}}
+HOST=${env_host:-${KIOSK_HOST:-}}
+FETCH_DENY_IPS=${env_deny:-${FETCH_DENY_IPS:-}}
+# Erst nach dem Einlesen: deploy.env legt nur die drei Werte oben fest.
+DEST=/opt/kiosk
+config_error() {
+  echo "$1" >&2
+  echo "Serverwerte in deploy/deploy.env eintragen (Vorlage: deploy/deploy.env.example) oder als" >&2
+  echo "Umgebungsvariable setzen. Nichts auf der Box verändert." >&2
+  exit 2
+}
+# Zeichen ausgeschrieben: [a-z] träfe je nach Locale auch Umlaute.
+alnum=abcdefghijklmnopqrstuvwxyz0123456789 upper=ABCDEFGHIJKLMNOPQRSTUVWXYZ
+label="[$alnum]([$alnum-]{0,61}[$alnum])?"
+[ -n "$BOX" ] || config_error "BOX fehlt (SSH-Alias oder user@host der Box)."
+[[ "$BOX" =~ ^[${alnum}${upper}_][${alnum}${upper}._@:-]*$ ]] \
+  || config_error "BOX ungültig: '$BOX' (SSH-Alias oder user@host, ohne Leerzeichen)."
+[ -n "$HOST" ] || config_error "KIOSK_HOST fehlt (Hostname der Kiosk-Instanz, z. B. kiosk.example.org)."
+if ! [[ "$HOST" =~ ^($label\.)+$label$ ]] || [ ${#HOST} -gt 253 ]; then
+  config_error "KIOSK_HOST ungültig: '$HOST' (Hostname in Kleinbuchstaben, ohne https:// und Pfad)."
+fi
+[ -n "$FETCH_DENY_IPS" ] || config_error "FETCH_DENY_IPS fehlt (öffentliche Adressen der Box, kommagetrennt)."
+if ! [[ "$FETCH_DENY_IPS" =~ ^[0123456789abcdefABCDEF.:/,]+$ ]] || ! python3 -c '
+import ipaddress, sys
+for net in sys.argv[1].split(","):
+    ipaddress.ip_network(net, strict=False)
+' "$FETCH_DENY_IPS" 2>/dev/null; then
+  config_error "FETCH_DENY_IPS ungültig: '$FETCH_DENY_IPS' (IPs oder Netze in CIDR-Schreibweise, kommagetrennt, ohne Leerzeichen)."
+fi
+
 BUILD=$(date -u +%Y%m%dT%H%M%SZ)
 # Wartezeit auf /healthz nach dem Start (Sekunden); die Schema-Migration kann bei großen
 # Datenbanken dauern (ca. 2 ms pro Artikel), siehe deploy/README.md.
@@ -73,7 +106,7 @@ echo "== Code nach $BOX:$DEST"
 # docker-compose.yml, requirements.txt, app/, static/, sources.yaml, deploy/ (backup.sh,
 # Caddyfile.kiosk), dazu README.md und .env.example als Doku. Und zwar der committete Stand
 # (git archive HEAD), nie das Arbeitsverzeichnis: keine halbfertigen Änderungen, keine
-# ungetrackten Dateien (.env*, Testdatenbanken, venv). Ältere Deploys luden auch
+# ungetrackten Dateien (.env*, deploy/deploy.env, Testdatenbanken, venv). Ältere Deploys luden auch
 # Entwicklungsdateien hoch; die entfernt der Schritt "Besitzer und Rechte".
 DEPLOY_PATHS=(Dockerfile .dockerignore docker-compose.yml requirements.txt app static sources.yaml deploy
               README.md .env.example)
@@ -199,7 +232,7 @@ trap rollback_hint ERR
 
 echo "== Datenverzeichnis für uid 10100 und Container starten"
 # Kiosk läuft als eigene uid/gid 10100 (Dockerfile, docker-compose.yml user:); frühere Versionen
-# liefen als 1000, die auf der Box maildigest gehört. Umstellen und Start in EINEM Aufruf auf der
+# liefen als 1000, die auf der Box einem anderen Dienst gehört. Umstellen und Start in EINEM Aufruf auf der
 # Box: Bricht die SSH-Verbindung dazwischen ab, liefe sonst der alte Container (uid 1000) gegen ein
 # data/, das er nicht mehr lesen darf. Bis dahin arbeitet er mit seinen offenen Dateien weiter.
 # data/ gehört danach 10100 und ist nur für ihn lesbar: Verzeichnis 700, Datenbank und Secret 600.
@@ -282,13 +315,21 @@ tmp=$(mktemp /etc/caddy/.Caddyfile.kiosk-XXXXXX)
 trap 'rm -f "$tmp" "$tmp.log"' EXIT
 
 python3 - "$live" "$block" "$host" "$tmp" <<'PY'
+import re
 import sys
 
 live, block_path, host, out = sys.argv[1:]
 BEGIN = "# >>> kiosk (managed by deploy.sh)"
 END = "# <<< kiosk"
 lines = open(live, encoding="utf-8").read().splitlines(keepends=True)
-block = open(block_path, encoding="utf-8").read().strip("\n") + "\n"
+# Den Hostnamen setzt erst deploy.sh ein (KIOSK_HOST aus deploy/deploy.env), im Repo steht ein Platzhalter.
+PLACEHOLDER = "@KIOSK_HOST@"
+if not re.fullmatch(r"[a-z0-9.-]+", host):
+    sys.exit(f"Ungültiger Kiosk-Host: {host!r}")
+template = open(block_path, encoding="utf-8").read()
+if template.count(PLACEHOLDER) != 1:
+    sys.exit(f"{PLACEHOLDER} muss genau einmal in {block_path} stehen")
+block = template.replace(PLACEHOLDER, host).strip("\n") + "\n"
 
 begins = [i for i, l in enumerate(lines) if l.strip() == BEGIN]
 ends = [i for i, l in enumerate(lines) if l.strip() == END]

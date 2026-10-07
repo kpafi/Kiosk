@@ -1,6 +1,7 @@
 # >>> kiosk (managed by deploy.sh)
 # Dieser Block wird von deploy/deploy.sh zwischen den Markern ersetzt; nicht von Hand ändern.
-kiosk.example.org {
+# Den Hostnamen in der nächsten Zeile setzt deploy.sh aus KIOSK_HOST (deploy/deploy.env) ein.
+@KIOSK_HOST@ {
 	encode zstd gzip
 	# Range-Anfragen gar nicht erst weitergeben: Starlette vor 0.49.1 fasste viele Bereiche quadratisch
 	# zusammen (CVE-2025-62727, eine Anfrage blockierte den einen uvicorn-Worker). Die statischen

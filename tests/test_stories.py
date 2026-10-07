@@ -65,7 +65,11 @@ def canon(word: str, lang: str) -> list[str]:
 # Ereignisses in den 30 größten Geschichten (unbeschriftete Mitglieder zählen als falsch).
 
 def _load(name: str) -> list[dict]:
-    data = json.loads(gzip.open(FIXTURES / f"stories_{name}.json.gz", "rt", encoding="utf-8").read())
+    # Die Goldsets enthalten Überschriften und Anreißer der Verlage und liegen nur lokal, nicht auf GitHub.
+    path = FIXTURES / f"stories_{name}.json.gz"
+    if not path.exists():
+        pytest.skip(f"Goldset {path.name} fehlt (nur lokal vorhanden)")
+    data = json.loads(gzip.open(path, "rt", encoding="utf-8").read())
     return [{**d, "source_id": d["source"]} for d in data]
 
 
